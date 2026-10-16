@@ -102,6 +102,8 @@ Each native event is verified against what was persisted
   skips any non-empty reason (never sent to remote servers)**. The verify check
   `rejection_column` now catches it. Other Go workers reading Synapse's tables
   have stricter expectations than Synapse: test against them, not only Synapse.
+  The operator repaired the 12 rows (NULL) the same day; after the fix the e2e
+  suite against a native worker passed 31/31 with every native event verified.
 - Room participation's `UPDATE room_memberships` fires the
   `check_event_stream_ordering` trigger, which runs as the caller and reads
   `events`: the role needs SELECT on it (found by `TestWritesAsTheRole`).

@@ -61,7 +61,7 @@ New repo, module `github.com/ricardo-duarte-av/synapse-goevent-creator`, built w
 
 1. **Skeleton + proxy** (done, 2026-10-16): config, synapsecfg on the RO mount, unix socket listener, proxy everything (deployed on `goevent.aguiarvieira.pt`, upstream main), metrics, Dockerfile, docker-compose (`/opt/matrix/synapse/synapse:/etc/synapse:ro`, `/var/sockets`).
 2. **Read path + "decide" shadow** (done, 2026-10-16, except push actions; see CLAUDE.md "Shadow mode"): for proxied requests in the two rooms, compute what Go *would* have built from the same prev events, then compare it with the persisted event: `auth_events`, depth, state group contents, push actions in `event_push_actions` and `room_participation`. Same idea as goinbound's `decide` check. No writes.
-3. **Native `/send` (message events)** in the two rooms, through `send_events`. (Built 2026-10-16; see CLAUDE.md "Native mode". Not yet verified live after the `rejected: null` fix.)
+3. **Native `/send` (message events)** in the two rooms, through `send_events`. (Done 2026-10-16: e2e 31/31 on a native worker, every native event verified; see CLAUDE.md "Native mode".)
 4. **State events** (`/state/`, with dedup and new state groups) and **`/redact`** (redaction rules, `is_admin_redaction`, the MSC2815 / redaction period check).
 5. **Membership**: local leave/kick/ban/unban, invite (local and remote), and local join, with `/join/{alias}` resolution.
 6. **Hardening**: ratelimit parity (`rc_message`, `rc_invites`), shadow-ban, guest rules, the `m.room.encrypted` participation write, and the `extra_users` notify.
