@@ -104,6 +104,11 @@ type Config struct {
 	// paths (beside homeserver.yaml when Synapse's own path is absent).
 	AppServiceFiles []string
 
+	// RedactionAllowedPeriod is redaction_allowed_period being set: local
+	// users may then not redact old messages (handlers/message.py,
+	// _check_redaction_allowed_period).
+	RedactionAllowedPeriod bool
+
 	signingKey, signingKeyPath string
 }
 
@@ -119,6 +124,8 @@ func (c *Config) Flag(name string, def bool) bool {
 // a Synapse upgrade that adds options cannot stop this parsing.
 type raw struct {
 	ServerName string `yaml:"server_name"`
+
+	RedactionAllowedPeriod any `yaml:"redaction_allowed_period"`
 
 	SigningKey     string `yaml:"signing_key"`
 	SigningKeyPath string `yaml:"signing_key_path"`
@@ -203,7 +210,8 @@ func parse(b []byte, path string) (*Config, error) {
 		return nil, fmt.Errorf("synapsecfg: %s has no server_name", path)
 	}
 
-	cfg := &Config{Path: path, ServerName: r.ServerName, signingKey: r.SigningKey, signingKeyPath: r.SigningKeyPath}
+	cfg := &Config{Path: path, ServerName: r.ServerName, signingKey: r.SigningKey, signingKeyPath: r.SigningKeyPath,
+		RedactionAllowedPeriod: r.RedactionAllowedPeriod != nil}
 
 	var err error
 	if cfg.InstanceMap, err = instanceMap(r); err != nil {

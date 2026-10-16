@@ -33,7 +33,9 @@ func TestQueriesUseOnlyGrants(t *testing.T) {
 		{regexp.MustCompile(`(?i)\bFROM\s+(\w+)`), "SELECT"},
 		{regexp.MustCompile(`(?i)\bJOIN\s+(\w+)`), "SELECT"},
 	}
-	notTables := map[string]bool{"unnest": true}
+	// Names that follow FROM without being tables: functions, and the
+	// recursive CTE of qStateHops.
+	notTables := map[string]bool{"unnest": true, "state": true}
 	queries := 0
 	for _, pkg := range pkgs {
 		for _, f := range pkg.Files {
@@ -85,7 +87,9 @@ func TestGrantsAreNarrow(t *testing.T) {
 		"room_memberships":              "SELECT, UPDATE (participant)",
 		"local_current_membership":      "SELECT",
 		"events":                        "SELECT",
-		"state_groups":                  "SELECT",
+		"state_groups":                  "SELECT, INSERT, UPDATE (id)",
+		"state_group_edges":             "SELECT, INSERT",
+		"state_groups_state":            "SELECT, INSERT",
 		"state_groups_pending_deletion": "SELECT, UPDATE",
 	}
 	if len(Grants) != len(writes) {

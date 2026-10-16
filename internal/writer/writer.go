@@ -10,6 +10,7 @@ package writer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -32,15 +33,19 @@ var Grants = []dbrole.Grant{
 	// Read by room_memberships' check_event_stream_ordering trigger, which
 	// runs as the caller.
 	{Table: "events", Privileges: "SELECT"},
-	// check_state_groups_and_bump_deletion, which the creator calls with
-	// lock=False: a plain SELECT, no FOR KEY SHARE.
-	{Table: "state_groups", Privileges: "SELECT"},
+	// store_state_group, for a state event's new group. UPDATE (id) only so
+	// the prev group can be locked FOR KEY SHARE, as
+	// _get_existing_groups_with_lock does with lock=True; nothing updates it.
+	{Table: "state_groups", Privileges: "SELECT, INSERT, UPDATE (id)"},
+	{Table: "state_group_edges", Privileges: "SELECT, INSERT"},
+	{Table: "state_groups_state", Privileges: "SELECT, INSERT"},
+	// check_state_groups_and_bump_deletion.
 	{Table: "state_groups_pending_deletion", Privileges: "SELECT, UPDATE"},
 }
 
-// Sequences are granted USAGE: the pending deletion bump's
-// sequence_number = DEFAULT.
-var Sequences = []string{"state_groups_pending_deletion_sequence_number_seq"}
+// Sequences are granted USAGE: new state group IDs, and the pending deletion
+// bump's sequence_number = DEFAULT.
+var Sequences = []string{"state_group_id_seq", "state_groups_pending_deletion_sequence_number_seq"}
 
 // Spec is the role as dbrole ensures it.
 func Spec(password string) dbrole.Spec {
@@ -72,11 +77,39 @@ const (
 	// qExistingGroups is _get_existing_groups_with_lock with lock=False
 	// (storage/databases/state/deletion.py).
 	qExistingGroups = `SELECT id FROM state_groups WHERE id = ANY($1)`
+	// qLockGroups is _get_existing_groups_with_lock with lock=True, as
+	// store_state_group calls it for the prev group.
+	qLockGroups = `SELECT id FROM state_groups WHERE id = ANY($1) FOR KEY SHARE`
 	// qBumpDeletion is _bump_deletion_txn.
 	qBumpDeletion = `
 		UPDATE state_groups_pending_deletion
 		SET sequence_number = DEFAULT, insertion_ts = $1
 		WHERE state_group = ANY($2)`
+)
+
+// State groups, as store_state_group writes them
+// (storage/databases/state/store.py; goinbound's port).
+const (
+	// maxStateDeltaHops is MAX_STATE_DELTA_HOPS (state/bg_updates.py): a
+	// delta chain this long is ended with a full group.
+	maxStateDeltaHops = 100
+
+	// qStateHops is _count_state_group_hops_txn.
+	qStateHops = `
+		WITH RECURSIVE state(state_group) AS (
+			VALUES($1::bigint)
+			UNION ALL
+			SELECT prev_state_group FROM state_group_edges e, state s
+			WHERE s.state_group = e.state_group
+		)
+		SELECT count(*) FROM state`
+	qNextStateGroup   = `SELECT nextval('state_group_id_seq')`
+	qInsertStateGroup = `INSERT INTO state_groups (id, room_id, event_id) VALUES ($1, $2, $3)`
+	qInsertEdge       = `INSERT INTO state_group_edges (state_group, prev_state_group) VALUES ($1, $2)`
+	qInsertState      = `
+		INSERT INTO state_groups_state (state_group, room_id, type, state_key, event_id)
+		SELECT $1, $2, k.type, k.state_key, k.event_id
+		FROM unnest($3::text[], $4::text[], $5::text[]) AS k(type, state_key, event_id)`
 )
 
 // DB is the write connection.
@@ -183,6 +216,85 @@ func (d *DB) BumpDeletion(ctx context.Context, groups []int64) (missing []int64,
 		return nil
 	})
 	return missing, err
+}
+
+// ErrMissingGroup is a prev state group that has been deleted.
+var ErrMissingGroup = errors.New("writer: state group deleted")
+
+// StateRow is one entry of a state map.
+type StateRow struct{ Type, StateKey, EventID string }
+
+// StoreStateGroup is store_state_group with a prev group: a delta of the
+// rows on prev when its chain is short enough, otherwise the whole state,
+// which full supplies (the state of prev, with the delta applied).
+func (d *DB) StoreStateGroup(ctx context.Context, eventID, roomID string, prev int64, delta []StateRow, full func() ([]StateRow, error)) (int64, error) {
+	var group int64
+	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, qLockGroups, []int64{prev})
+		if err != nil {
+			return fmt.Errorf("writer: lock groups: %w", err)
+		}
+		have, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+		if err != nil {
+			return fmt.Errorf("writer: lock groups: %w", err)
+		}
+		if len(have) == 0 {
+			return fmt.Errorf("%w: trying to persist state with unpersisted prev_group %d", ErrMissingGroup, prev)
+		}
+		if _, err := tx.Exec(ctx, qBumpDeletion, d.now().UnixMilli(), have); err != nil {
+			return fmt.Errorf("writer: bump deletion: %w", err)
+		}
+		var hops int
+		if err := tx.QueryRow(ctx, qStateHops, prev).Scan(&hops); err != nil {
+			return fmt.Errorf("writer: state hops: %w", err)
+		}
+		if hops >= maxStateDeltaHops {
+			return nil
+		}
+		if group, err = insertGroupTx(ctx, tx, roomID, eventID, delta); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, qInsertEdge, group, prev); err != nil {
+			return fmt.Errorf("writer: state group edge: %w", err)
+		}
+		return nil
+	})
+	if err != nil || group != 0 {
+		return group, err
+	}
+	rows, err := full()
+	if err != nil {
+		return 0, err
+	}
+	err = pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		var err error
+		group, err = insertGroupTx(ctx, tx, roomID, eventID, rows)
+		return err
+	})
+	return group, err
+}
+
+// insertGroupTx allocates a group and stores its rows.
+func insertGroupTx(ctx context.Context, tx pgx.Tx, roomID, eventID string, rows []StateRow) (int64, error) {
+	var group int64
+	if err := tx.QueryRow(ctx, qNextStateGroup).Scan(&group); err != nil {
+		return 0, fmt.Errorf("writer: state group id: %w", err)
+	}
+	if _, err := tx.Exec(ctx, qInsertStateGroup, group, roomID, eventID); err != nil {
+		return 0, fmt.Errorf("writer: state group: %w", err)
+	}
+	types := make([]string, len(rows))
+	keys := make([]string, len(rows))
+	ids := make([]string, len(rows))
+	for i, r := range rows {
+		types[i], keys[i], ids[i] = r.Type, r.StateKey, r.EventID
+	}
+	if len(ids) > 0 {
+		if _, err := tx.Exec(ctx, qInsertState, group, roomID, types, keys, ids); err != nil {
+			return 0, fmt.Errorf("writer: state group rows: %w", err)
+		}
+	}
+	return group, nil
 }
 
 func b2i(b bool) int16 {

@@ -1,9 +1,9 @@
-// Package creator serves /send natively: it builds the event as Synapse's
-// event creator does, writes what the creator writes itself (push actions
-// staging, room participation, the state group deletion bump), and hands the
-// event to the room's events writer over send_events
-// (EventCreationHandler.create_and_send_nonmember_event, handlers/message.py,
-// v1.163.0).
+// Package creator serves /send, /state and /redact natively: it builds the
+// event as Synapse's event creator does, writes what the creator writes itself
+// (push actions staging, room participation, the state group deletion bump, a
+// state event's new state group), and hands the event to the room's events
+// writer over send_events (EventCreationHandler.create_and_send_nonmember_event,
+// handlers/message.py, and the servlets in rest/client/room.py, v1.163.0).
 //
 // Anything it does not reproduce exactly is left to Synapse: the request is
 // proxied, untouched, and the reason counted
@@ -33,6 +33,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog"
 	"github.com/tidwall/gjson"
+	"maunium.net/go/mautrix/crypto/canonicaljson"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/auth"
@@ -100,6 +101,7 @@ type Writer interface {
 	SetRoomParticipation(ctx context.Context, userID, roomID string) error
 	StagePush(ctx context.Context, eventID string, rows []writer.PushRow) error
 	UnstagePush(ctx context.Context, eventID string) error
+	StoreStateGroup(ctx context.Context, eventID, roomID string, prev int64, delta []writer.StateRow, full func() ([]writer.StateRow, error)) (int64, error)
 }
 
 // Persister is the events writer, over replication.
@@ -126,6 +128,9 @@ type Options struct {
 	EventsWriter func(roomID string) string
 	// Sticky is experimental_features.msc4354_enabled.
 	Sticky bool
+	// RedactionAllowedPeriod is redaction_allowed_period being set, which
+	// limits local redactions; they are then Synapse's.
+	RedactionAllowedPeriod bool
 	// Timeout bounds one request's work, the persister's included.
 	Timeout time.Duration
 	Log     zerolog.Logger
@@ -164,11 +169,17 @@ type Outcome struct {
 
 func fallback(reason string) Outcome { return Outcome{Fallback: reason} }
 
-// Send serves PUT /rooms/{room}/send/{type}/{txn} and its POST form. r.Body
-// is left readable from the start, so a fallback can forward the request.
-func (c *Creator) Send(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
+// Serves reports whether an endpoint can be native.
+func Serves(ep route.Endpoint) bool {
+	return ep == route.Send || ep == route.State || ep == route.Redact
+}
+
+// Serve serves /send (PUT with a transaction, or POST), PUT /state and
+// /redact (PUT with a transaction, or POST). r.Body is left readable from the
+// start, so a fallback can forward the request.
+func (c *Creator) Serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	start := c.o.Now()
-	out := c.send(w, r, req)
+	out := c.serve(w, r, req)
 	ep := string(req.Endpoint)
 	if out.Fallback != "" {
 		fallbacks.WithLabelValues(ep, out.Fallback).Inc()
@@ -179,7 +190,19 @@ func (c *Creator) Send(w http.ResponseWriter, r *http.Request, req route.Request
 	return out
 }
 
-func (c *Creator) send(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
+// input is what a request asks for: Synapse's event_dict.
+type input struct {
+	typ string
+	// stateKey is nil for a message event.
+	stateKey *string
+	content  []byte
+	// redacts is the redacted event, for a redaction.
+	redacts *string
+	txn     string
+	sticky  *int64
+}
+
+func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	q := r.URL.Query()
 	switch {
 	case q.Has(DelayParam):
@@ -187,6 +210,9 @@ func (c *Creator) send(w http.ResponseWriter, r *http.Request, req route.Request
 	case q.Has("user_id"), q.Has("device_id"), q.Has("ts"):
 		// Appservice masquerading and timestamps.
 		return fallback("appservice")
+	}
+	if req.Endpoint == route.State && r.Method != http.MethodPut {
+		return fallback("method")
 	}
 
 	body, tooLarge, err := readBody(r)
@@ -199,8 +225,13 @@ func (c *Creator) send(w http.ResponseWriter, r *http.Request, req route.Request
 	if !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() {
 		return fallback("not_object")
 	}
-	content := gjson.ParseBytes(body)
-	if reason := validateSend(req.Action, content); reason != "" {
+
+	in, reason := c.parse(req, body, q)
+	if reason != "" {
+		return fallback(reason)
+	}
+	content := gjson.ParseBytes(in.content)
+	if reason := validate(in, content); reason != "" {
 		return fallback(reason)
 	}
 
@@ -215,10 +246,10 @@ func (c *Creator) send(w http.ResponseWriter, r *http.Request, req route.Request
 	unlock := c.locks.lock(req.Room)
 	defer unlock()
 
-	// create_and_send_nonmember_event: a transaction already used answers
-	// with its event.
-	if req.TxnID != "" {
-		id, err := c.o.Store.TxnEvent(ctx, req.Room, rq.UserID, rq.DeviceID, req.TxnID)
+	// get_event_from_transaction: a transaction already used answers with
+	// its event. /state has no transaction.
+	if in.txn != "" {
+		id, err := c.o.Store.TxnEvent(ctx, req.Room, rq.UserID, rq.DeviceID, in.txn)
 		switch {
 		case err == nil:
 			writeEventID(w, id)
@@ -228,13 +259,58 @@ func (c *Creator) send(w http.ResponseWriter, r *http.Request, req route.Request
 		}
 	}
 
-	p, reason := c.prepare(ctx, req, rq, body, content, q)
+	p, dup, reason := c.prepare(ctx, req, rq, in, content)
 	if reason != "" {
 		return fallback(reason)
+	}
+	if dup != "" {
+		// deduplicate_state_event: the same state, from the same sender, is
+		// already in the room; that event is the answer.
+		writeEventID(w, dup)
+		return Outcome{Result: "state_dedup"}
 	}
 
 	// Past here, writes. Everything Synapse could refuse has been checked.
 	return c.persist(ctx, w, p)
+}
+
+// parse is the servlet: what the request asks for, or why it is Synapse's.
+func (c *Creator) parse(req route.Request, body []byte, q map[string][]string) (*input, string) {
+	in := &input{typ: req.Action, content: body, txn: req.TxnID}
+	switch req.Endpoint {
+	case route.Send:
+		if c.o.Sticky {
+			if v, ok := q[StickyParam]; ok && len(v) > 0 {
+				// parse_integer: anything else is Synapse's 400.
+				n, err := strconv.ParseInt(v[0], 10, 64)
+				if err != nil {
+					return nil, "bad_sticky"
+				}
+				in.sticky = &n
+			}
+		}
+	case route.State:
+		if req.Action == "m.room.member" {
+			// update_membership, not the non-member path.
+			return nil, "type_member"
+		}
+		sk := req.StateKey
+		in.stateKey, in.txn = &sk, ""
+	case route.Redact:
+		if c.o.RedactionAllowedPeriod {
+			return nil, "redaction_period"
+		}
+		content := gjson.ParseBytes(body)
+		if pdu.Get(content, "org.matrix.msc3912.with_relations").Exists() {
+			// Synapse strips it and redacts the relations too.
+			return nil, "with_relations"
+		}
+		target := req.Action
+		in.typ, in.redacts = "m.room.redaction", &target
+	default:
+		return nil, "endpoint"
+	}
+	return in, ""
 }
 
 // requester identifies the caller as get_user_by_req would, or says why
@@ -301,6 +377,7 @@ func (rq *requester) MarshalJSON() ([]byte, error) {
 // prepared is an event ready to persist.
 type prepared struct {
 	req       route.Request
+	in        *input
 	rq        *requester
 	rv        *pdu.RoomVersion
 	ev        *pdu.Event
@@ -309,132 +386,237 @@ type prepared struct {
 	group     int64
 	deltas    []stateGroupDelta
 	before    pdu.StateMap
+	replaces  string
 	maxStream int64
 	push      map[string]pushcalc.Row
+	// after is the state group after the event, once stored.
+	after int64
 }
 
-// prepare builds and checks the event. A reason means Synapse's.
-func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester, body []byte, content gjson.Result, q map[string][]string) (*prepared, string) {
+// prepare builds and checks the event. A reason means Synapse's; dup is the
+// event a state event duplicates.
+func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester, in *input, content gjson.Result) (p *prepared, dup, reason string) {
 	rvID, err := c.o.Store.RoomVersion(ctx, req.Room)
 	if err != nil {
-		return nil, "unknown_room"
+		return nil, "", "unknown_room"
 	}
 	rv, ok := pdu.LookupRoomVersion(rvID)
 	if !ok || rv.EventFormat < 3 {
-		return nil, "room_version"
+		return nil, "", "room_version"
 	}
 	if partial, err := c.o.Store.PartialState(ctx, req.Room); err != nil {
-		return nil, "db_error"
+		return nil, "", "db_error"
 	} else if partial {
-		return nil, "partial_state"
+		return nil, "", "partial_state"
+	}
+	if in.redacts != nil && rv.UpdatedRedactionRules {
+		// RoomRedactEventRestServlet: MSC2174 puts redacts in the content.
+		if reason := c.checkRedacts(rv, *in.redacts, content); reason != "" {
+			return nil, "", reason
+		}
+		b, err := withField(in.content, "redacts", *in.redacts)
+		if err != nil {
+			return nil, "", "not_object"
+		}
+		in.content, content = b, gjson.ParseBytes(b)
 	}
 
 	// The stream position first: the push check reads members as of now.
 	maxStream, err := c.o.Store.RoomMaxStream(ctx, req.Room)
 	if err != nil {
-		return nil, "db_error"
+		return nil, "", "db_error"
 	}
 	prevs, err := c.o.Store.PrevEventsForRoom(ctx, req.Room)
 	if err != nil {
-		return nil, "db_error"
+		return nil, "", "db_error"
 	}
 	if len(prevs) != 1 {
 		// Several extremities need state resolution, and a new state group
 		// for the result; Synapse does both.
-		return nil, "prev_events_" + strconv.Itoa(min(len(prevs), 2))
+		return nil, "", "prev_events_" + strconv.Itoa(min(len(prevs), 2))
 	}
 	group, err := c.o.Store.StateGroupForEvent(ctx, prevs[0])
 	if err != nil {
-		return nil, "no_state_group"
+		return nil, "", "no_state_group"
 	}
 	before, err := c.o.Store.StateForGroup(ctx, group)
 	if err != nil {
-		return nil, "db_error"
+		return nil, "", "db_error"
 	}
-	deltas, err := c.contextDeltas(ctx, group)
-	if err != nil {
-		return nil, "db_error"
-	}
-	depths, err := c.o.Store.Depths(ctx, prevs)
-	if err != nil || len(depths) != len(prevs) {
-		return nil, "db_error"
+	// MSC4284: Synapse asks the room's policy server to sign every local
+	// event, and refuses what it calls spam.
+	for _, t := range []string{"m.room.policy", "org.matrix.msc4284.policy"} {
+		if _, ok := before[pdu.StateKey{Type: t}]; ok {
+			return nil, "", "policy_server"
+		}
 	}
 
-	if reason := c.checkRelation(ctx, req, rq, content); reason != "" {
-		return nil, reason
+	if in.stateKey != nil {
+		if id, err := c.duplicate(ctx, before, in, rq); err != nil {
+			return nil, "", "db_error"
+		} else if id != "" {
+			return nil, id, ""
+		}
+	}
+	if in.redacts != nil {
+		if reason := c.checkRedaction(ctx, req, *in.redacts); reason != "" {
+			return nil, "", reason
+		}
+	}
+
+	depths, err := c.o.Store.Depths(ctx, prevs)
+	if err != nil || len(depths) != len(prevs) {
+		return nil, "", "db_error"
+	}
+	if reason := c.checkRelation(ctx, req, rq, in.typ, content); reason != "" {
+		return nil, "", reason
 	}
 
 	// validate_canonicaljson, on the content alone first: a float or an
 	// out-of-range integer would otherwise fail to build at all.
-	if err := pdu.CheckPDUJSON([]byte(`{"type":"","depth":0,"content":`+string(body)+`}`), rv); err != nil {
-		return nil, "invalid_json"
+	if err := pdu.CheckPDUJSON([]byte(`{"type":"","depth":0,"content":`+string(in.content)+`}`), rv); err != nil {
+		return nil, "", "invalid_json"
 	}
 
-	proto := &pdu.Event{Type: req.Action, Sender: rq.UserID, RoomID: req.Room, Content: content, Room: rv}
+	proto := &pdu.Event{Type: in.typ, Sender: rq.UserID, RoomID: req.Room, StateKey: in.stateKey, Content: content, Room: rv}
 	authIDs, err := pdu.ComputeAuthEvents(rv, proto, before)
 	if err != nil {
-		return nil, "auth_events"
+		return nil, "", "auth_events"
 	}
 	ts := c.o.Now().UnixMilli()
-	p := build.Proto{
-		RoomVersion:    id.RoomVersion(rvID),
-		RoomID:         req.Room,
-		Sender:         rq.UserID,
-		Type:           req.Action,
-		Content:        jsontext.Value(body),
-		PrevEvents:     prevs,
-		AuthEvents:     authIDs,
-		Depth:          build.Depth([]int64{depths[prevs[0]]}),
-		OriginServerTS: ts,
+	bp := build.Proto{
+		RoomVersion:      id.RoomVersion(rvID),
+		RoomID:           req.Room,
+		Sender:           rq.UserID,
+		Type:             in.typ,
+		StateKey:         in.stateKey,
+		Content:          jsontext.Value(in.content),
+		Redacts:          in.redacts,
+		PrevEvents:       prevs,
+		AuthEvents:       authIDs,
+		Depth:            build.Depth([]int64{depths[prevs[0]]}),
+		OriginServerTS:   ts,
+		StickyDurationMS: in.sticky,
 	}
-	if c.o.Sticky {
-		if v, ok := q[StickyParam]; ok && len(v) > 0 {
-			// parse_integer: anything else is Synapse's 400.
-			n, err := strconv.ParseInt(v[0], 10, 64)
-			if err != nil {
-				return nil, "bad_sticky"
-			}
-			p.StickyDurationMS = &n
-		}
-	}
-	built, err := build.Build(p, c.o.Key)
+	built, err := build.Build(bp, c.o.Key)
 	if err != nil {
-		return nil, "build"
+		return nil, "", "build"
 	}
 
-	withUnsigned, err := withAgeTS(built.JSON, ts)
+	// calculate_context_info: a state event replacing another says so.
+	replaces := ""
+	if in.stateKey != nil {
+		if r := before[pdu.StateKey{Type: in.typ, StateKey: *in.stateKey}]; r != built.ID {
+			replaces = r
+		}
+	}
+	withUnsigned, err := withUnsignedFields(built.JSON, ts, replaces)
 	if err != nil {
-		return nil, "build"
+		return nil, "", "build"
 	}
 	// validate_new and _check_size_limits.
 	if err := pdu.CheckPDUJSON(withUnsigned, rv); err != nil {
-		return nil, "invalid_json"
+		return nil, "", "invalid_json"
 	}
 	if se := pdu.CheckPDUSize(withUnsigned); se != nil {
-		return nil, "too_large"
+		return nil, "", "too_large"
 	}
 	ev, err := pdu.ParseEvent(built.JSON, built.ID, rv, false)
 	if err != nil {
-		return nil, "build"
+		return nil, "", "build"
 	}
 	if se := pdu.CheckFieldSizes(ev); se != nil {
-		return nil, "too_large"
+		return nil, "", "too_large"
 	}
 
 	if err := c.checkAuth(ctx, ev); err != nil {
 		// Synapse refuses it, with its own words.
-		return nil, "auth_rules"
+		return nil, "", "auth_rules"
 	}
 
+	deltas, err := c.contextDeltas(ctx, group)
+	if err != nil {
+		return nil, "", "db_error"
+	}
 	var rows map[string]pushcalc.Row
 	if c.o.Push != nil {
 		if rows, err = c.o.Push.Rows(ctx, ev, before); err != nil {
-			return nil, "push"
+			return nil, "", "push"
 		}
 	}
 
-	return &prepared{req: req, rq: rq, rv: rv, ev: ev, built: built, ts: ts, group: group,
-		deltas: deltas, before: before, maxStream: maxStream, push: rows}, ""
+	return &prepared{req: req, in: in, rq: rq, rv: rv, ev: ev, built: built, ts: ts, group: group,
+		deltas: deltas, before: before, replaces: replaces, maxStream: maxStream, push: rows}, "", ""
+}
+
+// duplicate is deduplicate_state_event: the event of this key in the state
+// before, when it has the same sender and canonical content.
+func (c *Creator) duplicate(ctx context.Context, before pdu.StateMap, in *input, rq *requester) (string, error) {
+	prevID, ok := before[pdu.StateKey{Type: in.typ, StateKey: *in.stateKey}]
+	if !ok {
+		return "", nil
+	}
+	evs, _, err := c.o.Store.GetStoredEvents(ctx, []string{prevID})
+	if err != nil {
+		return "", err
+	}
+	prev := evs[prevID]
+	if prev == nil || prev.Sender != rq.UserID {
+		return "", nil
+	}
+	a, errA := canonicaljson.CanonicalJSON(in.content)
+	b, errB := canonicaljson.CanonicalJSON([]byte(prev.Content.Raw))
+	if errA != nil || errB != nil || !bytes.Equal(a, b) {
+		return "", nil
+	}
+	return prevID, nil
+}
+
+// checkRedacts is the redact servlet's refusal of a body whose redacts is
+// not the event in the path.
+func (c *Creator) checkRedacts(rv *pdu.RoomVersion, target string, content gjson.Result) string {
+	if r := pdu.Get(content, "redacts"); r.Exists() && !(r.Type == gjson.String && r.Str == target) {
+		return "redacts_mismatch"
+	}
+	return ""
+}
+
+// withField sets one top-level field of a JSON object.
+func withField(raw []byte, key string, value any) ([]byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	m[key] = b
+	return json.Marshal(m)
+}
+
+// checkRedaction is the refusals persist_and_notify_client_events makes on
+// the events writer, made here before any write: a redaction is never sent
+// that the writer would refuse.
+func (c *Creator) checkRedaction(ctx context.Context, req route.Request, target string) string {
+	evs, _, err := c.o.Store.GetStoredEvents(ctx, []string{target})
+	if err != nil {
+		return "db_error"
+	}
+	orig := evs[target]
+	if orig == nil {
+		// Unknown to us: the writer decides on what it holds.
+		return "redaction_target_unknown"
+	}
+	switch {
+	case orig.Type == "m.room.create":
+		return "redact_create"
+	case orig.Type == "m.room.server_acl":
+		return "redact_acl"
+	case orig.RoomID != req.Room:
+		return "redact_other_room"
+	}
+	return ""
 }
 
 // persist writes what the creator writes, then sends the event to its
@@ -449,11 +631,34 @@ func (c *Creator) persist(ctx context.Context, w http.ResponseWriter, p *prepare
 		return fallback("state_group_deleted")
 	}
 	// handle_new_client_event.
-	if p.ev.Type == "m.room.message" || p.ev.Type == "m.room.encrypted" {
+	if !p.ev.IsState() && (p.ev.Type == "m.room.message" || p.ev.Type == "m.room.encrypted") {
 		if err := c.o.Writer.SetRoomParticipation(ctx, p.rq.UserID, room); err != nil {
 			return fallback("db_error")
 		}
 	}
+
+	// UnpersistedEventContext.persist: a state event gets a new group, a
+	// delta of exactly itself on the group before.
+	after := p.group
+	if p.ev.IsState() {
+		key := p.ev.Key()
+		g, err := c.o.Writer.StoreStateGroup(ctx, p.ev.ID, room, p.group,
+			[]writer.StateRow{{Type: key.Type, StateKey: key.StateKey, EventID: p.ev.ID}},
+			func() ([]writer.StateRow, error) {
+				rows := make([]writer.StateRow, 0, len(p.before)+1)
+				for k, v := range p.before {
+					if k != key {
+						rows = append(rows, writer.StateRow{Type: k.Type, StateKey: k.StateKey, EventID: v})
+					}
+				}
+				return append(rows, writer.StateRow{Type: key.Type, StateKey: key.StateKey, EventID: p.ev.ID}), nil
+			})
+		if err != nil {
+			return fallback("state_group")
+		}
+		after = g
+	}
+	p.after = after
 
 	rows := make([]writer.PushRow, 0, len(p.push))
 	for _, r := range p.push {
@@ -504,13 +709,27 @@ func (c *Creator) persist(ctx context.Context, w http.ResponseWriter, p *prepare
 // entry is ReplicationSendEventsRestServlet._serialize_payload's entry for
 // the event.
 func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
-	ev, err := withAgeTS(p.built.JSON, p.ts)
+	ev, err := withUnsignedFields(p.built.JSON, p.ts, p.replaces)
 	if err != nil {
 		return nil, err
 	}
 	meta := map[string]any{"device_id": p.rq.DeviceID}
-	if p.req.TxnID != "" {
-		meta["txn_id"] = p.req.TxnID
+	if p.in.txn != "" {
+		meta["txn_id"] = p.in.txn
+	}
+	if p.ev.RecheckRedaction {
+		// check_redaction set it; the writer checks the sender again.
+		meta["recheck_redaction"] = true
+	}
+	// _build_state_group_deltas: (before, after) first, then the group
+	// before's own edge.
+	deltas := p.deltas
+	due := []any{}
+	if p.ev.IsState() {
+		key := p.ev.Key()
+		own := stateGroupDelta{From: p.group, To: p.after, Delta: pdu.StateMap{key: p.ev.ID}}
+		deltas = append([]stateGroupDelta{own}, p.deltas[1:]...)
+		due = []any{[3]string{key.Type, key.StateKey, p.ev.ID}}
 	}
 	return json.Marshal(map[string]any{
 		"event":                json.RawMessage(ev),
@@ -520,14 +739,14 @@ func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
 		"outlier":              false,
 		"rejected_reason":      nil,
 		"context": map[string]any{
-			"state_group":              p.group,
+			"state_group":              p.after,
 			"state_group_before_event": p.group,
 			// str | None (events/snapshot.py): None, never False. The
 			// writer stores it in events.rejection_reason as it is, and a
 			// False there is the text 'false'.
 			"rejected":                 nil,
-			"state_group_deltas":       p.deltas,
-			"state_delta_due_to_event": []any{},
+			"state_group_deltas":       deltas,
+			"state_delta_due_to_event": due,
 			"app_service_id":           nil,
 			"partial_state":            false,
 		},
@@ -552,10 +771,11 @@ func (d stateGroupDelta) MarshalJSON() ([]byte, error) {
 	return json.Marshal([]any{d.From, d.To, rows})
 }
 
-// contextDeltas is _build_state_group_deltas for a message event whose state
-// is one existing group: the event's own (group, group) with no change, then
-// the group's edge from its prev group, as resolve_state_groups_for_events
-// returns it (get_state_group_delta), when it has one.
+// contextDeltas is _build_state_group_deltas for an event whose state before
+// is one existing group: the event's own (group, group) with no change (which
+// a state event replaces with its new group), then the group's edge from its
+// prev group, as resolve_state_groups_for_events returns it
+// (get_state_group_delta), when it has one.
 func (c *Creator) contextDeltas(ctx context.Context, group int64) ([]stateGroupDelta, error) {
 	out := []stateGroupDelta{{From: group, To: group, Delta: pdu.StateMap{}}}
 	prev, hasPrev, delta, err := c.o.Store.StateDelta(ctx, group)
@@ -570,7 +790,7 @@ func (c *Creator) contextDeltas(ctx context.Context, group int64) ([]stateGroupD
 
 // checkRelation is _validate_event_relation: a reason when Synapse would
 // refuse the relation.
-func (c *Creator) checkRelation(ctx context.Context, req route.Request, rq *requester, content gjson.Result) string {
+func (c *Creator) checkRelation(ctx context.Context, req route.Request, rq *requester, eventType string, content gjson.Result) string {
 	rel := pdu.Get(content, "m.relates_to")
 	if !rel.Exists() || !pyTruthy(rel) || !rel.IsObject() {
 		return ""
@@ -602,7 +822,7 @@ func (c *Creator) checkRelation(ctx context.Context, req route.Request, rq *requ
 		if key.Type != gjson.String || len([]rune(key.Str)) > 500 {
 			return "annotation_key"
 		}
-		dup, err := c.o.Store.HasAnnotated(ctx, parent.Str, req.Action, rq.UserID, key.Str)
+		dup, err := c.o.Store.HasAnnotated(ctx, parent.Str, eventType, rq.UserID, key.Str)
 		if err != nil {
 			return "db_error"
 		}
@@ -643,19 +863,40 @@ func (c *Creator) checkAuth(ctx context.Context, ev *pdu.Event) error {
 	return pdu.CheckStateDependentAuthRules(ev, list)
 }
 
-// validateSend is validate_builder and validate_new for a /send event, plus
-// the types the non-member path refuses. A reason means Synapse's.
-func validateSend(eventType string, content gjson.Result) string {
-	switch eventType {
+// validate is validate_builder and validate_new for the event, plus the
+// types the non-member path refuses. A reason means Synapse's.
+func validate(in *input, content gjson.Result) string {
+	state := in.stateKey != nil
+	switch in.typ {
 	case "m.room.member":
-		// create_and_send_nonmember_event refuses it.
+		// The non-member path refuses it on /send; on /state it is
+		// update_membership's.
 		return "type_member"
-	case "m.room.create", "m.room.topic", "m.room.name", "m.room.tombstone":
-		// validate_builder insists these are state events.
-		return "type_state_only"
+	case "m.room.create":
+		return "type_create"
 	case "m.room.aliases", "m.room.retention", "m.room.server_acl", "m.room.power_levels":
 		// validate_new checks their content.
 		return "type_validated"
+	case "m.room.policy", "org.matrix.msc4284.policy":
+		return "policy_server"
+	case "m.room.topic", "m.room.name", "m.room.tombstone":
+		if !state {
+			// validate_builder insists these are state events.
+			return "type_state_only"
+		}
+		switch in.typ {
+		case "m.room.topic":
+			if pdu.Get(content, "topic").Type != gjson.String {
+				return "invalid_topic"
+			}
+		case "m.room.name":
+			if pdu.Get(content, "name").Type != gjson.String {
+				return "invalid_name"
+			}
+		case "m.room.tombstone":
+			// replacement_room present, and not this room.
+			return "type_tombstone"
+		}
 	case "m.room.message":
 		for _, k := range []string{"body", "msgtype"} {
 			if pdu.Get(content, k).Type != gjson.String {
@@ -684,14 +925,24 @@ func validateSend(eventType string, content gjson.Result) string {
 	return ""
 }
 
-// withAgeTS adds unsigned.age_ts, as create_local_event_from_event_dict does
-// for an event with no age: the event as get_pdu_json sends it.
-func withAgeTS(raw []byte, ts int64) ([]byte, error) {
+// withUnsignedFields adds unsigned as Synapse fills it before sending the
+// event: age_ts (create_local_event_from_event_dict, for an event with no
+// age) and, for a state event replacing another, replaces_state
+// (calculate_context_info). The event as get_pdu_json sends it.
+func withUnsignedFields(raw []byte, ts int64, replaces string) ([]byte, error) {
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, err
 	}
-	m["unsigned"] = json.RawMessage(`{"age_ts":` + strconv.FormatInt(ts, 10) + `}`)
+	u := map[string]any{"age_ts": ts}
+	if replaces != "" {
+		u["replaces_state"] = replaces
+	}
+	b, err := json.Marshal(u)
+	if err != nil {
+		return nil, err
+	}
+	m["unsigned"] = b
 	return json.Marshal(m)
 }
 

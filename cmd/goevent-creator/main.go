@@ -345,6 +345,8 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		EventsWriter: hs.Writers.EventsWriter,
 		Sticky:       hs.Flag("msc4354_enabled", false),
 		Log:          log,
+
+		RedactionAllowedPeriod: hs.RedactionAllowedPeriod,
 	}), nil
 }
 

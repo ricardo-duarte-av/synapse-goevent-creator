@@ -32,12 +32,13 @@ const (
 // fakeRoom is a v11 room with a create event, power levels and @u joined,
 // whose one extremity is the member event, in state group 7 (a delta of 6).
 type fakeRoom struct {
-	events  map[string]*pdustore.StoredEvent
-	state   pdu.StateMap
-	prevs   []string
-	txn     string
-	token   *pdustore.TokenInfo
-	partial bool
+	create, topic string
+	events        map[string]*pdustore.StoredEvent
+	state         pdu.StateMap
+	prevs         []string
+	txn           string
+	token         *pdustore.TokenInfo
+	partial       bool
 }
 
 func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
@@ -66,7 +67,9 @@ func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
 	}
 	create := add("m.room.create", "", `{"room_version":"11","creator":"`+user+`"}`, nil)
 	member := add("m.room.member", user, `{"membership":"join"}`, []string{create})
-	add("m.room.power_levels", "", `{"users":{"`+user+`":100},"events_default":0}`, []string{create, member})
+	pl := add("m.room.power_levels", "", `{"users":{"`+user+`":100},"events_default":0}`, []string{create, member})
+	f.create = create
+	f.topic = add("m.room.topic", "", `{"topic":"old"}`, []string{create, member, pl})
 	f.prevs = prev
 	return f
 }
@@ -123,7 +126,10 @@ func (f *fakeRoom) HasAnnotated(context.Context, string, string, string, string)
 	return false, nil
 }
 
-type fakeWriter struct{ calls []string }
+type fakeWriter struct {
+	calls      []string
+	groupDelta []writer.StateRow
+}
 
 func (w *fakeWriter) BumpDeletion(_ context.Context, g []int64) ([]int64, error) {
 	w.calls = append(w.calls, "bump")
@@ -136,6 +142,11 @@ func (w *fakeWriter) SetRoomParticipation(context.Context, string, string) error
 func (w *fakeWriter) StagePush(context.Context, string, []writer.PushRow) error {
 	w.calls = append(w.calls, "stage")
 	return nil
+}
+func (w *fakeWriter) StoreStateGroup(_ context.Context, ev, room string, prev int64, delta []writer.StateRow, _ func() ([]writer.StateRow, error)) (int64, error) {
+	w.calls = append(w.calls, "state_group")
+	w.groupDelta = delta
+	return 8, nil
 }
 func (w *fakeWriter) UnstagePush(context.Context, string) error {
 	w.calls = append(w.calls, "unstage")
@@ -196,7 +207,7 @@ func (h *harness) send(t *testing.T, method, txn, body string) (*httptest.Respon
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer tok")
 	rec := httptest.NewRecorder()
-	out := h.c.Send(rec, r, req)
+	out := h.c.Serve(rec, r, req)
 	return rec, out
 }
 
@@ -249,7 +260,7 @@ func TestNativeSend(t *testing.T) {
 		"requester.authenticated_entity":   `"` + user + `"`,
 		"event.unsigned.age_ts":            "1700000000000",
 		"event.origin_server_ts":           "1700000000000",
-		"event.depth":                      "4",
+		"event.depth":                      "5",
 		"event.prev_events.#":              "1",
 		"event.auth_events.#":              "3",
 		"event.content.body":               `"hi"`,
@@ -286,7 +297,7 @@ func TestStickyIsSent(t *testing.T) {
 	path := "/_matrix/client/v3/rooms/" + room + "/send/m.room.message/t?" + StickyParam + "=60000"
 	r := httptest.NewRequest(http.MethodPut, path, strings.NewReader(`{"msgtype":"m.text","body":"hi"}`))
 	r.Header.Set("Authorization", "Bearer tok")
-	out := h.c.Send(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
+	out := h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
 	if out.Result != "created" {
 		t.Fatalf("outcome %+v", out)
 	}
@@ -390,7 +401,7 @@ func TestRequestsLeftToSynapse(t *testing.T) {
 		if tc.auth != "" {
 			r.Header.Set("Authorization", tc.auth)
 		}
-		out := h.c.Send(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
+		out := h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
 		if out.Fallback != tc.want {
 			t.Errorf("%s: fallback %q, want %q", tc.path, out.Fallback, tc.want)
 		}
@@ -404,7 +415,7 @@ func TestFallbackLeavesBodyReadable(t *testing.T) {
 	const body = `{"msgtype":"m.text","body":"hi"}`
 	r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+"/send/m.room.message/t", strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer tok")
-	h.c.Send(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
+	h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
 	b := make([]byte, 100)
 	n, _ := r.Body.Read(b)
 	if string(b[:n]) != body {
@@ -424,7 +435,7 @@ func TestValidateSend(t *testing.T) {
 		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{"user_ids":[1]}}`, "invalid_mentions"},
 		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":[]}`, "invalid_mentions"},
 	} {
-		if got := validateSend(tc.typ, gjson.Parse(tc.content)); got != tc.want {
+		if got := validate(&input{typ: tc.typ}, gjson.Parse(tc.content)); got != tc.want {
 			t.Errorf("%s %s: %q, want %q", tc.typ, tc.content, got, tc.want)
 		}
 	}
@@ -450,5 +461,146 @@ func TestRoomLocksSerialise(t *testing.T) {
 	<-done
 	if len(l.rooms) != 0 {
 		t.Errorf("%d rooms left in the lock table", len(l.rooms))
+	}
+}
+
+func (h *harness) put(t *testing.T, req route.Request, path, body string) (*httptest.ResponseRecorder, Outcome) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+path, strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	return rec, h.c.Serve(rec, r, req)
+}
+
+func stateReq(typ, key string) route.Request {
+	return route.Request{Endpoint: route.State, Write: true, Room: room, Action: typ, StateKey: key}
+}
+
+func TestNativeState(t *testing.T) {
+	h := newHarness(t)
+	rec, out := h.put(t, stateReq("m.room.topic", ""), "/state/m.room.topic/", `{"topic":"new"}`)
+	if out.Result != "created" || rec.Code != 200 {
+		t.Fatalf("%+v %d %s", out, rec.Code, rec.Body)
+	}
+	id := gjson.Get(rec.Body.String(), "event_id").Str
+	if got := strings.Join(h.w.calls, ","); got != "bump,state_group,stage" {
+		t.Errorf("writes %s (no room participation for state)", got)
+	}
+	if len(h.w.groupDelta) != 1 || h.w.groupDelta[0] != (writer.StateRow{Type: "m.room.topic", StateKey: "", EventID: id}) {
+		t.Errorf("group delta %v", h.w.groupDelta)
+	}
+	e := gjson.ParseBytes(h.p.entries[0])
+	for path, want := range map[string]string{
+		"context.state_group":              "8",
+		"context.state_group_before_event": "7",
+		"context.state_group_deltas.#":     "2",
+		"context.state_group_deltas.0":     `[7,8,[["m.room.topic","","` + id + `"]]]`,
+		"context.state_group_deltas.1.0":   "6",
+		"context.state_group_deltas.1.1":   "7",
+		"context.state_delta_due_to_event": `[["m.room.topic","","` + id + `"]]`,
+		"event.state_key":                  `""`,
+		"event.unsigned.replaces_state":    `"` + h.f.topic + `"`,
+		"event.content":                    `{"topic":"new"}`,
+	} {
+		if got := e.Get(path).Raw; got != want {
+			t.Errorf("%s = %s, want %s", path, got, want)
+		}
+	}
+	if e.Get("internal_metadata.txn_id").Exists() {
+		t.Error("/state has no transaction")
+	}
+}
+
+func TestStateDedupWritesNothing(t *testing.T) {
+	h := newHarness(t)
+	rec, out := h.put(t, stateReq("m.room.topic", ""), "/state/m.room.topic/", `{ "topic" : "old" }`)
+	if out.Result != "state_dedup" || gjson.Get(rec.Body.String(), "event_id").Str != h.f.topic {
+		t.Fatalf("%+v %s", out, rec.Body)
+	}
+	if len(h.w.calls) != 0 || len(h.p.entries) != 0 {
+		t.Errorf("a duplicate wrote: %v", h.w.calls)
+	}
+}
+
+func TestStateFallbacks(t *testing.T) {
+	for _, tc := range []struct {
+		typ, key, body, want string
+	}{
+		{"m.room.member", "@x:example.org", `{"membership":"join"}`, "type_member"},
+		{"m.room.power_levels", "", `{}`, "type_validated"},
+		{"m.room.server_acl", "", `{}`, "type_validated"},
+		{"m.room.create", "", `{}`, "type_create"},
+		{"m.room.topic", "", `{"topic":1}`, "invalid_topic"},
+		{"m.room.name", "", `{}`, "invalid_name"},
+		{"m.room.tombstone", "", `{"replacement_room":"!x:y"}`, "type_tombstone"},
+	} {
+		h := newHarness(t)
+		_, out := h.put(t, stateReq(tc.typ, tc.key), "/state/"+tc.typ+"/"+tc.key, tc.body)
+		if out.Fallback != tc.want {
+			t.Errorf("%s: fallback %q, want %q", tc.typ, out.Fallback, tc.want)
+		}
+		if len(h.w.calls) != 0 {
+			t.Errorf("%s: wrote %v", tc.typ, h.w.calls)
+		}
+	}
+}
+
+func redactReq(target, txn string) route.Request {
+	return route.Request{Endpoint: route.Redact, Write: true, Room: room, Action: target, TxnID: txn}
+}
+
+func TestNativeRedaction(t *testing.T) {
+	h := newHarness(t)
+	rec, out := h.put(t, redactReq(h.f.topic, "r1"), "/redact/x/r1", `{"reason":"test"}`)
+	if out.Result != "created" || rec.Code != 200 {
+		t.Fatalf("%+v %d %s", out, rec.Code, rec.Body)
+	}
+	e := gjson.ParseBytes(h.p.entries[0])
+	for path, want := range map[string]string{
+		"event.type":                   `"m.room.redaction"`,
+		"event.content.redacts":        `"` + h.f.topic + `"`,
+		"event.content.reason":         `"test"`,
+		"internal_metadata.txn_id":     `"r1"`,
+		"context.state_group":          "7",
+		"context.state_group_deltas.0": "[7,7,[]]",
+	} {
+		if got := e.Get(path).Raw; got != want {
+			t.Errorf("%s = %s, want %s", path, got, want)
+		}
+	}
+	if e.Get("event.redacts").Exists() {
+		t.Error("v11 redaction with a top-level redacts")
+	}
+	if e.Get("internal_metadata.recheck_redaction").Exists() {
+		t.Error("recheck_redaction for a sender with redact power")
+	}
+	if got := strings.Join(h.w.calls, ","); got != "bump,stage" {
+		t.Errorf("writes %s", got)
+	}
+}
+
+func TestRedactionFallbacks(t *testing.T) {
+	h := newHarness(t)
+	for name, tc := range map[string]struct{ target, body, want string }{
+		"create event":    {h.f.create, `{}`, "redact_create"},
+		"unknown target":  {"$nope", `{}`, "redaction_target_unknown"},
+		"redacts differs": {h.f.topic, `{"redacts":"$other"}`, "redacts_mismatch"},
+		"with relations":  {h.f.topic, `{"org.matrix.msc3912.with_relations":["m.thread"]}`, "with_relations"},
+	} {
+		h := newHarness(t)
+		target := tc.target
+		if name == "create event" {
+			target = h.f.create
+		}
+		if name == "redacts differs" || name == "with relations" {
+			target = h.f.topic
+		}
+		_, out := h.put(t, redactReq(target, "r"), "/redact/x/r", tc.body)
+		if out.Fallback != tc.want {
+			t.Errorf("%s: fallback %q, want %q", name, out.Fallback, tc.want)
+		}
+		if len(h.w.calls) != 0 {
+			t.Errorf("%s: wrote %v", name, h.w.calls)
+		}
 	}
 }

@@ -68,12 +68,25 @@ func (c *Creator) check(v pending) {
 	})
 
 	g, err := c.o.Store.StateGroupForEvent(ctx, p.ev.ID)
-	record("state_group", err == nil && g == p.group, func(e *zerolog.Event) {
-		e.AnErr("err", err).Int64("stored", g).Int64("ours", p.group)
+	record("state_group", err == nil && g == p.after, func(e *zerolog.Event) {
+		e.AnErr("err", err).Int64("stored", g).Int64("ours", p.after)
 	})
+	if p.ev.IsState() {
+		// The group we stored: a delta of exactly the event on the group
+		// before (or, past the hop limit, a full group).
+		prev, hasPrev, delta, err := c.o.Store.StateDelta(ctx, p.after)
+		ok := err == nil && (!hasPrev || (prev == p.group && len(delta) == 1 && delta[p.ev.Key()] == p.ev.ID))
+		record("state_group_shape", ok, func(e *zerolog.Event) {
+			e.AnErr("err", err).Bool("has_prev", hasPrev).Int64("prev", prev).Int("delta", len(delta))
+		})
+		// The room's current state now holds the event.
+		cur, err := c.o.Store.StateForGroup(ctx, p.after)
+		record("state_after", err == nil && cur[p.ev.Key()] == p.ev.ID && len(cur) == len(p.before)+boolInt(p.replaces == ""),
+			func(e *zerolog.Event) { e.AnErr("err", err).Int("entries", len(cur)).Int("before", len(p.before)) })
+	}
 
-	if p.req.TxnID != "" {
-		id, err := c.o.Store.TxnEvent(ctx, p.req.Room, p.rq.UserID, p.rq.DeviceID, p.req.TxnID)
+	if p.in.txn != "" {
+		id, err := c.o.Store.TxnEvent(ctx, p.req.Room, p.rq.UserID, p.rq.DeviceID, p.in.txn)
 		record("txn_mapping", err == nil && id == p.ev.ID, func(e *zerolog.Event) { e.AnErr("err", err).Str("stored", id) })
 	}
 
@@ -113,3 +126,10 @@ func canonicalWithout(raw []byte, drop ...string) ([]byte, error) {
 type canonicalRaw []byte
 
 func (r canonicalRaw) MarshalJSON() ([]byte, error) { return r, nil }
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}

@@ -31,7 +31,7 @@ const (
 	ModeShadow Mode = "shadow"
 	// ModeNative serves writes in an allowlisted room here (package
 	// creator), and proxies the rest; whatever native handling declines is
-	// proxied and shadow-checked.
+	// proxied and shadow-checked. send, state and redact only.
 	ModeNative Mode = "native"
 )
 
@@ -40,8 +40,8 @@ const (
 // its code path exists would silently mean "proxy".
 var accepted = map[route.Endpoint][]Mode{
 	route.Send:       {ModeProxy, ModeShadow, ModeNative},
-	route.State:      {ModeProxy, ModeShadow},
-	route.Redact:     {ModeProxy, ModeShadow},
+	route.State:      {ModeProxy, ModeShadow, ModeNative},
+	route.Redact:     {ModeProxy, ModeShadow, ModeNative},
 	route.Membership: {ModeProxy, ModeShadow},
 	route.Join:       {ModeProxy, ModeShadow},
 	route.Knock:      {ModeProxy},

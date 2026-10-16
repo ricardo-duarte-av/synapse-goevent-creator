@@ -76,8 +76,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// allowlisted rooms. An alias names no room yet, so it never passes.
 	ours := req.Write && h.rooms.Check(req.Room)
 
-	if ours && mode == config.ModeNative && h.creator != nil && req.Endpoint == route.Send {
-		out := h.creator.Send(w, r, req)
+	if ours && mode == config.ModeNative && h.creator != nil && creator.Serves(req.Endpoint) {
+		out := h.creator.Serve(w, r, req)
 		if out.Fallback == "" {
 			requests.WithLabelValues(string(req.Endpoint), "true", "allowlisted", "native", "native_"+out.Result).Inc()
 			return

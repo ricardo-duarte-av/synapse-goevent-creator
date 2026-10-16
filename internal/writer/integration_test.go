@@ -41,7 +41,8 @@ func TestWritesAsTheRole(t *testing.T) {
 	defer a.Close(ctx)
 	for _, q := range []string{
 		`DELETE FROM event_push_actions_staging`, `DELETE FROM room_memberships`, `DELETE FROM local_current_membership`,
-		`DELETE FROM state_groups_pending_deletion`, `DELETE FROM state_groups WHERE id IN (101, 102)`,
+		`DELETE FROM state_groups_pending_deletion`, `DELETE FROM state_group_edges WHERE prev_state_group IN (101, 102)`,
+		`DELETE FROM state_groups_state WHERE room_id = '!r:x'`, `DELETE FROM state_groups WHERE room_id = '!r:x'`,
 		`INSERT INTO room_memberships (event_id, user_id, sender, room_id, membership, participant) VALUES ('$m', '@u:x', '@u:x', '!r:x', 'join', false)`,
 		`INSERT INTO local_current_membership (room_id, user_id, event_id, membership) VALUES ('!r:x', '@u:x', '$m', 'join')`,
 		`INSERT INTO state_groups (id, room_id, event_id) VALUES (101, '!r:x', '$a'), (102, '!r:x', '$b')`,
@@ -97,12 +98,30 @@ func TestWritesAsTheRole(t *testing.T) {
 		t.Errorf("pending deletion not bumped: %d (%v)", ts, err)
 	}
 
+	// A state event's group: a delta on 101.
+	g, err := d.StoreStateGroup(ctx, "$s", "!r:x", 101, []StateRow{{"m.room.topic", "", "$s"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var edge int64
+	if err := a.QueryRow(ctx, `SELECT prev_state_group FROM state_group_edges WHERE state_group = $1`, g).Scan(&edge); err != nil || edge != 101 {
+		t.Errorf("edge %d (%v)", edge, err)
+	}
+	var row string
+	if err := a.QueryRow(ctx, `SELECT type || '|' || state_key || '|' || event_id FROM state_groups_state WHERE state_group = $1`, g).Scan(&row); err != nil || row != "m.room.topic||$s" {
+		t.Errorf("row %q (%v)", row, err)
+	}
+	if _, err := d.StoreStateGroup(ctx, "$s2", "!r:x", 999, []StateRow{{"m.room.topic", "", "$s2"}}, nil); err == nil {
+		t.Error("stored a group on a prev group that does not exist")
+	}
+
 	// Nothing else: Synapse's other tables are refused.
 	for _, q := range []string{
 		`INSERT INTO events (event_id, topological_ordering, stream_ordering, room_id, type, processed, outlier) VALUES ('$x', 1, 1, '!r:x', 't', true, false)`,
 		`UPDATE room_memberships SET membership = 'leave'`,
 		`DELETE FROM room_memberships`,
-		`INSERT INTO state_groups (id, room_id, event_id) VALUES (103, '!r:x', '$c')`,
+		`UPDATE state_groups SET room_id = '!other:x'`,
+		`DELETE FROM state_groups_state`,
 		`SELECT count(*) FROM access_tokens`,
 	} {
 		if _, err := d.pool.Exec(ctx, q); err == nil || !strings.Contains(err.Error(), "permission denied") {

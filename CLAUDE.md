@@ -81,9 +81,10 @@ in gopro.
   event** (`room_member.py`, duplicate rule: same sender, membership and
   content). The shadow check predicts it (`membership_noop`).
 
-## Native mode (M3, /send only)
+## Native mode (M3 /send, M4 /state and /redact)
 
-`modes.send: native` serves `/send` in the allowlisted rooms (`internal/creator`):
+`modes.{send,state,redact}: native` serve those endpoints in the allowlisted
+rooms (`internal/creator`):
 requester from whoami plus `access_tokens`/`users`, txn dedup, one prev event
 only, relation and content validation, build, auth, push rows, then the
 creator's own writes (deletion bump, room participation, push staging) as the
@@ -109,6 +110,25 @@ Each native event is verified against what was persisted
   `events`: the role needs SELECT on it (found by `TestWritesAsTheRole`).
 - The write role is created or repaired at startup over PostgreSQL's socket with
   homeserver.yaml's credentials (`dbrole.Ensure`); its password is derived.
+- **Policy servers (MSC4284)**: Synapse asks a room's policy server to sign
+  every local event and refuses what it calls spam
+  (`_create_and_send_nonmember_event_locked`). Neither test room has one; a
+  room with `m.room.policy` (or the unstable type) in its state falls back.
+- **State events**: dedup (`deduplicate_state_event`) is checked before auth,
+  as Synapse does; Synapse stores the new state group *before* dedup and leaves
+  it orphaned, we do not store it. The new group is a delta of exactly the
+  event on the group before (`writer.StoreStateGroup`, goinbound's port, full
+  group past 100 hops); the context's `state_group_deltas` is `(before,
+  after, [event])` then the group before's own edge. `unsigned.replaces_state`
+  is set. Membership, create, power levels, ACL, aliases, retention, policy
+  and tombstone fall back (their content validation is not ported).
+- **Redactions**: in v11 `redacts` goes into the content (the servlet does
+  it); a body naming another `redacts` is Synapse's 400. `recheck_redaction`
+  goes in internal metadata when the auth rules set it. Targets that are the
+  create event, a server ACL, unknown, or in another room fall back: the
+  writer would refuse the first three, and a redaction of a room's create
+  event is never sent from here. `msc3912 with_relations` and a set
+  `redaction_allowed_period` fall back.
 
 ## End-to-end suite
 
@@ -123,7 +143,8 @@ GOEVENT_E2E_PASSWORD=... GOEXPERIMENT=jsonv2 go run ./cmd/goevent-e2e \
 ```
 
 Run it against shadow mode first: that is Synapse's own behaviour, and the
-expectations are calibrated on it (31/31 on 2026-10-16).
+expectations are calibrated on it (46/46 on 2026-10-16, then 46/46 with send,
+state and redact native, 21 native events all verified).
 
 ## Shadow mode (M2)
 

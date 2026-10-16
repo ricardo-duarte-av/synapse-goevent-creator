@@ -334,6 +334,38 @@ func run() int {
 		s.record("state topic", false, "status %d %s", r.status, r.raw)
 	}
 
+	// /state, beyond the topic.
+	custom := map[string]any{"run": s.run}
+	r = c.do(http.MethodPut, s.roomPath("/state/pt.aguiarvieira.goevent.test/e2e"), custom, true)
+	if id := r.body.Get("event_id").Str; r.status == 200 && id != "" {
+		s.checkEvent("state custom", id, "pt.aguiarvieira.goevent.test", custom, "")
+		next := map[string]any{"run": s.run, "second": true}
+		r2 := c.do(http.MethodPut, s.roomPath("/state/pt.aguiarvieira.goevent.test/e2e"), next, true)
+		ev := c.do(http.MethodGet, s.roomPath("/event/"+esc(r2.body.Get("event_id").Str)), nil, true)
+		s.record("state replaces_state", ev.body.Get("unsigned.replaces_state").Str == id,
+			"replaces_state %s (want %s)", ev.body.Get("unsigned.replaces_state").Raw, id)
+		got := c.do(http.MethodGet, s.roomPath("/state/pt.aguiarvieira.goevent.test/e2e"), nil, true)
+		s.record("state reads back", got.status == 200 && got.body.Get("run").Str == s.run && got.body.Get("second").Bool(), "%d %s", got.status, got.raw)
+	} else {
+		s.record("state custom", false, "status %d %s", r.status, r.raw)
+	}
+	r = c.do(http.MethodPut, s.roomPath("/state/pt.aguiarvieira.goevent.test/"+esc(me)), map[string]any{"run": s.run}, true)
+	s.record("state keyed by own user", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
+	s.expectError("refuse state keyed by another user", c.do(http.MethodPut,
+		s.roomPath("/state/pt.aguiarvieira.goevent.test/"+esc("@nobody:example.org")), map[string]any{"run": s.run}, true), 403, "M_FORBIDDEN")
+	name := c.do(http.MethodGet, s.roomPath("/state/m.room.name/"), nil, true)
+	if name.status == 200 {
+		r = c.do(http.MethodPut, s.roomPath("/state/m.room.name/"), name.raw, true)
+		s.record("state name, unchanged", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
+	} else {
+		s.skip("state name, unchanged", fmt.Sprintf("no name to keep: %d", name.status))
+	}
+	pl := c.do(http.MethodGet, s.roomPath("/state/m.room.power_levels/"), nil, true)
+	if pl.status == 200 {
+		r = c.do(http.MethodPut, s.roomPath("/state/m.room.power_levels/"), pl.raw, true)
+		s.record("state power levels, unchanged (Synapse's)", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
+	}
+
 	// /redact
 	victim := s.send("send to redact", "m.room.message", map[string]any{"msgtype": "m.notice", "body": tag + ": to be redacted"}, "")
 	if victim != "" {
@@ -341,6 +373,35 @@ func run() int {
 		ev := c.do(http.MethodGet, s.roomPath("/event/"+esc(victim)), nil, true)
 		s.record("redact", r.status == 200 && r.body.Get("event_id").Str != "" && ev.body.Get("content").Raw == "{}",
 			"%d %s; redacted content %s", r.status, r.body.Get("event_id").Str, ev.body.Get("content").Raw)
+		if id := r.body.Get("event_id").Str; id != "" {
+			red := c.do(http.MethodGet, s.roomPath("/event/"+esc(id)), nil, true)
+			s.record("redaction event", red.body.Get("content.redacts").Str == victim && red.body.Get("content.reason").Str == tag &&
+				red.body.Get("unsigned.transaction_id").Str == s.txn("redact"), "%s", red.body.Get("content").Raw)
+		}
+		again := c.do(http.MethodPut, s.roomPath("/redact/"+esc(victim)+"/"+esc(s.txn("redact"))), map[string]any{"reason": tag}, true)
+		s.record("redact txn retry", again.status == 200 && again.body.Get("event_id").Str == r.body.Get("event_id").Str,
+			"%d %s (want %s)", again.status, again.body.Get("event_id").Str, r.body.Get("event_id").Str)
+	}
+	if v := s.send("send to redact by POST", "m.room.message", map[string]any{"msgtype": "m.notice", "body": tag + ": redacted by POST"}, ""); v != "" {
+		r := c.do(http.MethodPost, s.roomPath("/redact/"+esc(v)), map[string]any{}, true)
+		ev := c.do(http.MethodGet, s.roomPath("/event/"+esc(v)), nil, true)
+		s.record("redact by POST", r.status == 200 && ev.body.Get("content").Raw == "{}", "%d %s", r.status, r.raw)
+		s.expectError("refuse redacts that differs", c.do(http.MethodPut, s.roomPath("/redact/"+esc(v)+"/"+esc(s.txn("mismatch"))),
+			map[string]any{"redacts": "$someotherevent"}, true), 400, "M_INVALID_PARAM")
+	}
+	if text != "" {
+		reaction := map[string]any{"m.relates_to": map[string]any{"rel_type": "m.annotation", "event_id": text, "key": "🗑"}}
+		if rid := s.send("send reaction to redact", "m.reaction", reaction, ""); rid != "" {
+			r := c.do(http.MethodPut, s.roomPath("/redact/"+esc(rid)+"/"+esc(s.txn("redact reaction"))), map[string]any{}, true)
+			s.record("redact reaction", r.status == 200, "%d %s", r.status, r.raw)
+		}
+	}
+	create := c.do(http.MethodGet, s.roomPath("/state/m.room.create/?format=event"), nil, true)
+	if cid := create.body.Get("event_id").Str; cid != "" {
+		s.expectError("refuse redacting the create event", c.do(http.MethodPut, s.roomPath("/redact/"+esc(cid)+"/"+esc(s.txn("create"))),
+			map[string]any{}, true), 403, "M_FORBIDDEN")
+	} else {
+		s.skip("refuse redacting the create event", fmt.Sprintf("create event not found: %d %s", create.status, create.raw))
 	}
 
 	// Membership: a user that does not exist, so nobody is disturbed.
