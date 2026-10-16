@@ -29,12 +29,34 @@ rooms:
   - "!decSfHzLLhrNKJaZid:aguiarvieira.pt"   # TEST6TEST
   - "!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt"   # TEST7TESTE
 
-# Every endpoint must be given a mode. Only "proxy" exists so far.
+# Every endpoint must be given a mode:
+#   proxy   forward to the upstream, untouched
+#   shadow  forward too, and for writes in the rooms above check afterwards
+#           that we would have built the event Synapse built. Writes nothing.
 modes:
-  send: proxy
-  state: proxy
-  redact: proxy
-  membership: proxy
-  join: proxy
-  knock: proxy
-  profile: proxy     # always proxy: profile writes touch every room the user is in
+  send: shadow
+  state: shadow
+  redact: shadow
+  membership: shadow
+  join: shadow
+  knock: proxy       # proxy only: knocks are remote, main's job
+  profile: proxy     # proxy only: profile writes touch every room the user is in
+
+# Needed by shadow. The session is read-only (default_transaction_read_only),
+# and the worker refuses to start if it is not.
+database:
+  # Empty: homeserver.yaml's database and user, straight to PostgreSQL's
+  # socket in `host` (homeserver.yaml's own host is pgcat, which only knows
+  # the users in its own config).
+  dsn: ""
+  host: /var/sockets
+  max_conns: 4
+
+auth:
+  # Synapse's whoami, to know who sent a request. Empty: the first upstream.
+  whoami_socket: ""
+  cache_seconds: 60
+
+shadow:
+  concurrency: 8
+  timeout_seconds: 30

@@ -13,8 +13,9 @@ ARG COMMIT=unknown
 ARG BUILD_TIME=unknown
 
 # CGO_ENABLED=0 for the distroless static base below: every dependency is pure
-# Go, pgx included.
-RUN CGO_ENABLED=0 go build -trimpath \
+# Go, pgx included. GOEXPERIMENT=jsonv2: mautrix's federation/pdu (hashing,
+# signing, event IDs) is built only with it.
+RUN CGO_ENABLED=0 GOEXPERIMENT=jsonv2 go build -trimpath \
       -ldflags="-s -w \
         -X main.tag=${TAG} \
         -X main.commit=${COMMIT} \

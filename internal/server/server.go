@@ -5,6 +5,10 @@
 // database, and the request reaches Synapse unchanged. What the path says is
 // still counted, so the traffic a native mode would take is known before it
 // exists.
+//
+// In shadow mode the request is still proxied unchanged. For a write in an
+// allowlisted room the shadow checker reads the room first and compares
+// afterwards (package shadow).
 package server
 
 import (
@@ -19,6 +23,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/config"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/proxy"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/shadow"
 )
 
 var (
@@ -41,29 +46,50 @@ var (
 
 // Handler serves every request nginx sends us.
 type Handler struct {
-	cfg   *config.Config
-	up    *proxy.Proxy
-	rooms *allowlist.List
-	log   zerolog.Logger
+	cfg     *config.Config
+	up      *proxy.Proxy
+	rooms   *allowlist.List
+	checker *shadow.Checker
+	log     zerolog.Logger
 }
 
-// New builds the front door.
-func New(cfg *config.Config, up *proxy.Proxy, rooms *allowlist.List, log zerolog.Logger) *Handler {
+// New builds the front door. checker may be nil when nothing is shadowed.
+func New(cfg *config.Config, up *proxy.Proxy, rooms *allowlist.List, checker *shadow.Checker, log zerolog.Logger) *Handler {
 	for _, ep := range route.Endpoints {
 		modeInfo.WithLabelValues(string(ep), string(cfg.ModeFor(ep))).Set(1)
 	}
-	return &Handler{cfg: cfg, up: up, rooms: rooms, log: log}
+	return &Handler{cfg: cfg, up: up, rooms: rooms, checker: checker, log: log}
 }
+
+// shadowCapture is how much of Synapse's answer a shadowed request keeps:
+// the event ID is all that is read from it.
+const shadowCapture = 4096
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req := route.Classify(r.Method, r.URL.EscapedPath())
+	served := "proxy"
 
-	// Every endpoint is proxy-only so far; config refuses any other mode.
-	res := h.up.Forward(w, r, 0)
+	// Nothing is native yet: every request is proxied, and some are also
+	// checked. An alias names no room yet, so it is never checked.
+	var pending *shadow.Pending
+	if h.checker != nil && req.Write && h.cfg.ModeFor(req.Endpoint) == config.ModeShadow && h.rooms.Check(req.Room) {
+		pending = h.checker.Prepare(r.Context(), r, req)
+		served = "shadow"
+	}
+
+	capture := int64(0)
+	if pending != nil {
+		capture = shadowCapture
+	}
+	res := h.up.Forward(w, r, capture)
+
+	if pending != nil {
+		h.checker.Check(pending, res.Status, res.Body)
+	}
 
 	upstreamSeconds.WithLabelValues(string(req.Endpoint)).Observe(res.Duration.Seconds())
 	requests.WithLabelValues(string(req.Endpoint), strconv.FormatBool(req.Write),
-		h.roomClass(req), "proxy", statusClass(res)).Inc()
+		h.roomClass(req), served, statusClass(res)).Inc()
 
 	if res.Err != nil {
 		h.log.Warn().Err(res.Err).Str("endpoint", string(req.Endpoint)).

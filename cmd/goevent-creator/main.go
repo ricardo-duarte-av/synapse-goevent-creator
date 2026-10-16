@@ -14,6 +14,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,9 +22,13 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/allowlist"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/auth"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/build"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/config"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/proxy"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/server"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/shadow"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/synapsecfg"
 )
 
@@ -89,11 +94,25 @@ func run(cfg *config.Config, log zerolog.Logger) error {
 	// Proxy mode needs only the upstream, and does not insist on
 	// homeserver.yaml: it is the first thing deployed. Reading it anyway
 	// shows at once whether the mount is right.
-	if hs, err := synapsecfg.Load(cfg.HomeserverYAML); err != nil {
-		log.Warn().Err(err).Msg("Cannot read homeserver.yaml; fine in proxy mode, required for any other")
+	hs, hsErr := synapsecfg.Load(cfg.HomeserverYAML)
+	if hsErr != nil {
+		if cfg.AnyShadow() {
+			return hsErr
+		}
+		log.Warn().Err(hsErr).Msg("Cannot read homeserver.yaml; fine in proxy mode, required for any other")
 	} else {
 		log.Info().Str("server_name", hs.ServerName).
 			Strs("events_writers", hs.Writers.Events).Msg("Read homeserver.yaml")
+	}
+
+	var checker *shadow.Checker
+	if cfg.AnyShadow() {
+		var closeDB func()
+		checker, closeDB, err = newChecker(ctx, cfg, hs, log)
+		if err != nil {
+			return err
+		}
+		defer closeDB()
 	}
 
 	up, err := proxy.New(cfg.Upstream, log)
@@ -105,7 +124,7 @@ func run(cfg *config.Config, log zerolog.Logger) error {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("OK"))
 	})
-	mux.Handle("/", server.New(cfg, up, rooms, log))
+	mux.Handle("/", server.New(cfg, up, rooms, checker, log))
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -153,6 +172,95 @@ func run(cfg *config.Config, log zerolog.Logger) error {
 	defer cancel()
 	_ = metricsSrv.Shutdown(shutdownCtx)
 	return srv.Shutdown(shutdownCtx)
+}
+
+// newChecker connects what shadow mode reads: the database, read-only, the
+// signing key and whoami.
+func newChecker(ctx context.Context, cfg *config.Config, hs *synapsecfg.Config, log zerolog.Logger) (*shadow.Checker, func(), error) {
+	dsn := cfg.Database.DSN
+	if dsn == "" {
+		if !hs.Database.Present {
+			return nil, nil, errors.New("no database: set database.dsn, or give homeserver.yaml a database block")
+		}
+		direct := hs.Database
+		direct.Host = cfg.Database.Host
+		if direct.Host == "" {
+			direct.Host = "/var/sockets"
+		}
+		direct.Port = 0
+		dsn = direct.DSN()
+	}
+	// Server-enforced: until write mode, this session cannot write.
+	dsn += " default_transaction_read_only=on"
+	maxConns := int32(cfg.Database.MaxConns)
+	if maxConns == 0 {
+		maxConns = 4
+	}
+	db, err := pdustore.Open(ctx, dsn, maxConns)
+	if err != nil {
+		return nil, nil, err
+	}
+	ro, err := db.ReadOnly(ctx)
+	if err != nil || !ro {
+		db.Close()
+		return nil, nil, fmt.Errorf("database session is not read-only (%v); refusing to start", err)
+	}
+	log.Info().Str("database", redactDSN(dsn)).Msg("Connected to the database, read-only")
+
+	line, err := hs.SigningKeyLine()
+	if err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	key, err := build.ParseKey(hs.ServerName, line)
+	if err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+	log.Info().Str("key_id", string(key.ID)).Msg("Loaded the signing key")
+
+	whoami := cfg.Auth.WhoamiSocket
+	if whoami == "" {
+		whoami = cfg.Upstream.Sockets[0]
+	}
+	ttl := time.Duration(cfg.Auth.CacheSeconds) * time.Second
+	if ttl == 0 {
+		ttl = time.Minute
+	}
+	authn, err := auth.New(auth.Config{
+		WhoamiSocket: whoami,
+		PositiveTTL:  ttl,
+		NegativeTTL:  10 * time.Second,
+		MaxEntries:   1024,
+		Timeout:      10 * time.Second,
+	})
+	if err != nil {
+		db.Close()
+		return nil, nil, err
+	}
+
+	checker := shadow.New(shadow.Options{
+		Store:       db,
+		Auth:        authn,
+		Key:         key,
+		ServerName:  hs.ServerName,
+		Sticky:      hs.Flag("msc4354_enabled", false),
+		Concurrency: cfg.Shadow.Concurrency,
+		Timeout:     time.Duration(cfg.Shadow.TimeoutSeconds) * time.Second,
+		Log:         log,
+	})
+	return checker, db.Close, nil
+}
+
+// redactDSN hides a password in a DSN, for logs.
+func redactDSN(dsn string) string {
+	fields := strings.Fields(dsn)
+	for i, f := range fields {
+		if strings.HasPrefix(f, "password=") {
+			fields[i] = "password=***"
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 func newLogger(cfg config.Log) (zerolog.Logger, error) {

@@ -7,8 +7,11 @@ in place of the Python `event_creator` worker (`av-client-events-1`, which it
 is meant to retire) and proxies whatever it does not serve itself to Synapse's
 main process.
 
-**Status: M1, proxy only.** Every request is forwarded unchanged and counted
-by endpoint and room (`goevent_requests_total{endpoint,write,room,served,status}`).
+**Status: M2, shadow.** Every request is forwarded unchanged and counted by
+endpoint and room (`goevent_requests_total{endpoint,write,room,served,status}`).
+For writes in the allowlisted rooms, the worker also re-derives what Synapse
+decided and rebuilds the event, which must come out with the same event ID
+(`goevent_shadow_checks_total{endpoint,check,result}`). It writes nothing.
 Native event creation comes in stages (`docs/plan.md`), and only ever for the
 rooms compiled into `internal/allowlist`.
 
@@ -31,4 +34,5 @@ docker compose up -d
 Then point a **test** hostname's event_creator locations at
 `/var/sockets/nginx/av-goevent-creator-1.sock` (`deploy/nginx.conf.example`).
 
-Build: `go build ./cmd/goevent-creator`. Test: `go test -race ./...`.
+Build: `GOEXPERIMENT=jsonv2 go build ./cmd/goevent-creator`. Test:
+`GOEXPERIMENT=jsonv2 go test -race ./...`.

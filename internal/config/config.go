@@ -25,17 +25,21 @@ type Mode string
 const (
 	// ModeProxy forwards every request to the upstream untouched.
 	ModeProxy Mode = "proxy"
+	// ModeShadow forwards every request too, and for writes in an
+	// allowlisted room checks afterwards that we would have built the
+	// event Synapse built (package shadow). It writes nothing.
+	ModeShadow Mode = "shadow"
 )
 
 // accepted is every mode an endpoint may be given today. Shadow and native
 // are added per endpoint as each one exists: a mode that is accepted before
 // its code path exists would silently mean "proxy".
 var accepted = map[route.Endpoint][]Mode{
-	route.Send:       {ModeProxy},
-	route.State:      {ModeProxy},
-	route.Redact:     {ModeProxy},
-	route.Membership: {ModeProxy},
-	route.Join:       {ModeProxy},
+	route.Send:       {ModeProxy, ModeShadow},
+	route.State:      {ModeProxy, ModeShadow},
+	route.Redact:     {ModeProxy, ModeShadow},
+	route.Membership: {ModeProxy, ModeShadow},
+	route.Join:       {ModeProxy, ModeShadow},
 	route.Knock:      {ModeProxy},
 	route.Profile:    {ModeProxy},
 }
@@ -57,6 +61,42 @@ type Config struct {
 	// Rooms are the rooms this worker may write to. Each must also be in
 	// allowlist.Permitted, which is compiled in.
 	Rooms []string `yaml:"rooms"`
+
+	Database Database `yaml:"database"`
+	Auth     Auth     `yaml:"auth"`
+	Shadow   Shadow   `yaml:"shadow"`
+}
+
+// Database is how we reach Synapse's PostgreSQL. Needed by any mode but
+// proxy.
+type Database struct {
+	// DSN overrides the connection. Empty means homeserver.yaml's
+	// database, user and password, reached directly on Host rather than
+	// through homeserver.yaml's host: that is pgcat here, which only
+	// accepts the users in its own config.
+	DSN string `yaml:"dsn"`
+	// Host is the PostgreSQL socket directory used when DSN is empty.
+	// Default /var/sockets.
+	Host string `yaml:"host"`
+	// MaxConns per pool. Zero uses 4.
+	MaxConns int `yaml:"max_conns"`
+}
+
+// Auth is how requesters are identified: Synapse's whoami.
+type Auth struct {
+	// WhoamiSocket is a Synapse client listener. Empty uses the first
+	// upstream socket.
+	WhoamiSocket string `yaml:"whoami_socket"`
+	// CacheSeconds is how long a verdict is kept. Zero uses 60.
+	CacheSeconds int `yaml:"cache_seconds"`
+}
+
+// Shadow tunes shadow mode.
+type Shadow struct {
+	// Concurrency bounds checks in flight. Zero uses 8.
+	Concurrency int `yaml:"concurrency"`
+	// TimeoutSeconds bounds one check. Zero uses 30.
+	TimeoutSeconds int `yaml:"timeout_seconds"`
 }
 
 // Listen is where nginx reaches us.
@@ -150,6 +190,10 @@ func (c *Config) validate() error {
 		return fmt.Errorf("homeserver_yaml must be set")
 	}
 
+	if c.AnyShadow() && c.Auth.WhoamiSocket == "" && len(c.Upstream.Sockets) == 0 {
+		return fmt.Errorf("auth.whoami_socket must be set when the upstream is not a socket")
+	}
+
 	for ep := range c.Modes {
 		if _, ok := accepted[ep]; !ok {
 			return fmt.Errorf("modes: unknown endpoint %q", ep)
@@ -165,6 +209,16 @@ func (c *Config) validate() error {
 		}
 	}
 	return nil
+}
+
+// AnyShadow reports whether some endpoint is in shadow mode.
+func (c *Config) AnyShadow() bool {
+	for _, m := range c.Modes {
+		if m == ModeShadow {
+			return true
+		}
+	}
+	return false
 }
 
 // ModeFor returns how an endpoint is served. Requests that match no endpoint

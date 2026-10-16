@@ -46,6 +46,21 @@ func TestModeNotYetAvailable(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not available") {
 		t.Fatalf("native send: err = %v", err)
 	}
+	// Profile writes touch every room the user is in: never shadowed.
+	_, err = parse([]byte(strings.Replace(valid, "profile: proxy", "profile: shadow", 1)))
+	if err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("shadow profile: err = %v", err)
+	}
+}
+
+func TestShadow(t *testing.T) {
+	cfg, err := parse([]byte(strings.Replace(valid, "send: proxy", "send: shadow", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AnyShadow() || cfg.ModeFor(route.Send) != ModeShadow {
+		t.Error("send is not in shadow mode")
+	}
 }
 
 func TestUnknownEndpoint(t *testing.T) {
