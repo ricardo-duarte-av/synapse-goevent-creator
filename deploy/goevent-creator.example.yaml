@@ -33,6 +33,8 @@ rooms:
 #   proxy   forward to the upstream, untouched
 #   shadow  forward too, and for writes in the rooms above check afterwards
 #           that we would have built the event Synapse built. Writes nothing.
+#   native  (send only) create events in the rooms above here; whatever is
+#           declined is proxied and shadowed. Creates the role goevent_creator.
 modes:
   send: shadow
   state: shadow

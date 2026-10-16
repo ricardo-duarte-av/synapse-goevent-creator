@@ -40,7 +40,7 @@ func TestProxyModeForwardsEverythingUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := New(cfg, up, rooms, nil, zerolog.Nop())
+	h := New(cfg, up, rooms, nil, nil, zerolog.Nop())
 
 	for _, uri := range []string{
 		"/_matrix/client/v3/rooms/%21decSfHzLLhrNKJaZid%3Aaguiarvieira.pt/send/m.room.message/t1",

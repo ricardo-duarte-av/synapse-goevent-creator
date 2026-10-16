@@ -21,6 +21,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/allowlist"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/config"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/creator"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/proxy"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/shadow"
@@ -50,15 +51,17 @@ type Handler struct {
 	up      *proxy.Proxy
 	rooms   *allowlist.List
 	checker *shadow.Checker
+	creator *creator.Creator
 	log     zerolog.Logger
 }
 
-// New builds the front door. checker may be nil when nothing is shadowed.
-func New(cfg *config.Config, up *proxy.Proxy, rooms *allowlist.List, checker *shadow.Checker, log zerolog.Logger) *Handler {
+// New builds the front door. checker may be nil when nothing is shadowed,
+// and native when nothing is native.
+func New(cfg *config.Config, up *proxy.Proxy, rooms *allowlist.List, checker *shadow.Checker, native *creator.Creator, log zerolog.Logger) *Handler {
 	for _, ep := range route.Endpoints {
 		modeInfo.WithLabelValues(string(ep), string(cfg.ModeFor(ep))).Set(1)
 	}
-	return &Handler{cfg: cfg, up: up, rooms: rooms, checker: checker, log: log}
+	return &Handler{cfg: cfg, up: up, rooms: rooms, checker: checker, creator: native, log: log}
 }
 
 // shadowCapture is how much of Synapse's answer a shadowed request keeps:
@@ -68,13 +71,27 @@ const shadowCapture = 4096
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req := route.Classify(r.Method, r.URL.EscapedPath())
 	served := "proxy"
+	mode := h.cfg.ModeFor(req.Endpoint)
+	// The one gate: nothing is written, natively or checked, outside the
+	// allowlisted rooms. An alias names no room yet, so it never passes.
+	ours := req.Write && h.rooms.Check(req.Room)
 
-	// Nothing is native yet: every request is proxied, and some are also
-	// checked. An alias names no room yet, so it is never checked.
+	if ours && mode == config.ModeNative && h.creator != nil && req.Endpoint == route.Send {
+		out := h.creator.Send(w, r, req)
+		if out.Fallback == "" {
+			requests.WithLabelValues(string(req.Endpoint), "true", "allowlisted", "native", "native_"+out.Result).Inc()
+			return
+		}
+		served = "fallback"
+	}
+
+	// Proxied, and in an allowlisted room also checked.
 	var pending *shadow.Pending
-	if h.checker != nil && req.Write && h.cfg.ModeFor(req.Endpoint) == config.ModeShadow && h.rooms.Check(req.Room) {
+	if ours && h.checker != nil && (mode == config.ModeShadow || mode == config.ModeNative) {
 		pending = h.checker.Prepare(r.Context(), r, req)
-		served = "shadow"
+		if served == "proxy" {
+			served = "shadow"
+		}
 	}
 
 	capture := int64(0)

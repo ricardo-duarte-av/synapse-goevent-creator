@@ -119,3 +119,115 @@ func (s *Store) ReadOnly(ctx context.Context) (bool, error) {
 	}
 	return v == "on", nil
 }
+
+const qTokenInfo = `SELECT t.id, t.user_id, COALESCE(t.device_id, ''), t.puppets_user_id IS NOT NULL,
+		COALESCE(u.shadow_banned, false), COALESCE(u.suspended, false), u.is_guest <> 0,
+		u.deactivated <> 0, COALESCE(u.locked, false), u.appservice_id IS NOT NULL
+	FROM access_tokens t INNER JOIN users u ON u.name = t.user_id
+	WHERE t.token = $1`
+
+// TokenInfo is what get_user_by_access_token knows about a token, beyond
+// whoami's answer: the token's ID, which the requester carries, and the
+// user's flags.
+type TokenInfo struct {
+	ID          int64
+	UserID      string
+	DeviceID    string
+	Puppet      bool
+	ShadowBan   bool
+	Suspended   bool
+	Guest       bool
+	Deactivated bool
+	Locked      bool
+	AppService  bool
+}
+
+// Token looks up an access token Synapse has already accepted. ErrNotFound
+// for a token not in access_tokens (an appservice's, or a guest macaroon).
+func (s *Store) Token(ctx context.Context, token string) (*TokenInfo, error) {
+	var t TokenInfo
+	err := s.pool.QueryRow(ctx, qTokenInfo, token).Scan(&t.ID, &t.UserID, &t.DeviceID, &t.Puppet,
+		&t.ShadowBan, &t.Suspended, &t.Guest, &t.Deactivated, &t.Locked, &t.AppService)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("pdustore: token: %w", err)
+	}
+	return &t, nil
+}
+
+const qPartialStateRoom = `SELECT EXISTS (SELECT 1 FROM partial_state_rooms WHERE room_id = $1)`
+
+// PartialState reports whether the room has partial state.
+func (s *Store) PartialState(ctx context.Context, roomID string) (bool, error) {
+	var b bool
+	if err := s.pool.QueryRow(ctx, qPartialStateRoom, roomID).Scan(&b); err != nil {
+		return false, fmt.Errorf("pdustore: partial state: %w", err)
+	}
+	return b, nil
+}
+
+const qEventRoom = `SELECT e.room_id FROM events AS e
+	WHERE e.event_id = $1 AND NOT EXISTS (SELECT 1 FROM rejections AS r WHERE r.event_id = e.event_id)`
+
+// EventRoom is the room of an event get_event would return: held, and not
+// rejected. ErrNotFound otherwise.
+func (s *Store) EventRoom(ctx context.Context, eventID string) (string, error) {
+	var room string
+	err := s.pool.QueryRow(ctx, qEventRoom, eventID).Scan(&room)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("pdustore: event room: %w", err)
+	}
+	return room, nil
+}
+
+const (
+	// qIsRelationTarget is event_is_target_of_relation.
+	qIsRelationTarget = `SELECT EXISTS (SELECT 1 FROM event_relations WHERE relates_to_id = $1)`
+	// qHasRelation is event_includes_relation.
+	qHasRelation = `SELECT EXISTS (SELECT 1 FROM event_relations WHERE event_id = $1)`
+	// qHasAnnotated is has_user_annotated_event, verbatim.
+	qHasAnnotated = `SELECT EXISTS (SELECT 1 FROM event_relations
+		INNER JOIN events USING (event_id)
+		WHERE relates_to_id = $1 AND relation_type = 'm.annotation' AND type = $2
+		  AND sender = $3 AND aggregation_key = $4)`
+)
+
+// IsRelationTarget is event_is_target_of_relation.
+func (s *Store) IsRelationTarget(ctx context.Context, eventID string) (bool, error) {
+	return s.exists(ctx, "relation target", qIsRelationTarget, eventID)
+}
+
+// HasRelation is event_includes_relation.
+func (s *Store) HasRelation(ctx context.Context, eventID string) (bool, error) {
+	return s.exists(ctx, "has relation", qHasRelation, eventID)
+}
+
+// HasAnnotated is has_user_annotated_event.
+func (s *Store) HasAnnotated(ctx context.Context, parent, eventType, sender, key string) (bool, error) {
+	return s.exists(ctx, "annotated", qHasAnnotated, parent, eventType, sender, key)
+}
+
+func (s *Store) exists(ctx context.Context, what, q string, args ...any) (bool, error) {
+	var b bool
+	if err := s.pool.QueryRow(ctx, q, args...).Scan(&b); err != nil {
+		return false, fmt.Errorf("pdustore: %s: %w", what, err)
+	}
+	return b, nil
+}
+
+const qRejectionColumn = `SELECT rejection_reason FROM events WHERE event_id = $1`
+
+// RejectionColumn is events.rejection_reason, which the events writer fills
+// from the context it was sent; nil for NULL.
+func (s *Store) RejectionColumn(ctx context.Context, eventID string) (*string, error) {
+	var v *string
+	if err := s.pool.QueryRow(ctx, qRejectionColumn, eventID).Scan(&v); err != nil {
+		return nil, fmt.Errorf("pdustore: rejection column: %w", err)
+	}
+	return v, nil
+}

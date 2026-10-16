@@ -39,6 +39,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/build"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pushcalc"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
 )
 
@@ -86,9 +87,11 @@ type Authenticator interface {
 
 // Options configure a Checker.
 type Options struct {
-	Store      Store
-	Auth       Authenticator
-	Key        *build.Key
+	Store Store
+	Auth  Authenticator
+	Key   *build.Key
+	// Push computes push actions; nil skips the push check.
+	Push       *pushcalc.Calculator
 	ServerName string
 	// Sticky is experimental_features.msc4354_enabled: without it Synapse
 	// ignores the sticky query parameter.
@@ -425,6 +428,21 @@ func (c *Checker) check(ctx context.Context, p *Pending, resp []byte) {
 		r.compare("content", errA == nil && errB == nil && bytes.Equal(a, b), func(e *zerolog.Event) {
 			e.RawJSON("stored", stored).RawJSON("ours", content)
 		})
+	}
+
+	if c.o.Push != nil {
+		v := c.o.Push.Check(ctx, ev.ID, ourBefore, p.maxStream, nil)
+		switch v.Outcome {
+		case pushcalc.OutcomeMatch:
+			r.record("push", Match, nil)
+		case pushcalc.OutcomeMismatch:
+			r.record("push", Mismatch, func(e *zerolog.Event) { e.Strs("diff", v.Diff) })
+		case pushcalc.OutcomeSkipped:
+			r.record("push", Skipped, nil)
+			r.results["push"] = "skipped: " + v.Reason
+		default:
+			r.record("push", Error, func(e *zerolog.Event) { e.Str("outcome", v.Outcome).Str("reason", v.Reason) })
+		}
 	}
 
 	// The rebuild: our decisions, with the two things we cannot predict --

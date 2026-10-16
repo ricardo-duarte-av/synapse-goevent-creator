@@ -81,6 +81,48 @@ in gopro.
   event** (`room_member.py`, duplicate rule: same sender, membership and
   content). The shadow check predicts it (`membership_noop`).
 
+## Native mode (M3, /send only)
+
+`modes.send: native` serves `/send` in the allowlisted rooms (`internal/creator`):
+requester from whoami plus `access_tokens`/`users`, txn dedup, one prev event
+only, relation and content validation, build, auth, push rows, then the
+creator's own writes (deletion bump, room participation, push staging) as the
+role `goevent_creator` (`internal/writer`, exactly `writer.Grants`), and
+`send_events` to the events writer. Anything else falls back to Synapse before
+the first write (`goevent_native_fallback_total{reason}`), and is shadowed.
+Each native event is verified against what was persisted
+(`goevent_native_verify_total{check,result}`).
+
+- **`context.rejected` is `str | None`: send `null`, never `false`.** On
+  2026-10-16 twelve native events in TEST7TESTE were sent with `false`. The
+  persister treated it as not rejected (state, stream and push were right) but
+  wrote it into `events.rejection_reason` as the text `'false'`. Synapse loads
+  rejection from `rejections`, so Synapse itself served them, but **gosync
+  filters on `e.rejection_reason IS NULL` (hidden from /sync) and gofederation
+  skips any non-empty reason (never sent to remote servers)**. The verify check
+  `rejection_column` now catches it. Other Go workers reading Synapse's tables
+  have stricter expectations than Synapse: test against them, not only Synapse.
+- Room participation's `UPDATE room_memberships` fires the
+  `check_event_stream_ordering` trigger, which runs as the caller and reads
+  `events`: the role needs SELECT on it (found by `TestWritesAsTheRole`).
+- The write role is created or repaired at startup over PostgreSQL's socket with
+  homeserver.yaml's credentials (`dbrole.Ensure`); its password is derived.
+
+## End-to-end suite
+
+`cmd/goevent-e2e` drives a hostname as a client, as the test account, in one
+allowlisted room, and checks statuses, errcodes, events read back
+(`unsigned.transaction_id` proves our device and txn reached the writer), and
+the worker's counters:
+
+```sh
+GOEVENT_E2E_PASSWORD=... GOEXPERIMENT=jsonv2 go run ./cmd/goevent-e2e \
+  -base https://goevent.aguiarvieira.pt -metrics http://<container ip>:9102/metrics
+```
+
+Run it against shadow mode first: that is Synapse's own behaviour, and the
+expectations are calibrated on it (31/31 on 2026-10-16).
+
 ## Shadow mode (M2)
 
 Proxies everything, and for each write in an allowlisted room re-derives

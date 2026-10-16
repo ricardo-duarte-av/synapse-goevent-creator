@@ -42,9 +42,9 @@ func TestEveryModeIsRequired(t *testing.T) {
 }
 
 func TestModeNotYetAvailable(t *testing.T) {
-	_, err := parse([]byte(strings.Replace(valid, "send: proxy", "send: native", 1)))
+	_, err := parse([]byte(strings.Replace(valid, "state: proxy", "state: native", 1)))
 	if err == nil || !strings.Contains(err.Error(), "not available") {
-		t.Fatalf("native send: err = %v", err)
+		t.Fatalf("native state: err = %v", err)
 	}
 	// Profile writes touch every room the user is in: never shadowed.
 	_, err = parse([]byte(strings.Replace(valid, "profile: proxy", "profile: shadow", 1)))
@@ -83,5 +83,15 @@ func TestEveryEndpointHasAModeList(t *testing.T) {
 		if len(accepted[ep]) == 0 {
 			t.Errorf("endpoint %s has no accepted modes", ep)
 		}
+	}
+}
+
+func TestNative(t *testing.T) {
+	cfg, err := parse([]byte(strings.Replace(valid, "send: proxy", "send: native", 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AnyNative() || !cfg.AnyShadow() || cfg.ModeFor(route.Send) != ModeNative {
+		t.Error("send is not native, or its fallbacks are not shadowed")
 	}
 }

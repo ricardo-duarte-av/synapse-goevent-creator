@@ -29,13 +29,17 @@ const (
 	// allowlisted room checks afterwards that we would have built the
 	// event Synapse built (package shadow). It writes nothing.
 	ModeShadow Mode = "shadow"
+	// ModeNative serves writes in an allowlisted room here (package
+	// creator), and proxies the rest; whatever native handling declines is
+	// proxied and shadow-checked.
+	ModeNative Mode = "native"
 )
 
 // accepted is every mode an endpoint may be given today. Shadow and native
 // are added per endpoint as each one exists: a mode that is accepted before
 // its code path exists would silently mean "proxy".
 var accepted = map[route.Endpoint][]Mode{
-	route.Send:       {ModeProxy, ModeShadow},
+	route.Send:       {ModeProxy, ModeShadow, ModeNative},
 	route.State:      {ModeProxy, ModeShadow},
 	route.Redact:     {ModeProxy, ModeShadow},
 	route.Membership: {ModeProxy, ModeShadow},
@@ -211,10 +215,21 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// AnyShadow reports whether some endpoint is in shadow mode.
+// AnyShadow reports whether some endpoint is shadowed: in shadow mode, or
+// native, whose fallbacks are shadowed.
 func (c *Config) AnyShadow() bool {
 	for _, m := range c.Modes {
-		if m == ModeShadow {
+		if m == ModeShadow || m == ModeNative {
+			return true
+		}
+	}
+	return false
+}
+
+// AnyNative reports whether some endpoint is served natively.
+func (c *Config) AnyNative() bool {
+	for _, m := range c.Modes {
+		if m == ModeNative {
 			return true
 		}
 	}
