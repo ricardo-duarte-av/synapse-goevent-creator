@@ -1,0 +1,39 @@
+# goevent-creator configuration.
+#
+# Only what is ours: Synapse's own facts (events writer, instance map,
+# replication secret, database, signing key) are read from homeserver.yaml.
+
+homeserver_yaml: /etc/synapse/homeserver.yaml
+
+listen:
+  # nginx connects here. Keep the path under 108 bytes.
+  socket: /var/sockets/nginx/av-goevent-creator-1.sock
+  socket_mode: "0660"
+
+upstream:
+  # The Python event_creator worker's client listener.
+  sockets:
+    - /var/sockets/nginx/av-client-events-1.sock
+  timeout_seconds: 300
+
+metrics:
+  addr: ":9102"
+
+log:
+  level: info
+
+# The rooms this worker may write to. Only rooms compiled into
+# internal/allowlist are accepted; anything else fails at start.
+rooms:
+  - "!decSfHzLLhrNKJaZid:aguiarvieira.pt"   # TEST6TEST
+  - "!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt"   # TEST7TESTE
+
+# Every endpoint must be given a mode. Only "proxy" exists so far.
+modes:
+  send: proxy
+  state: proxy
+  redact: proxy
+  membership: proxy
+  join: proxy
+  knock: proxy
+  profile: proxy     # always proxy: profile writes touch every room the user is in

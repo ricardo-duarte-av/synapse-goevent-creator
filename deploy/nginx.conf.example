@@ -1,0 +1,45 @@
+# goevent-creator routing — FOR A TEST HOSTNAME ONLY.
+#
+# Do not add these to aguiarvieira.pt (proxy_host/2.conf) while the worker is
+# being proven. Use a separate host (the old gosync.aguiarvieira.pt test host,
+# proxy_host/324.conf, no longer exists), which needs the /login well_known
+# rewrite gosync used (see synapse-gosync-worker CLAUDE.md §6), or clients go
+# straight back to public_baseurl.
+#
+# The worker proxies everything outside its allowlisted rooms to
+# av-client-events-1, so the test host stays fully usable.
+
+upstream av-goevent-creator {
+        server unix:/var/sockets/nginx/av-goevent-creator-1.sock max_fails=0;
+        keepalive 16;
+}
+
+# The same seven patterns proxy_host/2.conf sends to av-client-events-lc.
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/redact {
+        include /data/nginx/custom/matrix-config.conf;
+        proxy_pass http://av-goevent-creator;
+}
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/send {
+        include /data/nginx/custom/matrix-config.conf;
+        proxy_pass http://av-goevent-creator;
+}
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/state/ {
+        include /data/nginx/custom/matrix-config.conf;
+        proxy_pass http://av-goevent-creator;
+}
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/rooms/.*/(join|invite|leave|ban|unban|kick)$ {
+        include /data/nginx/custom/matrix-config.conf;
+        proxy_pass http://av-goevent-creator;
+}
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/join/ {
+        include /data/nginx/custom/matrix-config.conf;
+        proxy_pass http://av-goevent-creator;
+}
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/knock/ {
+        include /data/nginx/custom/matrix-config.conf;
+        proxy_pass http://av-goevent-creator;
+}
+location ~ ^/_matrix/client/(api/v1|r0|v3|unstable)/profile/ {
+        include /data/nginx/custom/matrix-config.conf;
+        proxy_pass http://av-goevent-creator;
+}
