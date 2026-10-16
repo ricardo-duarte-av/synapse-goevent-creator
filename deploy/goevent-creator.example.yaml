@@ -11,9 +11,10 @@ listen:
   socket_mode: "0660"
 
 upstream:
-  # The Python event_creator worker's client listener.
+  # Main is the fallback for everything not served here: the goal is retiring
+  # the Python event_creator (av-client-events-1), so nothing depends on it.
   sockets:
-    - /var/sockets/nginx/av-client-events-1.sock
+    - /var/sockets/nginx/av-synapse-main.sock
   timeout_seconds: 300
 
 metrics:

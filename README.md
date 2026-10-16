@@ -3,8 +3,9 @@
 A Go worker for Synapse's client event-creation endpoints: `rooms/{id}/send`,
 `rooms/{id}/state`, `rooms/{id}/redact`, membership
 (`join|invite|leave|ban|unban|kick`), `join/`, `knock/` and `profile/`. It sits
-in front of the Python `event_creator` worker and proxies to it whatever it
-does not serve itself.
+in place of the Python `event_creator` worker (`av-client-events-1`, which it
+is meant to retire) and proxies whatever it does not serve itself to Synapse's
+main process.
 
 **Status: M1, proxy only.** Every request is forwarded unchanged and counted
 by endpoint and room (`goevent_requests_total{endpoint,write,room,served,status}`).

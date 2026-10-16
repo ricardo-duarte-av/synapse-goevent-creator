@@ -1,5 +1,5 @@
-// Package proxy forwards client requests to Synapse's Python event_creator
-// worker verbatim.
+// Package proxy forwards client requests to Synapse verbatim (main, as the
+// fallback for everything not served here).
 //
 // Verbatim matters for two reasons. Room and event IDs are percent-encoded
 // path segments ("!room%3Aserver", "%24event"), and re-encoding them changes

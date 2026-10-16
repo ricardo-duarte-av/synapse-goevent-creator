@@ -31,3 +31,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Deployment specifics and test credentials
+.claude/deployment-notes.md

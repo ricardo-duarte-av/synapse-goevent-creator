@@ -1,7 +1,7 @@
 // Package config loads the goevent-creator configuration.
 //
-// Only what is ours lives here: where to listen, which Python event_creator
-// worker to proxy to, and how each endpoint is served. Everything Synapse
+// Only what is ours lives here: where to listen, which Synapse process to
+// fall back to (main), and how each endpoint is served. Everything Synapse
 // already knows -- the events writer, the instance map, the replication
 // secret, the database, the signing key -- is read from homeserver.yaml by
 // package synapsecfg and is deliberately not repeated.
@@ -23,7 +23,7 @@ import (
 type Mode string
 
 const (
-	// ModeProxy forwards every request to the Python worker untouched.
+	// ModeProxy forwards every request to the upstream untouched.
 	ModeProxy Mode = "proxy"
 )
 
@@ -81,7 +81,8 @@ func (l Listen) ParsedSocketMode() (os.FileMode, error) {
 	return os.FileMode(n), nil
 }
 
-// Upstream is the Python event_creator worker.
+// Upstream is where everything not served here goes: Synapse's main process,
+// since av-client-events-1 is to be retired.
 type Upstream struct {
 	Sockets []string `yaml:"sockets"`
 	Addrs   []string `yaml:"addrs"`

@@ -30,7 +30,7 @@ services:
       # secret, the database and the signing key, and this worker must never
       # be able to change it.
       - /opt/matrix/synapse/synapse:/etc/synapse:ro
-      # nginx reaches us here; we reach the Python event_creator, the
+      # nginx reaches us here; we reach Synapse main (the fallback), the
       # stream writers' replication sockets and PostgreSQL here.
       - /var/sockets:/var/sockets
 

@@ -30,8 +30,8 @@ New repo, module `github.com/ricardo-duarte-av/synapse-goevent-creator`, built w
 | Package | Source | Purpose |
 |---|---|---|
 | `internal/synapsecfg` | goinbound (`internal/synapsecfg`), keep the `lastWins` duplicate-key handling | Parse `/etc/synapse/homeserver.yaml` (RO mount of `/opt/matrix/synapse/synapse`): server_name, DB DSN, `instance_map`, `stream_writers.events`, `worker_replication_secret`, signing key path, rc_message, experimental flags |
-| `internal/config` | goinbound pattern | Own YAML: listen socket, upstream (`av-client-events-1` nginx socket), `rooms_allowlist`, per-endpoint `modes` (`proxy` / `shadow` / `native`, all required, no defaults) |
-| `internal/proxy` | gopro / goinbound | Reverse proxy to the Python worker for everything not served |
+| `internal/config` | goinbound pattern | Own YAML: listen socket, upstream (main, `av-synapse-main.sock`: the fallback, since av-client-events-1 is to be retired), `rooms_allowlist`, per-endpoint `modes` (`proxy` / `shadow` / `native`, all required, no defaults) |
+| `internal/proxy` | gopro / goinbound | Reverse proxy to main for everything not served |
 | `internal/auth` | gosync (`docs/auth.md`) | `whoami` over the socket, LRU + singleflight, 502 on unknown, never 401. Add a read-only `access_tokens`/`users` lookup for `token_id` and `shadow_banned`, which the requester serialization needs |
 | `internal/pdu` | goinbound (Synapse's `event_auth.py` port) | Auth checks. **Not** mautrix eventauth (see goinbound CLAUDE.md "Port Synapse, not the spec") |
 | `internal/build` | new, on mautrix `federation/pdu` + `federation/signutil` | Event building: prevs, depth, `auth_events` selection (port `event_auth.auth_types_for_event`), hashes, signing with `aguiarvieira.pt.signing.key`, v11 redaction, event ID |
@@ -59,7 +59,7 @@ New repo, module `github.com/ricardo-duarte-av/synapse-goevent-creator`, built w
 
 ## Milestones
 
-1. **Skeleton + proxy** (done, 2026-10-16): config, synapsecfg on the RO mount, unix socket listener, proxy everything to `av-client-events-1`, metrics, Dockerfile, docker-compose (`/opt/matrix/synapse/synapse:/etc/synapse:ro`, `/var/sockets`).
+1. **Skeleton + proxy** (done, 2026-10-16): config, synapsecfg on the RO mount, unix socket listener, proxy everything (deployed on `goevent.aguiarvieira.pt`, upstream main), metrics, Dockerfile, docker-compose (`/opt/matrix/synapse/synapse:/etc/synapse:ro`, `/var/sockets`).
 2. **Read path + "decide" shadow**: for proxied requests in the two rooms, compute what Go *would* have built from the same prev events, then compare it with the persisted event: `auth_events`, depth, state group contents, push actions in `event_push_actions` and `room_participation`. Same idea as goinbound's `decide` check. No writes.
 3. **Native `/send` (message events)** in the two rooms, through `send_events`.
 4. **State events** (`/state/`, with dedup and new state groups) and **`/redact`** (redaction rules, `is_admin_redaction`, the MSC2815 / redaction period check).
@@ -70,14 +70,14 @@ New repo, module `github.com/ricardo-duarte-av/synapse-goevent-creator`, built w
 
 ## Routing (test hostname only)
 
-The gosync test host (`proxy_host/324.conf`) no longer exists, because gosync now serves `aguiarvieira.pt` itself. So a **new** test host is needed with the event_creator `location` blocks (`deploy/nginx.conf.example`) and gosync's `/login` well_known rewrite (gosync CLAUDE.md §6). `aguiarvieira.pt`'s `proxy_host/2.conf` is not touched. Go proxies everything outside the two rooms to `/var/sockets/nginx/av-client-events-1.sock`, so the test host stays fully functional.
+`goevent.aguiarvieira.pt` carries the event_creator `location` blocks (`deploy/nginx.conf.example`). `aguiarvieira.pt`'s `proxy_host/2.conf` is not touched. Go proxies everything it does not serve to **main** (`/var/sockets/nginx/av-synapse-main.sock`), so the test host stays fully functional. Main is the fallback, not av-client-events-1, because the end goal is to retire av-client-events-1 entirely (operator, 2026-10-16).
 
 ## Verification
 
 - `go test -race ./...` with no DB.
 - Write-path tests on the **throwaway PostgreSQL** with the live schema (the goinbound CLAUDE.md recipe), running as the granted role, so a missing grant fails there.
 - Replication wire-format tests against a fake persister, compared byte for byte with what Python's `_serialize_payload` produces (capture one real `send_events` body from av-client-events-1 if possible).
-- Live, on the test host with the test account in TEST6TEST/TEST7TESTE: send a message, a state change, a redaction, kick/invite/leave/rejoin, and a remote invite to `@test:daedric.net`. Each must show up in `/sync` (gosync and Python), federate (gofederation metrics, and the remote side sees it), carry correct push actions, and survive the decide check re-run on Go-built events.
+- Live, on the test host with the test account `@test:aguiarvieira.pt` (joined to both rooms; credentials in `.claude/deployment-notes.md`): send a message, a state change, a redaction, kick/invite/leave/rejoin, and a remote invite to `@test:daedric.net`. Each must show up in `/sync` (gosync and Python), federate (gofederation metrics, and the remote side sees it), carry correct push actions, and survive the decide check re-run on Go-built events.
 - Prometheus: `synapse_outgoing_replication_requests_total{name="send_events"}` from our worker, and persister errors. Python's event_creator traffic on the main host must be unchanged.
 
 ## Open items to resolve during M1–M2

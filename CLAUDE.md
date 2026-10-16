@@ -5,7 +5,8 @@ the client endpoints that create room events. Read `README.md` for what it
 does. This file is for things that are not derivable from the code.
 
 The plan, with what Synapse does on the creator vs. the persister, is in
-`docs/plan.md`.
+`docs/plan.md`. Deployment specifics and the test account are in
+`.claude/deployment-notes.md` (gitignored).
 
 ## The deployment
 
@@ -29,10 +30,15 @@ The plan, with what Synapse does on the creator vs. the persister, is in
   `internal/allowlist.Permitted`; the config can narrow it, never widen it.
   Every write path asks `allowlist.Check`, and only it. Both rooms have
   remote members, so what we write federates.
-- **Test hostname only.** `aguiarvieira.pt`'s nginx is not to be pointed at
-  us. The old gosync test host (`proxy_host/324.conf`) is gone (gosync now
-  serves the main host), so a new test host is needed, with gosync's `/login`
-  well_known rewrite. Changing nginx is the operator's call.
+- **The goal is retiring `av-client-events-1` entirely** (operator,
+  2026-10-16). So the upstream is **main**
+  (`/var/sockets/nginx/av-synapse-main.sock`), not the Python event_creator:
+  main is the fallback for whatever we don't serve, and nothing may come to
+  depend on av-client-events-1. Main is busy and single-threaded, so the
+  fallback share should shrink, not grow.
+- **Test hostname only: `goevent.aguiarvieira.pt`** (deployed 2026-10-16).
+  `aguiarvieira.pt`'s nginx is not to be pointed at us. Changing nginx is
+  the operator's call.
 - **All of `/profile/` is proxied** (operator, 2026-10-16). Profile writes go
   to main and then send a membership event into every room the user is in
   (`handlers/profile.py`, `_update_join_states`), which breaks the two-room rule.
@@ -43,7 +49,7 @@ The plan, with what Synapse does on the creator vs. the persister, is in
 ## Facts checked against the live system
 
 - `av-client-events-1` answers **500 M_UNKNOWN to any request without
-  `X-Forwarded-For`** (2026-10-16). ReverseProxy's Rewrite mode strips it, so
+  `X-Forwarded-For`** (2026-10-16); assume main does too. ReverseProxy's Rewrite mode strips it, so
   `proxy.rewrite` puts nginx's headers back. Test by hand with
   `-H 'X-Forwarded-For: 127.0.0.1'`.
 - The live homeserver.yaml parses: `HOMESERVER_YAML=/opt/matrix/synapse/synapse/homeserver.yaml go test -run TestLive ./internal/synapsecfg/`.

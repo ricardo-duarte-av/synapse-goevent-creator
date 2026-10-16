@@ -1,8 +1,8 @@
 // Package server is the front door: it classifies each request, decides
-// whether it is ours, and otherwise proxies it to the Python event_creator.
+// whether it is ours, and otherwise proxies it to Synapse (main).
 //
 // In proxy mode nothing is parsed beyond the path, nothing is read from the
-// database, and the request reaches Python unchanged. What the path says is
+// database, and the request reaches Synapse unchanged. What the path says is
 // still counted, so the traffic a native mode would take is known before it
 // exists.
 package server
@@ -29,7 +29,7 @@ var (
 
 	upstreamSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "goevent_upstream_seconds",
-		Help:    "Time waiting on the Python event_creator, by endpoint.",
+		Help:    "Time waiting on the upstream (Synapse main), by endpoint.",
 		Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120},
 	}, []string{"endpoint"})
 

@@ -1,7 +1,7 @@
 // Command goevent-creator serves the client endpoints that create room
 // events (send, state, redact, membership, join, knock, profile), in place of
-// Synapse's Python event_creator worker, and proxies to that worker whatever
-// it does not serve itself.
+// Synapse's Python event_creator worker, and proxies whatever it does not
+// serve itself to Synapse's main process.
 package main
 
 import (

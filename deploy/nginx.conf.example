@@ -1,13 +1,12 @@
 # goevent-creator routing — FOR A TEST HOSTNAME ONLY.
 #
 # Do not add these to aguiarvieira.pt (proxy_host/2.conf) while the worker is
-# being proven. Use a separate host (the old gosync.aguiarvieira.pt test host,
-# proxy_host/324.conf, no longer exists), which needs the /login well_known
-# rewrite gosync used (see synapse-gosync-worker CLAUDE.md §6), or clients go
-# straight back to public_baseurl.
+# being proven. Use the test host, goevent.aguiarvieira.pt, which needs the
+# /login well_known rewrite gosync used (see synapse-gosync-worker CLAUDE.md
+# §6), or clients go straight back to public_baseurl.
 #
-# The worker proxies everything outside its allowlisted rooms to
-# av-client-events-1, so the test host stays fully usable.
+# The worker proxies everything it does not serve to main, so the test host
+# stays fully usable.
 
 upstream av-goevent-creator {
         server unix:/var/sockets/nginx/av-goevent-creator-1.sock max_fails=0;
