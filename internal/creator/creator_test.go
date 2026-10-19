@@ -42,7 +42,11 @@ type fakeRoom struct {
 	token         *pdustore.TokenInfo
 	partial       bool
 
-	key         *build.Key
+	key *build.Key
+	// groupOf and groups are prev events' state groups other than 7, the
+	// one f.state is.
+	groupOf     map[string]int64
+	groups      map[int64]pdu.StateMap
 	profiles    map[string][2]*string
 	blocked     bool
 	accountData map[string]bool
@@ -152,10 +156,41 @@ func (f *fakeRoom) Depths(_ context.Context, ids []string) (map[string]int64, er
 	}
 	return out, nil
 }
-func (f *fakeRoom) StateGroupForEvent(context.Context, string) (int64, error)  { return 7, nil }
-func (f *fakeRoom) StateForGroup(context.Context, int64) (pdu.StateMap, error) { return f.state, nil }
-func (f *fakeRoom) StateDelta(context.Context, int64) (int64, bool, pdu.StateMap, error) {
+func (f *fakeRoom) StateGroupForEvent(_ context.Context, id string) (int64, error) {
+	if g, ok := f.groupOf[id]; ok {
+		return g, nil
+	}
+	return 7, nil
+}
+func (f *fakeRoom) StateForGroup(_ context.Context, g int64) (pdu.StateMap, error) {
+	if s, ok := f.groups[g]; ok {
+		return s, nil
+	}
+	return f.state, nil
+}
+func (f *fakeRoom) StateDelta(_ context.Context, g int64) (int64, bool, pdu.StateMap, error) {
+	if _, ok := f.groups[g]; ok {
+		return 0, false, nil, nil
+	}
 	return 6, true, pdu.StateMap{{Type: "m.room.power_levels"}: f.prevs[0]}, nil
+}
+func (f *fakeRoom) GetEvents(_ context.Context, ids []string) (map[string]*pdu.Event, error) {
+	out := map[string]*pdu.Event{}
+	for _, i := range ids {
+		if e := f.events[i]; e != nil {
+			out[i] = e.Event
+		}
+	}
+	return out, nil
+}
+func (f *fakeRoom) AuthEdges(_ context.Context, ids []string) (map[string][]string, error) {
+	out := map[string][]string{}
+	for _, i := range ids {
+		if e := f.events[i]; e != nil {
+			out[i] = e.AuthEvents
+		}
+	}
+	return out, nil
 }
 func (f *fakeRoom) GetStoredEvents(_ context.Context, ids []string) (map[string]*pdustore.StoredEvent, map[string]error, error) {
 	out := map[string]*pdustore.StoredEvent{}
@@ -182,6 +217,9 @@ func (f *fakeRoom) HasAnnotated(context.Context, string, string, string, string)
 type fakeWriter struct {
 	calls      []string
 	groupDelta []writer.StateRow
+	groupPrev  int64
+	bumped     []int64
+	nextGroup  int64
 }
 
 func (w *fakeWriter) MarkTokenUsed(context.Context, int64) error {
@@ -190,6 +228,7 @@ func (w *fakeWriter) MarkTokenUsed(context.Context, int64) error {
 }
 func (w *fakeWriter) BumpDeletion(_ context.Context, g []int64) ([]int64, error) {
 	w.calls = append(w.calls, "bump")
+	w.bumped = append(w.bumped, g...)
 	return nil, nil
 }
 func (w *fakeWriter) SetRoomParticipation(context.Context, string, string) error {
@@ -202,8 +241,17 @@ func (w *fakeWriter) StagePush(context.Context, string, []writer.PushRow) error 
 }
 func (w *fakeWriter) StoreStateGroup(_ context.Context, ev, room string, prev int64, delta []writer.StateRow, _ func() ([]writer.StateRow, error)) (int64, error) {
 	w.calls = append(w.calls, "state_group")
-	w.groupDelta = delta
-	return 8, nil
+	w.groupDelta, w.groupPrev = delta, prev
+	if w.nextGroup == 0 {
+		w.nextGroup = 8
+	}
+	w.nextGroup++
+	return w.nextGroup - 1, nil
+}
+func (w *fakeWriter) StoreFullStateGroup(_ context.Context, ev, room string, rows []writer.StateRow) (int64, error) {
+	w.calls = append(w.calls, "full_state_group")
+	w.groupDelta, w.groupPrev = rows, 0
+	return 50, nil
 }
 func (w *fakeWriter) UnstagePush(context.Context, string) error {
 	w.calls = append(w.calls, "unstage")
@@ -378,9 +426,9 @@ func stopped(out Outcome) string {
 // Every fallback and refusal is decided before the first write.
 func TestFallbacksWriteNothing(t *testing.T) {
 	cases := map[string]func(h *harness) (string, string){
-		"two extremities": func(h *harness) (string, string) {
-			h.f.prevs = append(h.f.prevs, h.f.prevs[0]+"x")
-			return `{"msgtype":"m.text","body":"hi"}`, "prev_events_2"
+		"no extremities": func(h *harness) (string, string) {
+			h.f.prevs = nil
+			return `{"msgtype":"m.text","body":"hi"}`, "prev_events_0"
 		},
 		"not joined": func(h *harness) (string, string) {
 			h.f.token = &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", Used: true}
@@ -802,4 +850,24 @@ func TestRedactionOfUnknownEvent(t *testing.T) {
 	if got := gjson.GetBytes(h.p.entries[0], "event.content.redacts").Str; got != "$unknown" {
 		t.Errorf("redacts %q", got)
 	}
+}
+
+// fork makes the room's DAG fork: two state events on the same extremity,
+// each the only one in its own group (8 and 9), both now extremities.
+func (f *fakeRoom) fork(t *testing.T, a, b [3]string) (string, string) {
+	t.Helper()
+	base := f.prevs
+	stateA, stateB := pdu.StateMap{}, pdu.StateMap{}
+	for k, v := range f.state {
+		stateA[k], stateB[k] = v, v
+	}
+	ida := f.addState(t, a[0], a[1], a[2])
+	f.prevs = base
+	idb := f.addState(t, b[0], b[1], b[2])
+	stateA[pdu.StateKey{Type: a[0], StateKey: a[1]}] = ida
+	stateB[pdu.StateKey{Type: b[0], StateKey: b[1]}] = idb
+	f.groupOf = map[string]int64{ida: 8, idb: 9}
+	f.groups = map[int64]pdu.StateMap{8: stateA, 9: stateB}
+	f.prevs = []string{ida, idb}
+	return ida, idb
 }

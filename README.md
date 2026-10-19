@@ -25,8 +25,10 @@ in Synapse's words and at the point Synapse refuses it
 every refusal body with a recording of Synapse's
 (`cmd/goevent-e2e/refusals.golden.json`).
 
-Anything not reproduced exactly (a remote join, a 3pid invite, a room with
-several forward extremities, an appservice or guest, ...) is proxied to main
+Where the DAG has forked, the state before the event is resolved across its
+prev events (state resolution v2) and stored as a new state group, as
+Synapse's creator does. Anything not reproduced exactly (a remote join, a
+3pid invite, an appservice or guest, ...) is proxied to main
 before the first write, counted
 (`goevent_native_fallback_total{endpoint,reason}`) and shadow-checked: Synapse's event is rebuilt and must come out with the same
 event ID (`goevent_shadow_checks_total{endpoint,check,result}`). Every request

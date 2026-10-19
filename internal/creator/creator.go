@@ -45,6 +45,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pushcalc"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/stateres"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/synapsecfg"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/writer"
 )
@@ -97,6 +98,9 @@ type Store interface {
 	HasRelation(ctx context.Context, eventID string) (bool, error)
 	HasAnnotated(ctx context.Context, parent, eventType, sender, key string) (bool, error)
 
+	// State resolution, across several prev events.
+	stateres.Store
+
 	// Membership.
 	Profile(ctx context.Context, userID string) (displayname, avatarURL *string, ok bool, err error)
 	RoomBlocked(ctx context.Context, roomID string) (bool, error)
@@ -114,6 +118,7 @@ type Writer interface {
 	StagePush(ctx context.Context, eventID string, rows []writer.PushRow) error
 	UnstagePush(ctx context.Context, eventID string) error
 	StoreStateGroup(ctx context.Context, eventID, roomID string, prev int64, delta []writer.StateRow, full func() ([]writer.StateRow, error)) (int64, error)
+	StoreFullStateGroup(ctx context.Context, eventID, roomID string, rows []writer.StateRow) (int64, error)
 }
 
 // Persister is the events writer, over replication.
@@ -482,15 +487,17 @@ func (rq *requester) MarshalJSON() ([]byte, error) {
 
 // prepared is an event ready to persist.
 type prepared struct {
-	req       route.Request
-	in        *input
-	rq        *requester
-	rv        *pdu.RoomVersion
-	ev        *pdu.Event
-	built     *build.Event
-	ts        int64
+	req   route.Request
+	in    *input
+	rq    *requester
+	rv    *pdu.RoomVersion
+	ev    *pdu.Event
+	built *build.Event
+	ts    int64
+	// group is the state group before the event: sb's, or the one stored
+	// for it.
 	group     int64
-	deltas    []stateGroupDelta
+	sb        *stateBefore
 	before    pdu.StateMap
 	replaces  string
 	maxStream int64
@@ -548,10 +555,8 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	if err != nil {
 		return nil, "", fb("db_error")
 	}
-	if len(prevs) != 1 {
-		// Several extremities need state resolution, and a new state group
-		// for the result; Synapse does both.
-		return nil, "", fb("prev_events_" + strconv.Itoa(min(len(prevs), 2)))
+	if len(prevs) == 0 {
+		return nil, "", fb("prev_events_0")
 	}
 	if in.typ == "m.room.create" {
 		if in.stateKey != nil {
@@ -560,14 +565,13 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		}
 		return nil, "", fb("type_create")
 	}
-	group, err := c.o.Store.StateGroupForEvent(ctx, prevs[0])
-	if err != nil {
-		return nil, "", fb("no_state_group")
+	// calculate_context_info: the state before, resolved across the prev
+	// events when they disagree.
+	sb, st := c.resolveStateBefore(ctx, req.Room, rv, prevs)
+	if st != nil {
+		return nil, "", st
 	}
-	before, err := c.o.Store.StateForGroup(ctx, group)
-	if err != nil {
-		return nil, "", fb("db_error")
-	}
+	before := sb.state
 	// MSC4284: Synapse asks the room's policy server to sign every local
 	// event it sends through the non-member path, and refuses what it calls
 	// spam.
@@ -623,6 +627,10 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	if err != nil || len(depths) != len(prevs) {
 		return nil, "", fb("db_error")
 	}
+	prevDepths := make([]int64, len(prevs))
+	for i, id := range prevs {
+		prevDepths[i] = depths[id]
+	}
 	proto := &pdu.Event{Type: in.typ, Sender: rq.UserID, RoomID: req.Room, StateKey: in.stateKey, Content: content, Room: rv}
 	authIDs, err := pdu.ComputeAuthEvents(rv, proto, before)
 	if err != nil {
@@ -639,7 +647,7 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		Redacts:          in.redacts,
 		PrevEvents:       prevs,
 		AuthEvents:       authIDs,
-		Depth:            build.Depth([]int64{depths[prevs[0]]}),
+		Depth:            build.Depth(prevDepths),
 		OriginServerTS:   ts,
 		StickyDurationMS: in.sticky,
 	}
@@ -679,10 +687,6 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		return nil, "", c.authRefusal(err)
 	}
 
-	deltas, err := c.contextDeltas(ctx, group)
-	if err != nil {
-		return nil, "", fb("db_error")
-	}
 	var rows map[string]pushcalc.Row
 	if c.o.Push != nil {
 		if rows, err = c.o.Push.Rows(ctx, ev, before); err != nil {
@@ -690,8 +694,8 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		}
 	}
 
-	return &prepared{req: req, in: in, rq: rq, rv: rv, ev: ev, built: built, ts: ts, group: group,
-		deltas: deltas, before: before, replaces: replaces, maxStream: maxStream, push: rows}, "", nil
+	return &prepared{req: req, in: in, rq: rq, rv: rv, ev: ev, built: built, ts: ts, group: sb.group,
+		sb: sb, before: before, replaces: replaces, maxStream: maxStream, push: rows}, "", nil
 }
 
 // tooLarge is EventSizeError: 413 M_TOO_LARGE.
@@ -781,12 +785,34 @@ func (c *Creator) checkRedaction(ctx context.Context, req route.Request, target 
 // writer: _persist_events.
 func (c *Creator) persist(ctx context.Context, w http.ResponseWriter, p *prepared) Outcome {
 	room := p.req.Room
-	missing, err := c.o.Writer.BumpDeletion(ctx, []int64{p.group})
+	// check_state_groups_and_bump_deletion on what the state relies on: a
+	// resolution's inputs, or the one group.
+	need := p.sb.inputs
+	if len(need) == 0 {
+		need = []int64{p.sb.group}
+	}
+	missing, err := c.o.Writer.BumpDeletion(ctx, need)
 	if err != nil {
 		return fallback("db_error")
 	}
 	if len(missing) > 0 {
 		return fallback("state_group_deleted")
+	}
+	if p.sb.group == 0 {
+		// calculate_context_info stores a group for resolved state that no
+		// group holds.
+		var g int64
+		if p.sb.hasPrev {
+			g, err = c.o.Writer.StoreStateGroup(ctx, p.ev.ID, room, p.sb.prev, stateRows(p.sb.delta),
+				func() ([]writer.StateRow, error) { return stateRows(p.sb.state), nil })
+		} else {
+			g, err = c.o.Writer.StoreFullStateGroup(ctx, p.ev.ID, room, stateRows(p.sb.state))
+		}
+		if err != nil {
+			c.o.Log.Warn().Err(err).Str("room_id", room).Msg("Could not store the resolved state")
+			return fallback("state_group")
+		}
+		p.group = g
 	}
 	// handle_new_client_event.
 	if !p.ev.IsState() && (p.ev.Type == "m.room.message" || p.ev.Type == "m.room.encrypted") {
@@ -880,14 +906,16 @@ func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
 		meta["recheck_redaction"] = true
 	}
 	// _build_state_group_deltas: (before, after) first, then the group
-	// before's own edge.
-	deltas := p.deltas
+	// before's own edge when its entry has one.
+	deltas := []stateGroupDelta{{From: p.group, To: p.group, Delta: pdu.StateMap{}}}
 	due := []any{}
 	if p.ev.IsState() {
 		key := p.ev.Key()
-		own := stateGroupDelta{From: p.group, To: p.after, Delta: pdu.StateMap{key: p.ev.ID}}
-		deltas = append([]stateGroupDelta{own}, p.deltas[1:]...)
+		deltas[0] = stateGroupDelta{From: p.group, To: p.after, Delta: pdu.StateMap{key: p.ev.ID}}
 		due = []any{[3]string{key.Type, key.StateKey, p.ev.ID}}
+	}
+	if p.sb.hasPrev {
+		deltas = append(deltas, stateGroupDelta{From: p.sb.prev, To: p.group, Delta: p.sb.delta})
 	}
 	// _local_membership_update notifies the target too.
 	extra := []string{}
@@ -932,23 +960,6 @@ func (d stateGroupDelta) MarshalJSON() ([]byte, error) {
 		rows = append(rows, [3]string{k.Type, k.StateKey, v})
 	}
 	return json.Marshal([]any{d.From, d.To, rows})
-}
-
-// contextDeltas is _build_state_group_deltas for an event whose state before
-// is one existing group: the event's own (group, group) with no change (which
-// a state event replaces with its new group), then the group's edge from its
-// prev group, as resolve_state_groups_for_events returns it
-// (get_state_group_delta), when it has one.
-func (c *Creator) contextDeltas(ctx context.Context, group int64) ([]stateGroupDelta, error) {
-	out := []stateGroupDelta{{From: group, To: group, Delta: pdu.StateMap{}}}
-	prev, hasPrev, delta, err := c.o.Store.StateDelta(ctx, group)
-	if err != nil {
-		return nil, err
-	}
-	if hasPrev {
-		out = append(out, stateGroupDelta{From: prev, To: group, Delta: delta})
-	}
-	return out, nil
 }
 
 // checkRelation is _validate_event_relation.

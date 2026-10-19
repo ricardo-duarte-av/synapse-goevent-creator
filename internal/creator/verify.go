@@ -85,6 +85,21 @@ func (c *Creator) check(v pending) {
 			func(e *zerolog.Event) { e.AnErr("err", err).Int("entries", len(cur)).Int("before", len(p.before)) })
 	}
 
+	if p.sb.group == 0 {
+		// The group stored for resolved state holds exactly it.
+		st, err := c.o.Store.StateForGroup(ctx, p.group)
+		same := err == nil && len(st) == len(p.before)
+		for k, v := range p.before {
+			if !same {
+				break
+			}
+			same = st[k] == v
+		}
+		record("state_before", same, func(e *zerolog.Event) {
+			e.AnErr("err", err).Int64("group", p.group).Int("stored", len(st)).Int("ours", len(p.before))
+		})
+	}
+
 	if p.in.txn != "" {
 		id, err := c.o.Store.TxnEvent(ctx, p.req.Room, p.rq.UserID, p.rq.DeviceID, p.in.txn)
 		record("txn_mapping", err == nil && id == p.ev.ID, func(e *zerolog.Event) { e.AnErr("err", err).Str("stored", id) })

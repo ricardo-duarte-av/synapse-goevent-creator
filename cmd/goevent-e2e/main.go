@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -256,6 +257,64 @@ func (s *suite) membership(me, probe, tag string) {
 }
 
 // expectError checks a refusal: status and errcode.
+// fork makes the room's DAG fork and sends on it: a state event the worker
+// creates and one main creates (user_id in the query is appservice
+// masquerading, which the worker leaves to main; Synapse ignores it for a
+// user's own token), at once, so both build on the same extremity; then a message, whose state
+// before must be resolved across both. The worker counts a stored resolved
+// group as the verify check state_before. Concurrency is not guaranteed:
+// it is tried a few times.
+func (s *suite) fork(metricsURL, tag string) {
+	const typ = "pt.aguiarvieira.goevent.fork"
+	if metricsURL == "" {
+		s.skip("send on a fork", "needs -metrics")
+		return
+	}
+	for attempt := 1; attempt <= 5; attempt++ {
+		before, err := scrape(metricsURL)
+		if err != nil {
+			s.record("send on a fork", false, "%v", err)
+			return
+		}
+		run := fmt.Sprintf("%s-%d", s.run, attempt)
+		var wg sync.WaitGroup
+		var native, main resp
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			native = s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/native"), map[string]any{"run": run}, true)
+		}()
+		go func() {
+			defer wg.Done()
+			main = s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/main")+"?user_id="+url.QueryEscape(s.me), map[string]any{"run": run}, true)
+		}()
+		wg.Wait()
+		if native.status != 200 || main.status != 200 {
+			s.record("send on a fork", false, "state %d %s / %d %s", native.status, native.raw, main.status, main.raw)
+			return
+		}
+		r := s.c.do(http.MethodPost, s.roomPath("/send/m.room.message"), map[string]any{"msgtype": "m.notice", "body": tag + ": on a fork"}, true)
+		if r.status != 200 {
+			s.record("send on a fork", false, "%d %s", r.status, r.raw)
+			return
+		}
+		time.Sleep(2 * time.Second)
+		after, err := scrape(metricsURL)
+		if err != nil {
+			s.record("send on a fork", false, "%v", err)
+			return
+		}
+		resolved := after.sum("goevent_native_verify_total", `check="state_before"`) - before.sum("goevent_native_verify_total", `check="state_before"`)
+		bad := after.sum("goevent_native_verify_total", `check="state_before"`, `result="mismatch"`) -
+			before.sum("goevent_native_verify_total", `check="state_before"`, `result="mismatch"`)
+		if resolved > 0 {
+			s.record("send on a fork", bad == 0, "attempt %d: %s, resolved state stored and verified (%v mismatches)", attempt, r.body.Get("event_id").Str, bad)
+			return
+		}
+	}
+	s.skip("send on a fork", "no fork in 5 attempts (Synapse serialises, or the timing missed)")
+}
+
 func (s *suite) expectError(name string, r resp, status int, errcodes ...string) {
 	ok := r.status == status && slices.Contains(errcodes, r.body.Get("errcode").Str)
 	s.record(name, ok, "status %d errcode %s (want %d %v)", r.status, r.body.Get("errcode").Str, status, errcodes)
@@ -614,6 +673,8 @@ func run() int {
 	} else {
 		s.skip("refuse redacting the create event", fmt.Sprintf("create event not found: %d %s", create.status, create.raw))
 	}
+
+	s.fork(*metricsURL, tag)
 
 	// Membership: a user that does not exist, so nobody is disturbed, and
 	// joins by the test account that is already joined. The account never

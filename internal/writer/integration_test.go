@@ -113,6 +113,16 @@ func TestWritesAsTheRole(t *testing.T) {
 	if err := a.QueryRow(ctx, `SELECT type || '|' || state_key || '|' || event_id FROM state_groups_state WHERE state_group = $1`, g).Scan(&row); err != nil || row != "m.room.topic||$s" {
 		t.Errorf("row %q (%v)", row, err)
 	}
+	// A resolved state with no group to build on: whole, and no edge.
+	full, err := d.StoreFullStateGroup(ctx, "$f", "!r:x", []StateRow{{"m.room.topic", "", "$s"}, {"m.room.name", "", "$n"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rowsIn, edges int
+	if err := a.QueryRow(ctx, `SELECT (SELECT count(*) FROM state_groups_state WHERE state_group = $1),
+		(SELECT count(*) FROM state_group_edges WHERE state_group = $1)`, full).Scan(&rowsIn, &edges); err != nil || rowsIn != 2 || edges != 0 {
+		t.Errorf("full group: %d rows, %d edges (%v)", rowsIn, edges, err)
+	}
 	if _, err := d.StoreStateGroup(ctx, "$s2", "!r:x", 999, []StateRow{{"m.room.topic", "", "$s2"}}, nil); err == nil {
 		t.Error("stored a group on a prev group that does not exist")
 	}

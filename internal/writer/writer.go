@@ -295,6 +295,18 @@ func (d *DB) StoreStateGroup(ctx context.Context, eventID, roomID string, prev i
 	return group, err
 }
 
+// StoreFullStateGroup is store_state_group without a prev group: the whole
+// state.
+func (d *DB) StoreFullStateGroup(ctx context.Context, eventID, roomID string, rows []StateRow) (int64, error) {
+	var group int64
+	err := pgx.BeginFunc(ctx, d.pool, func(tx pgx.Tx) error {
+		var err error
+		group, err = insertGroupTx(ctx, tx, roomID, eventID, rows)
+		return err
+	})
+	return group, err
+}
+
 // insertGroupTx allocates a group and stores its rows.
 func insertGroupTx(ctx context.Context, tx pgx.Tx, roomID, eventID string, rows []StateRow) (int64, error) {
 	var group int64

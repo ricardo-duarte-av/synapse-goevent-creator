@@ -85,8 +85,8 @@ in gopro.
 
 `modes.{send,state,redact,membership,join}: native` serve those endpoints in
 the allowlisted rooms (`internal/creator`):
-requester from `access_tokens`/`users` (no whoami), txn dedup, one prev event
-only, relation and content validation, build, auth, push rows, then the
+requester from `access_tokens`/`users` (no whoami), txn dedup, the state
+before (resolved across up to ten prev events), relation and content validation, build, auth, push rows, then the
 creator's own writes (deletion bump, room participation, push staging) as the
 role `goevent_creator` (`internal/writer`, exactly `writer.Grants`), and
 `send_events` to the events writer. Anything else falls back to Synapse before
@@ -156,10 +156,26 @@ Each native event is verified against what was persisted
   (429 after Synapse's half-second pause). A request that passes our limits
   and then falls back is counted again by main's.
 - **`m.call.invite` is refused in public rooms** (`create_new_client_event`);
-  native `/send` falls back for it (`call_invite_public`). Found while porting
+  native `/send` refused it (`call_invite_public`). Found while porting
   M5: it had been missed in M3.
-- **Repeated JSON keys fall back** (`duplicate_keys`): Python keeps the last,
-  gjson finds the first.
+- **Repeated JSON keys are Python's**: json.loads keeps the key's first
+  position and its last value; gjson finds the first. `pyjson.Dedupe`
+  rewrites the body that way before anything reads it, in native and in
+  shadow mode.
+- **Forks are resolved here** (M6): `resolve_state_groups_for_events` over
+  the prev events' groups (`internal/stateres`, goinbound's v2 port), then
+  `_make_state_cache_entry`: an input group holding exactly the result is
+  reused (and the context has no edge for it), otherwise a new group is
+  stored on the input it differs least from, or whole when every input has a
+  key the result lacks. Synapse tries the inputs in Python set order, random
+  per process, so any of equal ones is Synapse's choice; ours is the lowest.
+  Synapse stores that group in `calculate_context_info`, before the checks
+  that may refuse the event (an orphan then); we store it only once nothing
+  can be refused. All the inputs are bumped (`resolve_state_groups`). On
+  2026-10-19 3.7% of the week's local events had several prev events (76 of
+  them ten). The e2e step "send on a fork" races a native state event with
+  one main makes (`?user_id=` is masquerading, main's; Synapse ignores it for
+  a user's own token) and checks the resolved group (`state_before`).
 - **Synapse is not asked who the requester is** (M6, operator: "we must not
   depend on synapse"). `requester` is `get_user_by_req` on the database:
   Synapse's token rules (`Mixing Authorization headers...`, `Too many
@@ -278,7 +294,9 @@ with both sides, every check summarised at info.
 - Not compared yet: membership content (profile, M5), refusals (we would need
   the native path's validation), push actions (`event_push_actions`; goinbound's
   push check is the model), events with several prev events (`state_before`
-  skipped; Synapse resolves state).
+  skipped; Synapse resolves state). A `prev_events` difference where a stored
+  prev event was persisted after the room was read is a race: recorded as
+  skipped, and nothing past it is compared.
 
 Live run, 2026-10-16, as `@test` in TEST7TESTE: message (PUT and POST), txn
 retry, sticky message, topic and its repeat, redaction, ban, unban, invite,

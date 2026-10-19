@@ -10,6 +10,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
+
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pyjson"
 )
 
 // The request parsing of http/servlet.py (v1.163.0).
@@ -29,9 +31,9 @@ var (
 
 // parseJSONObject is parse_json_object_from_request: the body, decoded as
 // UTF-8 and then json_decoder decodes it, must be an object. With
-// allowEmpty, an empty body is {}. A body Python would decode differently
-// from gjson (repeated keys, which Python takes the last of; lone
-// surrogates) is Synapse's.
+// allowEmpty, an empty body is {}. Repeated keys are collapsed as Python
+// collapses them; a lone surrogate, which Python keeps and cannot encode, is
+// Synapse's.
 func parseJSONObject(body []byte, allowEmpty bool) ([]byte, *stop) {
 	if len(body) == 0 && allowEmpty {
 		return []byte("{}"), nil
@@ -73,8 +75,10 @@ func parseJSONObject(body []byte, allowEmpty bool) ([]byte, *stop) {
 	if !v.IsObject() {
 		return nil, notAnObject.stop()
 	}
-	if hasDuplicateKeys(v) {
-		return nil, fb("duplicate_keys")
+	// A repeated key: Python's dict keeps the last value.
+	body, err := pyjson.Dedupe(body)
+	if err != nil {
+		return nil, notJSON.stop()
 	}
 	if surrogateEscape.Match(body) {
 		return nil, fb("surrogate_escape")

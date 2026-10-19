@@ -40,6 +40,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pushcalc"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pyjson"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
 )
 
@@ -160,6 +161,10 @@ func (c *Checker) Prepare(ctx context.Context, r *http.Request, req route.Reques
 		}
 		r.Body = readCloser{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}
 		p.body = head
+		// As json.loads holds it: a repeated key's last value.
+		if d, err := pyjson.Dedupe(head); err == nil {
+			p.body = d
+		}
 	}
 	if p.err != nil {
 		return p
@@ -358,6 +363,14 @@ func (c *Checker) check(ctx context.Context, p *Pending, resp []byte) {
 
 	r.compare("sender", ev.Sender == p.user, func(e *zerolog.Event) { e.Str("stored", ev.Sender).Str("requester", p.user) })
 
+	if !sameSet(ev.PrevEvents, p.prevs) && c.raced(ctx, ev.PrevEvents, p.maxStream) {
+		// Another event was persisted between our read and Synapse's: what
+		// follows depends on it, and is not compared.
+		r.record("prev_events", Skipped, func(e *zerolog.Event) {
+			e.Str("reason", "race").Strs("stored", ev.PrevEvents).Strs("extremities_before", p.prevs)
+		})
+		return
+	}
 	r.compare("prev_events", sameSet(ev.PrevEvents, p.prevs), func(e *zerolog.Event) {
 		e.Strs("stored", ev.PrevEvents).Strs("extremities_before", p.prevs)
 	})
@@ -607,6 +620,20 @@ func (c *Checker) checkAuthRules(ctx context.Context, ev *pdu.Event) error {
 		return fmt.Errorf("state dependent: %w", err)
 	}
 	return nil
+}
+
+// raced reports a prev event persisted after the room was read.
+func (c *Checker) raced(ctx context.Context, prevs []string, maxStream int64) bool {
+	evs, _, err := c.o.Store.GetStoredEvents(ctx, prevs)
+	if err != nil {
+		return false
+	}
+	for _, se := range evs {
+		if se.StreamOrdering > maxStream {
+			return true
+		}
+	}
+	return false
 }
 
 // expectedContent is the content Synapse builds from the request, when

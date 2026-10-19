@@ -28,7 +28,7 @@ func TestParseJSONObject(t *testing.T) {
 		`[1]`:               "refused:not_object",
 		`{"a":1e400}`:       "",
 		`{"a":"\ud800"}`:    "surrogate_escape",
-		`{"a":1,"a":2}`:     "duplicate_keys",
+		`{"a":1,"a":2}`:     "",
 		`{"a":` + strings.Repeat("1", 5000) + `}`:           "long_integer",
 		strings.Repeat("[", 101) + strings.Repeat("]", 101): "deep_json",
 	} {
@@ -43,6 +43,9 @@ func TestParseJSONObject(t *testing.T) {
 		if got != want {
 			t.Errorf("%.40q: %q, want %q", body, got, want)
 		}
+	}
+	if b, st := parseJSONObject([]byte(`{"a":1,"a":2}`), false); st != nil || string(b) != `{"a":2}` {
+		t.Errorf("repeated key: %s %+v", b, st)
 	}
 	if b, st := parseJSONObject(nil, true); st != nil || string(b) != "{}" {
 		t.Errorf("empty body with allow_empty_body: %s %+v", b, st)

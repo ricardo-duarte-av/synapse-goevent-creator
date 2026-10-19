@@ -160,7 +160,6 @@ func TestMembershipFallbacks(t *testing.T) {
 			memberReq("invite", ""), `{"user_id":"` + other + `"}`, "invite_config"},
 		"blocked room":  {func(h *harness) { h.f.blocked = true }, memberReq("join", ""), ``, "refused:room_blocked"},
 		"not an object": {nil, memberReq("leave", ""), `[]`, "refused:not_object"},
-		"duplicate key": {nil, memberReq("leave", ""), `{"reason":"a","reason":"b"}`, "duplicate_keys"},
 		"restricted join": {func(h *harness) {
 			h.f.addState(t, "m.room.join_rules", "", `{"join_rule":"restricted","allow":[]}`)
 			h.f.token.UserID = user
@@ -217,5 +216,18 @@ func TestCallInviteInPublicRoom(t *testing.T) {
 	out := h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.call.invite", TxnID: "c"})
 	if out.Refused != "call_invite_public" {
 		t.Fatalf("%+v", out)
+	}
+}
+
+// A repeated key is Python's: the last value.
+func TestRepeatedKeyIsTheLast(t *testing.T) {
+	h := newHarness(t)
+	h.f.addState(t, "m.room.member", other, `{"membership":"join"}`)
+	if _, out := h.member(t, memberReq("kick", ""), `{"user_id":"@nobody:example.org","reason":"a","user_id":"`+other+`","reason":"b"}`); out.Result != "created" {
+		t.Fatalf("%+v", out)
+	}
+	e := gjson.ParseBytes(h.p.entries[0])
+	if e.Get("event.state_key").Str != other || e.Get("event.content").Raw != `{"membership":"leave","reason":"b"}` {
+		t.Errorf("%s %s", e.Get("event.state_key").Raw, e.Get("event.content").Raw)
 	}
 }

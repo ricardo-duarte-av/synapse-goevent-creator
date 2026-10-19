@@ -630,27 +630,3 @@ func (t *txnCache) add(key string, now time.Time) {
 	}
 	t.seen[key] = now
 }
-
-// hasDuplicateKeys reports a repeated key in any object: Python's json keeps
-// the last, gjson finds the first.
-func hasDuplicateKeys(v gjson.Result) bool {
-	dup := false
-	switch {
-	case v.IsObject():
-		seen := map[string]bool{}
-		v.ForEach(func(k, x gjson.Result) bool {
-			if seen[k.Str] || hasDuplicateKeys(x) {
-				dup = true
-				return false
-			}
-			seen[k.Str] = true
-			return true
-		})
-	case v.IsArray():
-		v.ForEach(func(_, x gjson.Result) bool {
-			dup = hasDuplicateKeys(x)
-			return !dup
-		})
-	}
-	return dup
-}
