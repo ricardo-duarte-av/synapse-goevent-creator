@@ -39,6 +39,7 @@ import (
 	"maunium.net/go/mautrix/crypto/canonicaljson"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/appservice"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/build"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
@@ -108,6 +109,9 @@ type Store interface {
 	RatelimitExempt(ctx context.Context, userID string) (bool, error)
 	RecentJoins(ctx context.Context, roomID string, sinceMS int64) ([]int64, error)
 	AccountData(ctx context.Context, userID, typ string) (content []byte, ok bool, err error)
+	// Appservices.
+	UserFlags(ctx context.Context, userID string) (exists, admin, suspended bool, err error)
+	DeviceExists(ctx context.Context, userID, deviceID string) (bool, error)
 }
 
 // Writer is what the creator writes.
@@ -134,9 +138,8 @@ type Options struct {
 	Key        *build.Key
 	Push       *pushcalc.Calculator
 	ServerName string
-	// AppServiceTokens are the registrations' as_tokens: their requests
-	// are Synapse's.
-	AppServiceTokens map[string]bool
+	// AppServices are the registrations, by as_token.
+	AppServices map[string]*appservice.Service
 	// DelegatedAuth is MAS or MSC3861: tokens are not in the database.
 	DelegatedAuth bool
 	// AccountValidity is account_validity.enabled.
@@ -172,9 +175,9 @@ type Creator struct {
 	o     Options
 	locks roomLocks
 	txns  txnCache
-	// fakes are the event IDs shadow-banned transactions were answered
-	// with.
-	fakes fakeCache
+	// answers are the event IDs transactions were answered with
+	// (HttpTransactionCache).
+	answers answerCache
 
 	limitersOnce sync.Once
 	lim          *membershipLimiters
@@ -259,16 +262,14 @@ type input struct {
 	member *memberInput
 	// dedupKind labels an answer with an existing event.
 	dedupKind string
+	// originTS is an appservice's ts.
+	originTS *int64
 }
 
 func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	q := r.URL.Query()
-	switch {
-	case q.Has(DelayParam):
+	if q.Has(DelayParam) {
 		return fallback("delayed")
-	case q.Has("user_id"), q.Has("device_id"), q.Has("ts"):
-		// Appservice masquerading and timestamps.
-		return fallback("appservice")
 	}
 	if req.Endpoint == route.State && r.Method != http.MethodPut {
 		return fallback("method")
@@ -300,14 +301,14 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		return c.refuse(w, &refusal{reason: "guest", status: http.StatusForbidden, errcode: "M_GUEST_ACCESS_FORBIDDEN",
 			msg: "Guest access not allowed"})
 	}
-	// fetch_or_execute_request: what this process answered a shadow-banned
-	// transaction with. (A real event is found again by the txn lookup.)
-	var fakeKey string
-	if req.TxnID != "" && rq.ShadowBanned {
-		fakeKey = rq.txnKey(r)
-		if id, ok := c.fakes.get(fakeKey, c.o.Now()); ok {
+	// fetch_or_execute_request: what this process answered the
+	// transaction with, in the last 30 minutes.
+	var txnKey string
+	if req.TxnID != "" {
+		txnKey = rq.txnKey(r)
+		if id, ok := c.answers.get(txnKey, c.o.Now()); ok {
 			writeEventID(w, id)
-			return Outcome{Result: "shadow_banned"}
+			return Outcome{Result: "txn_cached"}
 		}
 	}
 	body, st := parseJSONObject(body, false)
@@ -321,7 +322,7 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	content := gjson.ParseBytes(in.content)
 	if rq.ShadowBanned && in.redacts == nil {
 		// create_and_send_nonmember_event, before its transaction lookup.
-		return c.shadowBanned(ctx, w, fakeKey)
+		return c.shadowBanned(ctx, w, txnKey)
 	}
 
 	unlock := c.locks.lock(req.Room)
@@ -340,6 +341,7 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		switch {
 		case err == nil:
 			c.respond(w, in, id)
+			c.answers.add(txnKey, id, c.o.Now())
 			return Outcome{Result: "txn_dedup"}
 		case !errors.Is(err, pdustore.ErrNotFound):
 			return fallback("db_error")
@@ -350,7 +352,7 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		// pause is not the room's.
 		locked = false
 		unlock()
-		return c.shadowBanned(ctx, w, fakeKey)
+		return c.shadowBanned(ctx, w, txnKey)
 	}
 
 	p, dup, st := c.prepare(ctx, req, rq, in, content)
@@ -365,7 +367,29 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	}
 
 	// Past here, writes. Everything Synapse could refuse has been checked.
-	return c.persist(ctx, w, p)
+	out := c.persist(ctx, w, p)
+	if out.Result == "created" || out.Result == "writer_dedup" {
+		c.answers.add(txnKey, p.answer, c.o.Now())
+	}
+	return out
+}
+
+// appserviceTS is an appservice's ts query parameter: the event's
+// origin_server_ts.
+func appserviceTS(rq *requester, q map[string][]string, in *input) *stop {
+	if rq.AppService == nil {
+		return nil
+	}
+	v, ok := q["ts"]
+	if !ok || len(v) == 0 {
+		return nil
+	}
+	n, st := parseIntegerParam("ts", v[0])
+	if st != nil {
+		return st
+	}
+	in.originTS = &n
+	return nil
 }
 
 // configFallback is what homeserver.yaml configures that the native path
@@ -387,6 +411,13 @@ func (c *Creator) configFallback() string {
 // Synapse's.
 func (c *Creator) parse(ctx context.Context, req route.Request, rq *requester, body []byte, q map[string][]string) (*input, *stop) {
 	in := &input{typ: req.Action, content: body, txn: req.TxnID, room: req.Room}
+	if req.Endpoint == route.Send || req.Endpoint == route.State {
+		// `if requester.app_service_id: origin_server_ts =
+		// parse_integer(request, "ts")`.
+		if st := appserviceTS(rq, q, in); st != nil {
+			return nil, st
+		}
+	}
 	switch req.Endpoint {
 	case route.Send:
 		if c.o.Sticky {
@@ -459,9 +490,9 @@ func (c *Creator) requester(ctx context.Context, r *http.Request) (*requester, s
 		return nil, "token_encoding", nil
 	case ref != nil:
 		return nil, "", ref
-	case c.o.AppServiceTokens[token]:
-		// get_appservice_user, and its masquerading.
-		return nil, "appservice", nil
+	}
+	if as := c.o.AppServices[token]; as != nil {
+		return c.appserviceRequester(ctx, r, as)
 	}
 	t, err := c.o.Store.Token(ctx, token)
 	switch {
@@ -495,8 +526,63 @@ func (c *Creator) requester(ctx context.Context, r *http.Request) (*requester, s
 		Guest: t.Guest, ShadowBanned: t.ShadowBan, Suspended: t.Suspended}, "", nil
 }
 
-// requester is Requester.serialize (rust/src/types/mod.rs) for an access
-// token in the database: never an appservice's.
+// appserviceRequester is get_appservice_user: the appservice's sender, or
+// the user and device it says it acts as.
+func (c *Creator) appserviceRequester(ctx context.Context, r *http.Request, as *appservice.Service) (*requester, string, *refusal) {
+	if as.IPRanges {
+		// Checked against the client's address.
+		return nil, "appservice_ip", nil
+	}
+	q := r.URL.Query()
+	user := as.Sender
+	if v, ok := q["user_id"]; ok && len(v) > 0 {
+		user = v[0]
+		// validate_appservice_can_control_user_id.
+		if user != as.Sender {
+			in, known := as.InUserNamespace(user)
+			if !known {
+				return nil, "appservice_regex", nil
+			}
+			if !in {
+				return nil, "", forbidden("appservice_user", fmt.Sprintf("Application service cannot masquerade as this user (%s).", user))
+			}
+			exists, _, _, err := c.o.Store.UserFlags(ctx, user)
+			if err != nil {
+				return nil, "db_error", nil
+			}
+			if !exists {
+				return nil, "", forbidden("appservice_user", fmt.Sprintf("Application service has not registered this user (%s)", user))
+			}
+		}
+	}
+	device := ""
+	if v, ok := q["device_id"]; ok && len(v) > 0 {
+		device = v[0]
+		ok, err := c.o.Store.DeviceExists(ctx, user, device)
+		if err != nil {
+			return nil, "db_error", nil
+		}
+		if !ok {
+			return nil, "", badRequest("appservice_device", fmt.Sprintf(
+				"Application service trying to use a device that doesn't exist ('%s' for %s)", device, user), "M_UNKNOWN_DEVICE")
+		}
+	}
+	// create_requester: UserID.from_string.
+	key, _ := json.Marshal(user)
+	if _, st := targetUserID(gjson.ParseBytes(key)); st != nil {
+		if st.ref != nil {
+			return nil, "", st.ref
+		}
+		return nil, st.fallback, nil
+	}
+	_, admin, suspended, err := c.o.Store.UserFlags(ctx, user)
+	if err != nil {
+		return nil, "db_error", nil
+	}
+	return &requester{UserID: user, DeviceID: device, AppService: as, Entity: user, Admin: admin, Suspended: suspended}, "", nil
+}
+
+// requester is Requester.serialize (rust/src/types/mod.rs).
 type requester struct {
 	UserID string
 	// DeviceID is "" for a token without one (the admin API mints them).
@@ -507,10 +593,20 @@ type requester struct {
 	Entity       string
 	Guest        bool
 	ShadowBanned bool
+	// AppService is the appservice whose token it is.
+	AppService *appservice.Service
 	// Admin is is_server_admin and Suspended get_user_suspended_status;
 	// neither is serialized.
 	Admin     bool
 	Suspended bool
+}
+
+// appServiceID is app_service_id: null for a user's own token.
+func (rq *requester) appServiceID() any {
+	if rq.AppService == nil {
+		return nil
+	}
+	return rq.AppService.ID
 }
 
 func (rq *requester) MarshalJSON() ([]byte, error) {
@@ -522,14 +618,18 @@ func (rq *requester) MarshalJSON() ([]byte, error) {
 	if entity == "" {
 		entity = rq.UserID
 	}
+	var token any = rq.TokenID
+	if rq.AppService != nil {
+		token = nil
+	}
 	return json.Marshal(map[string]any{
 		"user_id":              rq.UserID,
-		"access_token_id":      rq.TokenID,
+		"access_token_id":      token,
 		"is_guest":             rq.Guest,
 		"scope":                []string{},
 		"shadow_banned":        rq.ShadowBanned,
 		"device_id":            device,
-		"app_server_id":        nil,
+		"app_server_id":        rq.appServiceID(),
 		"authenticated_entity": entity,
 	})
 }
@@ -540,6 +640,8 @@ func (rq *requester) txnKey(r *http.Request) string {
 	switch {
 	case rq.Guest:
 		return r.URL.EscapedPath() + "\x00guest\x00" + rq.UserID
+	case rq.AppService != nil:
+		return r.URL.EscapedPath() + "\x00appservice\x00" + rq.AppService.ID
 	case rq.DeviceID != "":
 		return r.URL.EscapedPath() + "\x00user\x00" + rq.UserID + "\x00" + rq.DeviceID
 	}
@@ -565,6 +667,8 @@ type prepared struct {
 	push      map[string]pushcalc.Row
 	// after is the state group after the event, once stored.
 	after int64
+	// answer is the event ID the request was answered with.
+	answer string
 }
 
 // prepare builds and checks the event, in the order Synapse checks it
@@ -715,6 +819,10 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		return nil, "", fb("auth_events")
 	}
 	ts := c.o.Now().UnixMilli()
+	originTS := ts
+	if in.originTS != nil {
+		originTS = *in.originTS
+	}
 	bp := build.Proto{
 		RoomVersion:      id.RoomVersion(rvID),
 		RoomID:           req.Room,
@@ -726,7 +834,7 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		PrevEvents:       prevs,
 		AuthEvents:       authIDs,
 		Depth:            build.Depth(prevDepths),
-		OriginServerTS:   ts,
+		OriginServerTS:   originTS,
 		StickyDurationMS: in.sticky,
 	}
 	built, err := build.Build(bp, c.o.Key)
@@ -960,9 +1068,11 @@ func (c *Creator) persist(ctx context.Context, w http.ResponseWriter, p *prepare
 	if persisted != "" && persisted != p.ev.ID {
 		// Deduplicated by the writer: an event of the same transaction
 		// was persisted first. That is the answer.
+		p.answer = persisted
 		c.respond(w, p.in, persisted)
 		return Outcome{Result: "writer_dedup"}
 	}
+	p.answer = p.ev.ID
 	c.respond(w, p.in, p.ev.ID)
 	c.verify(pending{p: p})
 	return Outcome{Result: "created"}
@@ -1019,7 +1129,7 @@ func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
 			"rejected":                 nil,
 			"state_group_deltas":       deltas,
 			"state_delta_due_to_event": due,
-			"app_service_id":           nil,
+			"app_service_id":           p.rq.appServiceID(),
 			"partial_state":            false,
 		},
 		"requester":   p.rq,

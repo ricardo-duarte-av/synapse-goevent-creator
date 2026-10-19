@@ -80,9 +80,6 @@ func (c *Creator) limiters() *membershipLimiters {
 // serveMembership serves the membership servlets.
 func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	q := r.URL.Query()
-	if q.Has("user_id") || q.Has("device_id") || (req.Endpoint == route.State && q.Has("ts")) {
-		return fallback("appservice")
-	}
 	if req.Endpoint == route.State && q.Has(DelayParam) {
 		return fallback("delayed")
 	}
@@ -128,10 +125,19 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 	if st != nil {
 		return c.end(w, st)
 	}
+	var ts *int64
+	if req.Endpoint == route.State {
+		probe := &input{}
+		if st := appserviceTS(rq, q, probe); st != nil {
+			return c.end(w, st)
+		}
+		ts = probe.originTS
+	}
 	in, st := c.parseMembership(req, rq, body)
 	if st != nil {
 		return c.end(w, st)
 	}
+	in.originTS = ts
 
 	if out, limited := c.ratelimitMembership(ctx, w, req, rq, in.member); limited {
 		return out
@@ -428,7 +434,16 @@ func (c *Creator) ratelimitMembership(ctx context.Context, w http.ResponseWriter
 	if m.action != "join" && m.action != "invite" {
 		return Outcome{}, false
 	}
-	exempt, err := c.o.Store.RatelimitExempt(ctx, rq.UserID)
+	if rq.AppService != nil && !rq.AppService.RateLimited {
+		// can_do_action: an appservice registered with rate_limited: false.
+		return Outcome{}, false
+	}
+	entity := rq.Entity
+	if entity == "" {
+		entity = rq.UserID
+	}
+	// get_ratelimit_for_user(requester.authenticated_entity).
+	exempt, err := c.o.Store.RatelimitExempt(ctx, entity)
 	if err != nil {
 		return fallback("db_error"), true
 	}

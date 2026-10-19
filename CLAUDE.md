@@ -174,8 +174,8 @@ Each native event is verified against what was persisted
   can be refused. All the inputs are bumped (`resolve_state_groups`). On
   2026-10-19 3.7% of the week's local events had several prev events (76 of
   them ten). The e2e step "send on a fork" races a native state event with
-  one main makes (`?user_id=` is masquerading, main's; Synapse ignores it for
-  a user's own token) and checks the resolved group (`state_before`).
+  one main makes (JSON nested past 100 levels is main's) and checks the
+  resolved group (`state_before`).
 - **Synapse is not asked who the requester is** (M6, operator: "we must not
   depend on synapse"). `requester` is `get_user_by_req` on the database:
   Synapse's token rules (`Mixing Authorization headers...`, `Too many
@@ -190,7 +190,20 @@ Each native event is verified against what was persisted
   option. Appservice tokens (the registrations' `as_token`), anything
   pymacaroons could deserialize (guest macaroons need
   `macaroon_secret_key`), delegated auth (MAS, MSC3861) and
-  `account_validity` are Synapse's. Not reproduced: `_record_request`
+  `account_validity` are Synapse's.
+- **Appservices are served** (`get_appservice_user`): the registrations'
+  `as_token` (re-read at start, `appservice.Load`), `?user_id=` masquerading
+  (`validate_appservice_can_control_user_id`: the namespace regexes as
+  `re.match`, then the user must exist), MSC3202 `?device_id=` (a device that
+  is not hidden), and `?ts=` as `origin_server_ts`. The requester and the
+  context carry `app_service_id`, so the writer applies the appservice's
+  `rate_limited`; membership ratelimits skip unlimited ones too. Without a
+  device there is no transaction lookup: a retry is answered by the
+  transaction cache (`answerCache`, Synapse's `HttpTransactionCache`, keyed
+  as it keys: path plus user and device, guest, appservice, or token). The
+  doublepuppet registration claims every local user, so bridged messages
+  from real users come this way. `ip_range_whitelist` is Synapse's. Not run
+  live: it needs a bridge's token, which is the operator's. Not reproduced: `_record_request`
   (`user_ips`, MAU), which goes to main over TCP replication; clients'
   other requests keep last-seen current.
 - **Refusals are given here, in Synapse's order and words** (M6). A check

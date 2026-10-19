@@ -18,7 +18,7 @@ import (
 func (c *Creator) shadowBanned(ctx context.Context, w http.ResponseWriter, txnKey string) Outcome {
 	c.shadowPause(ctx)
 	id := fakeEventID()
-	c.fakes.add(txnKey, id, c.o.Now())
+	c.answers.add(txnKey, id, c.o.Now())
 	writeEventID(w, id)
 	return Outcome{Result: "shadow_banned"}
 }
@@ -48,18 +48,19 @@ func fakeEventID() string {
 	return string(b)
 }
 
-// fakeCache is HttpTransactionCache for shadow-banned answers: 30 minutes.
-type fakeCache struct {
+// answerCache is HttpTransactionCache for the event endpoints: the event ID
+// a transaction was answered with, for 30 minutes, on this process.
+type answerCache struct {
 	mu   sync.Mutex
-	byID map[string]fakeEntry
+	byID map[string]answerEntry
 }
 
-type fakeEntry struct {
+type answerEntry struct {
 	id string
 	at time.Time
 }
 
-func (f *fakeCache) get(key string, now time.Time) (string, bool) {
+func (f *answerCache) get(key string, now time.Time) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	e, ok := f.byID[key]
@@ -69,21 +70,21 @@ func (f *fakeCache) get(key string, now time.Time) (string, bool) {
 	return e.id, true
 }
 
-func (f *fakeCache) add(key, id string, now time.Time) {
+func (f *answerCache) add(key, id string, now time.Time) {
 	if key == "" {
 		return
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.byID == nil {
-		f.byID = map[string]fakeEntry{}
+		f.byID = map[string]answerEntry{}
 	}
 	for k, e := range f.byID {
 		if now.Sub(e.at) >= txnCacheTTL {
 			delete(f.byID, k)
 		}
 	}
-	f.byID[key] = fakeEntry{id, now}
+	f.byID[key] = answerEntry{id, now}
 }
 
 // userSuspended is the refusals of a suspended account (MSC3823).

@@ -1,7 +1,8 @@
 // Package appservice reads the application service registrations Synapse is
-// configured with, for the one thing this worker needs from them: which users
-// an appservice claims exclusively. Synapse never computes push actions for
-// those users (bulk_push_rule_evaluator.py:193).
+// configured with (config/appservice.py): which users an appservice claims
+// exclusively, as Synapse never computes push actions for them
+// (bulk_push_rule_evaluator.py:193), and who an appservice's token may act
+// as (api/auth/base.py, get_appservice_user).
 package appservice
 
 import (
@@ -14,8 +15,12 @@ import (
 )
 
 type registration struct {
-	ASToken    string `yaml:"as_token"`
-	Namespaces struct {
+	ID               string `yaml:"id"`
+	ASToken          string `yaml:"as_token"`
+	SenderLocalpart  string `yaml:"sender_localpart"`
+	RateLimited      any    `yaml:"rate_limited"`
+	IPRangeWhitelist any    `yaml:"ip_range_whitelist"`
+	Namespaces       struct {
 		Users []struct {
 			Exclusive bool   `yaml:"exclusive"`
 			Regex     string `yaml:"regex"`
@@ -54,10 +59,25 @@ func ExclusiveUsers(files []string) (*regexp.Regexp, error) {
 	return re, nil
 }
 
-// Tokens are the registrations' as_tokens: get_app_service_by_token's
-// lookup, which get_user_by_req makes before the access_tokens table.
-func Tokens(files []string) (map[string]bool, error) {
-	out := map[string]bool{}
+// Service is an ApplicationService, as far as a request from it goes.
+type Service struct {
+	ID     string
+	Token  string
+	Sender string
+	// RateLimited is rate_limited: true unless the registration says a
+	// bool false.
+	RateLimited bool
+	// IPRanges is ip_range_whitelist being set: a request from elsewhere is
+	// not the appservice's.
+	IPRanges bool
+	users    []*regexp.Regexp
+	// broken is a namespace regex Go cannot compile.
+	broken bool
+}
+
+// Load reads the registrations: the services by as_token.
+func Load(files []string, serverName string) (map[string]*Service, error) {
+	out := map[string]*Service{}
 	for _, f := range files {
 		b, err := os.ReadFile(f)
 		if err != nil {
@@ -67,9 +87,44 @@ func Tokens(files []string) (map[string]bool, error) {
 		if err := yaml.Unmarshal(b, &r); err != nil {
 			return nil, fmt.Errorf("appservice: %s: %w", f, err)
 		}
-		if r.ASToken != "" {
-			out[r.ASToken] = true
+		if r.ASToken == "" {
+			continue
 		}
+		s := &Service{ID: r.ID, Token: r.ASToken, Sender: "@" + r.SenderLocalpart + ":" + serverName, RateLimited: true}
+		if v, ok := r.RateLimited.(bool); ok {
+			s.RateLimited = v
+		}
+		// `if as_info.get("ip_range_whitelist")`: anything truthy.
+		switch v := r.IPRangeWhitelist.(type) {
+		case nil:
+		case []any:
+			s.IPRanges = len(v) > 0
+		case string:
+			s.IPRanges = v != ""
+		default:
+			s.IPRanges = true
+		}
+		for _, u := range r.Namespaces.Users {
+			// re.match: anchored at the start only.
+			re, err := regexp.Compile(`^(?:` + u.Regex + `)`)
+			if err != nil {
+				s.broken = true
+				continue
+			}
+			s.users = append(s.users, re)
+		}
+		out[s.Token] = s
 	}
 	return out, nil
+}
+
+// InUserNamespace is is_user_in_namespace. ok is false when a namespace
+// could not be compiled, and the answer is unknown.
+func (s *Service) InUserNamespace(userID string) (in, ok bool) {
+	for _, re := range s.users {
+		if re.MatchString(userID) {
+			return true, true
+		}
+	}
+	return false, !s.broken
 }

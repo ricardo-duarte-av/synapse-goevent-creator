@@ -49,14 +49,30 @@ func TestLiveRegistrations(t *testing.T) {
 	t.Logf("%d registrations; exclusive regex: %v", len(hs.AppServiceFiles), re)
 }
 
-func TestTokens(t *testing.T) {
+func TestLoad(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "reg.yaml")
-	_ = os.WriteFile(f, []byte("as_token: secret\nhs_token: other\n"), 0o600)
-	toks, err := Tokens([]string{f})
+	_ = os.WriteFile(f, []byte(`
+id: bridge
+as_token: secret
+hs_token: other
+sender_localpart: bot
+rate_limited: false
+namespaces:
+  users:
+    - exclusive: true
+      regex: '@bridge_.*:example\.org'
+`), 0o600)
+	svcs, err := Load([]string{f}, "example.org")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !toks["secret"] || toks["other"] || len(toks) != 1 {
-		t.Errorf("tokens %v", toks)
+	s := svcs["secret"]
+	if s == nil || s.ID != "bridge" || s.Sender != "@bot:example.org" || s.RateLimited || s.IPRanges {
+		t.Fatalf("%+v", s)
+	}
+	for id, want := range map[string]bool{"@bridge_1:example.org": true, "@bridge_1:example.org.evil": true, "@x:example.org": false, "x@bridge_1:example.org": false} {
+		if in, ok := s.InUserNamespace(id); !ok || in != want {
+			t.Errorf("%s: %v %v", id, in, ok)
+		}
 	}
 }

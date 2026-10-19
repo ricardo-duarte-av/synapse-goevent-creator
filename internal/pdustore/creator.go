@@ -244,3 +244,25 @@ func (s *Store) RejectionColumn(ctx context.Context, eventID string) (*string, e
 	}
 	return v, nil
 }
+
+const qUserFlags = `SELECT COALESCE(admin, 0) <> 0, COALESCE(suspended, false) FROM users WHERE name = $1`
+
+// UserFlags is get_user_by_id's existence, is_server_admin and
+// get_user_suspended_status, for a user an appservice acts as.
+func (s *Store) UserFlags(ctx context.Context, userID string) (exists, admin, suspended bool, err error) {
+	err = s.pool.QueryRow(ctx, qUserFlags, userID).Scan(&admin, &suspended)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, false, nil
+	}
+	if err != nil {
+		return false, false, false, fmt.Errorf("pdustore: user flags: %w", err)
+	}
+	return true, admin, suspended, nil
+}
+
+const qDeviceExists = `SELECT EXISTS (SELECT 1 FROM devices WHERE user_id = $1 AND device_id = $2 AND NOT hidden)`
+
+// DeviceExists is get_device: a device that is not hidden.
+func (s *Store) DeviceExists(ctx context.Context, userID, deviceID string) (bool, error) {
+	return s.exists(ctx, "device", qDeviceExists, userID, deviceID)
+}

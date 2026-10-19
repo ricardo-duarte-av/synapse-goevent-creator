@@ -284,9 +284,8 @@ func (s *suite) membership(me, probe, tag string) {
 
 // expectError checks a refusal: status and errcode.
 // fork makes the room's DAG fork and sends on it: a state event the worker
-// creates and one main creates (user_id in the query is appservice
-// masquerading, which the worker leaves to main; Synapse ignores it for a
-// user's own token), at once, so both build on the same extremity; then a message, whose state
+// creates and one main creates (JSON nested deeper than the worker decodes
+// itself is main's), at once, so both build on the same extremity; then a message, whose state
 // before must be resolved across both. The worker counts a stored resolved
 // group as the verify check state_before. Concurrency is not guaranteed:
 // it is tried a few times.
@@ -312,7 +311,8 @@ func (s *suite) fork(metricsURL, tag string) {
 		}()
 		go func() {
 			defer wg.Done()
-			main = s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/main")+"?user_id="+url.QueryEscape(s.me), map[string]any{"run": run}, true)
+			deep := strings.Repeat("[", 101) + strings.Repeat("]", 101)
+			main = s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/main"), `{"run":"`+run+`","deep":`+deep+`}`, true)
 		}()
 		wg.Wait()
 		if native.status != 200 || main.status != 200 {

@@ -39,6 +39,8 @@ var Tables = []string{
 	"account_data",
 	// Membership.
 	"profiles", "blocked_rooms", "ratelimit_override", "access_tokens", "users",
+	// Appservice device masquerading.
+	"devices",
 }
 
 const qAccountData = `SELECT content FROM account_data WHERE user_id = $1 AND account_data_type = $2`

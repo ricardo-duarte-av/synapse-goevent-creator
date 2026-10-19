@@ -335,7 +335,7 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 	d.closers = append(d.closers, w.Close)
 	log.Info().Str("role", writer.Role).Msg("Connected as the write role")
 
-	asTokens, err := appservice.Tokens(hs.AppServiceFiles)
+	appservices, err := appservice.Load(hs.AppServiceFiles, hs.ServerName)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +352,7 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		Sticky:       hs.Flag("msc4354_enabled", false),
 		Log:          log,
 
-		AppServiceTokens:       asTokens,
+		AppServices:            appservices,
 		DelegatedAuth:          hs.Auth.Delegated,
 		AccountValidity:        hs.Auth.AccountValidity,
 		RedactionAllowedPeriod: hs.RedactionAllowedPeriod,

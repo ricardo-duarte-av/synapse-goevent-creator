@@ -17,6 +17,7 @@ import (
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/appservice"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/build"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
@@ -122,7 +123,13 @@ func (f *fakeRoom) LocalMembership(_ context.Context, u, _ string) (string, stri
 	}
 	return gjson.Get(f.events[id].Content.Raw, "membership").Str, id, nil
 }
-func (f *fakeRoom) RatelimitExempt(context.Context, string) (bool, error)       { return f.exempt, nil }
+func (f *fakeRoom) RatelimitExempt(context.Context, string) (bool, error) { return f.exempt, nil }
+func (f *fakeRoom) UserFlags(_ context.Context, u string) (bool, bool, bool, error) {
+	return u == user || u == other || u == "@bot:example.org", false, false, nil
+}
+func (f *fakeRoom) DeviceExists(_ context.Context, u, d string) (bool, error) {
+	return d == "BRIDGEDEV", nil
+}
 func (f *fakeRoom) RecentJoins(context.Context, string, int64) ([]int64, error) { return nil, nil }
 func (f *fakeRoom) AccountData(_ context.Context, u, typ string) ([]byte, bool, error) {
 	if f.accountData[u+" "+typ] {
@@ -508,12 +515,11 @@ func TestWriterDedupAnswersWithItsEvent(t *testing.T) {
 func TestRequestsLeftToSynapse(t *testing.T) {
 	for _, tc := range []struct{ path, auth, want string }{
 		{"/send/m.room.message/t?org.matrix.msc4140.delay=1000", "Bearer tok", "delayed"},
-		{"/send/m.room.message/t?user_id=@ghost:example.org", "Bearer tok", "appservice"},
-		{"/send/m.room.message/t", "Bearer as-secret", "appservice"},
+		{"/send/m.room.message/t", "Bearer as-iprange", "appservice_ip"},
 		{"/send/m.room.message/t", "Bearer MDAxY2xvY2F0aW9uIGV4YW1wbGUub3JnCg", "guest_token"},
 	} {
 		h := newHarness(t)
-		h.c.o.AppServiceTokens = map[string]bool{"as-secret": true}
+		h.c.o.AppServices = map[string]*appservice.Service{"as-iprange": {ID: "x", Sender: "@x:example.org", IPRanges: true}}
 		r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+tc.path, strings.NewReader(`{"msgtype":"m.text","body":"hi"}`))
 		if tc.auth != "" {
 			r.Header.Set("Authorization", tc.auth)
