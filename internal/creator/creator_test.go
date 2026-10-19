@@ -118,7 +118,7 @@ func (f *fakeRoom) LocalMembership(_ context.Context, u, _ string) (string, stri
 	}
 	return gjson.Get(f.events[id].Content.Raw, "membership").Str, id, nil
 }
-func (f *fakeRoom) RatelimitExempt(context.Context, string) (bool, error)          { return f.exempt, nil }
+func (f *fakeRoom) RatelimitExempt(context.Context, string) (bool, error)       { return f.exempt, nil }
 func (f *fakeRoom) RecentJoins(context.Context, string, int64) ([]int64, error) { return nil, nil }
 func (f *fakeRoom) AccountData(_ context.Context, u, typ string) ([]byte, bool, error) {
 	if f.accountData[u+" "+typ] {
