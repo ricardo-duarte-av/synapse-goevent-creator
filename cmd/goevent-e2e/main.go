@@ -289,9 +289,34 @@ func (s *suite) membership(me, probe, tag string) {
 }
 
 // expectError checks a refusal: status and errcode.
+// delayed adds a delayed state event and waits for main to send it, then
+// checks Synapse's refusals of delays it will not take.
+func (s *suite) delayed() {
+	const typ = "pt.aguiarvieira.goevent.delayed"
+	r := s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/")+"?org.matrix.msc4140.delay=1500", map[string]any{"run": s.run}, true)
+	id := r.body.Get("delay_id").Str
+	if r.status != 200 || !strings.HasPrefix(id, "syd_") {
+		s.record("delayed state event", false, "%d %s", r.status, r.raw)
+	} else {
+		var got resp
+		for i := 0; i < 40; i++ {
+			time.Sleep(250 * time.Millisecond)
+			got = s.c.do(http.MethodGet, s.roomPath("/state/"+typ+"/"), nil, true)
+			if got.body.Get("run").Str == s.run {
+				break
+			}
+		}
+		s.record("delayed state event", got.body.Get("run").Str == s.run, "%s, sent: %s", id, got.raw)
+	}
+	s.expectError("refuse a delay over the maximum", s.c.do(http.MethodPut, s.roomPath("/send/m.room.message/"+esc(s.txn("delay max")))+
+		"?org.matrix.msc4140.delay=86400001", map[string]any{"msgtype": "m.text", "body": "x"}, true), 400, "ORG.MATRIX.MSC4140_DELAY_TOO_LARGE")
+	s.expectError("refuse a negative delay", s.c.do(http.MethodPut, s.roomPath("/send/m.room.message/"+esc(s.txn("delay neg")))+
+		"?org.matrix.msc4140.delay=-1", map[string]any{"msgtype": "m.text", "body": "x"}, true), 400, "M_INVALID_PARAM")
+}
+
 // fork makes the room's DAG fork and sends on it: a state event the worker
-// creates and one main creates (a delayed event, due at once: main
-// schedules and sends delayed events), at the same moment, so both build on the same extremity; then a message, whose state
+// creates and one main creates (a delayed event, due at once: the worker
+// adds it, main sends it), at the same moment, so both build on the same extremity; then a message, whose state
 // before must be resolved across both. The worker counts a stored resolved
 // group as the verify check state_before. Concurrency is not guaranteed:
 // it is tried a few times.
@@ -701,6 +726,7 @@ func run() int {
 		s.skip("refuse redacting the create event", fmt.Sprintf("create event not found: %d %s", create.status, create.raw))
 	}
 
+	s.delayed()
 	s.fork(*metricsURL, tag)
 	s.appservice(os.Getenv("GOEVENT_E2E_AS_TOKEN"), tag)
 

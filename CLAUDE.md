@@ -174,8 +174,7 @@ Each native event is verified against what was persisted
   can be refused. All the inputs are bumped (`resolve_state_groups`). On
   2026-10-19 3.7% of the week's local events had several prev events (76 of
   them ten). The e2e step "send on a fork" races a native state event with
-  a delayed one main sends (`?org.matrix.msc4140.delay=`, main's for good:
-  it schedules and sends delayed events) and checks the resolved group
+  a delayed one (added here, sent by main when due) and checks the resolved group
   (`state_before`). It usually forks within a few attempts (up to 10, the
   delay cycling 0-100 ms); a skip is timing, not a failure.
 - **The suite's appservice** (`goevent-e2e`, operator, 2026-10-19):
@@ -290,6 +289,19 @@ Each native event is verified against what was persisted
   container needs outbound HTTPS for it. The invite itself is the events
   writer's to send: an invitee on a server that does not exist is its 502,
   relayed (`Can't connect to server nonexistent.invalid`, an e2e step).
+- **Delayed events are added here** (MSC4140, `DelayedEventsHandler.add`):
+  `?org.matrix.msc4140.delay=` on `/send` and `/state` (member events too,
+  as sent, before the member path), after the servlet's JSON, `ts` and
+  sticky parsing. `rc_message` is counted in this process (`update=True`,
+  unlike the event path's pre-check), with the user's
+  `ratelimit_override` rates; then `max_event_delay_duration`,
+  `validate_builder`, and `add_delayed_event_txn` (per-user limit, its
+  429 with `retry_after_ms` possibly null) as the role, granted SELECT and
+  INSERT on `delayed_events`. Main, which schedules and sends delayed
+  events, is told the next send time
+  (`/_synapse/replication/added_delayed_event/`) and creates the event
+  when due. Cancel, restart and send (`/delayed_events/...`) are not
+  routed here.
 - **Writer-side refusals** (`persist_and_notify_client_events`): redacting
   the create event (403), an event of another room (400) or a server ACL
   (403) is refused here, never sent. The writer ratelimits (`rc_message`)

@@ -35,9 +35,11 @@ const (
 )
 
 // MembershipNotifier is main, told that a user left a room
-// (ReplicationUserJoinedLeftRoomRestServlet).
+// (ReplicationUserJoinedLeftRoomRestServlet) or that a delayed event was
+// added (ReplicationAddedDelayedEventRestServlet).
 type MembershipNotifier interface {
 	UserLeftRoom(ctx context.Context, roomID, userID string) error
+	DelayedEventAdded(ctx context.Context, nextSendTS int64) error
 }
 
 // memberInput is what a membership request asks for.
@@ -80,9 +82,6 @@ func (c *Creator) limiters() *membershipLimiters {
 // serveMembership serves the membership servlets.
 func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	q := r.URL.Query()
-	if req.Endpoint == route.State && q.Has(DelayParam) {
-		return fallback("delayed")
-	}
 	if reason := c.configFallback(); reason != "" {
 		// user_may_invite, user_may_join_room, check_event_allowed.
 		return fallback(reason)
@@ -132,6 +131,15 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 			return c.end(w, st)
 		}
 		ts = probe.originTS
+		if st := parseDelay(q, probe); st != nil {
+			return c.end(w, st)
+		}
+		if probe.delayMS != nil {
+			// The state servlet adds a delayed member event as it is.
+			sk := req.StateKey
+			in := &input{typ: "m.room.member", stateKey: &sk, content: body, room: req.Room, originTS: ts}
+			return c.addDelayed(ctx, w, rq, in, *probe.delayMS, "")
+		}
 	}
 	in, st := c.parseMembership(req, rq, body)
 	if st != nil {

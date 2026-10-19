@@ -85,3 +85,18 @@ func (s *Store) RecentJoins(ctx context.Context, roomID string, sinceMS int64) (
 	}
 	return ts, nil
 }
+
+const qRatelimitOverrideRates = `SELECT messages_per_second, burst_count FROM ratelimit_override WHERE user_id = $1`
+
+// RatelimitOverride is get_ratelimit_for_user: whether the user has an
+// override row, and its values.
+func (s *Store) RatelimitOverride(ctx context.Context, userID string) (found bool, perSecond, burst *int64, err error) {
+	err = s.pool.QueryRow(ctx, qRatelimitOverrideRates, userID).Scan(&perSecond, &burst)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil, nil, nil
+	}
+	if err != nil {
+		return false, nil, nil, fmt.Errorf("pdustore: ratelimit override: %w", err)
+	}
+	return true, perSecond, burst, nil
+}

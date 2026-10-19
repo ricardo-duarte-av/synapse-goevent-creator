@@ -44,6 +44,8 @@ var Grants = []dbrole.Grant{
 	// mark_access_token_as_used, on a token's first request. Only the flag:
 	// the role never reads a token.
 	{Table: "access_tokens", Privileges: "SELECT (id, used), UPDATE (used)"},
+	// add_delayed_event: a delayed event's row, sent later by main.
+	{Table: "delayed_events", Privileges: "SELECT, INSERT"},
 }
 
 // Sequences are granted USAGE: new state group IDs, and the pending deletion
@@ -80,6 +82,16 @@ const (
 	// qMarkTokenUsed is mark_access_token_as_used's simple_update_one
 	// (storage/databases/main/registration.py).
 	qMarkTokenUsed = `UPDATE access_tokens SET used = true WHERE id = $1`
+
+	// add_delayed_event_txn (storage/databases/main/delayed_events.py).
+	qDelayedCount     = `SELECT COUNT(*) FROM delayed_events WHERE user_localpart = $1`
+	qDelayedThreshold = `SELECT MAX(send_ts) FROM (
+		SELECT * FROM delayed_events WHERE user_localpart = $1 ORDER BY send_ts ASC LIMIT $2
+	) AS subquery`
+	qInsertDelayed = `INSERT INTO delayed_events (delay_id, user_localpart, device_id, delay, send_ts, room_id,
+		event_type, state_key, origin_server_ts, content, sticky_duration_ms)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
+	qNextDelayed = `SELECT MIN(send_ts) FROM delayed_events WHERE is_processed = false`
 
 	// qExistingGroups is _get_existing_groups_with_lock with lock=False
 	// (storage/databases/state/deletion.py).
@@ -191,6 +203,56 @@ func (d *DB) SetRoomParticipation(ctx context.Context, userID, roomID string) er
 		return fmt.Errorf("writer: room participation: %w", err)
 	}
 	return nil
+}
+
+// DelayedEvent is a delayed_events row.
+type DelayedEvent struct {
+	DelayID, UserLocalpart string
+	DeviceID               *string
+	DelayMS, SendTS        int64
+	RoomID, EventType      string
+	StateKey               *string
+	OriginServerTS         *int64
+	Content                string
+	StickyDurationMS       *int64
+}
+
+// DelayedLimitError is add_delayed_event's LimitExceededError: the user has
+// limit delayed events already. RetryAfterMS is nil when the threshold has
+// passed.
+type DelayedLimitError struct{ RetryAfterMS *int64 }
+
+func (e *DelayedLimitError) Error() string { return "writer: too many delayed events" }
+
+// AddDelayedEvent is add_delayed_event: the row, unless the user has limit
+// already, and the send time of the next delayed event due.
+func (d *DB) AddDelayedEvent(ctx context.Context, ev DelayedEvent, limit int) (nextSendTS int64, err error) {
+	err = pgx.BeginTxFunc(ctx, d.pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead}, func(tx pgx.Tx) error {
+		var n int
+		if err := tx.QueryRow(ctx, qDelayedCount, ev.UserLocalpart).Scan(&n); err != nil {
+			return fmt.Errorf("writer: delayed events count: %w", err)
+		}
+		if n >= limit {
+			var max int64
+			if err := tx.QueryRow(ctx, qDelayedThreshold, ev.UserLocalpart, n-limit+1).Scan(&max); err != nil {
+				return fmt.Errorf("writer: delayed events threshold: %w", err)
+			}
+			le := &DelayedLimitError{}
+			if retry := max - d.now().UnixMilli(); retry > 0 {
+				le.RetryAfterMS = &retry
+			}
+			return le
+		}
+		if _, err := tx.Exec(ctx, qInsertDelayed, ev.DelayID, ev.UserLocalpart, ev.DeviceID, ev.DelayMS, ev.SendTS,
+			ev.RoomID, ev.EventType, ev.StateKey, ev.OriginServerTS, ev.Content, ev.StickyDurationMS); err != nil {
+			return fmt.Errorf("writer: delayed event: %w", err)
+		}
+		if err := tx.QueryRow(ctx, qNextDelayed).Scan(&nextSendTS); err != nil {
+			return fmt.Errorf("writer: next delayed event: %w", err)
+		}
+		return nil
+	})
+	return nextSendTS, err
 }
 
 // MarkTokenUsed is mark_access_token_as_used: the token has served a

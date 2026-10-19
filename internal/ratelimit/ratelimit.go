@@ -46,11 +46,17 @@ func (l *Limiter) seconds() float64 {
 // retry_after_ms ratelimit would refuse it with. With update, an allowed
 // action is counted.
 func (l *Limiter) CanDo(key string, update bool) (bool, int64) {
+	return l.CanDoRate(key, l.cfg.PerSecond, l.cfg.Burst, update)
+}
+
+// CanDoRate is CanDo with rate_hz and burst_count given for the call, as the
+// request ratelimiter gives a user's override.
+func (l *Limiter) CanDoRate(key string, perSecond float64, burstCount int, update bool) (bool, int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.seconds()
 	l.prune(now)
-	rate, burst := l.cfg.PerSecond, float64(l.cfg.Burst)
+	rate, burst := perSecond, float64(burstCount)
 
 	b, ok := l.actions[key]
 	if !ok {

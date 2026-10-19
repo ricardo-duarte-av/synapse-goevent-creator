@@ -1,5 +1,7 @@
 {
   "refuse ACL denying this server": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"Can't create an ACL event that denies the local server\"}",
+  "refuse a delay over the maximum": "400 {\"errcode\":\"ORG.MATRIX.MSC4140_DELAY_TOO_LARGE\",\"error\":\"The requested delay (86400001ms) exceeds the allowed maximum (86400000ms)\"}",
+  "refuse a negative delay": "400 {\"errcode\":\"M_INVALID_PARAM\",\"error\":\"Query parameter org.matrix.msc4140.delay must be a positive integer.\"}",
   "refuse alias too long": "400 {\"errcode\":\"M_INVALID_PARAM\",\"error\":\"Can't create aliases longer than 255 characters\"}",
   "refuse appservice bad ts": "400 {\"errcode\":\"M_INVALID_PARAM\",\"error\":\"Query parameter ts must be a positive integer.\"}",
   "refuse appservice outside its namespace": "403 {\"errcode\":\"M_FORBIDDEN\",\"error\":\"Application service cannot masquerade as this user (@nobody:elsewhere.example).\"}",

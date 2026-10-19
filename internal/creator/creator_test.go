@@ -124,6 +124,9 @@ func (f *fakeRoom) LocalMembership(_ context.Context, u, _ string) (string, stri
 	return gjson.Get(f.events[id].Content.Raw, "membership").Str, id, nil
 }
 func (f *fakeRoom) RatelimitExempt(context.Context, string) (bool, error) { return f.exempt, nil }
+func (f *fakeRoom) RatelimitOverride(context.Context, string) (bool, *int64, *int64, error) {
+	return f.exempt, nil, nil, nil
+}
 func (f *fakeRoom) UserFlags(_ context.Context, u string) (bool, bool, bool, error) {
 	return u == user || u == other || u == "@bot:example.org", false, false, nil
 }
@@ -227,8 +230,17 @@ type fakeWriter struct {
 	groupPrev  int64
 	bumped     []int64
 	nextGroup  int64
+	delayed    []writer.DelayedEvent
 }
 
+func (w *fakeWriter) AddDelayedEvent(_ context.Context, ev writer.DelayedEvent, limit int) (int64, error) {
+	w.calls = append(w.calls, "delayed")
+	w.delayed = append(w.delayed, ev)
+	if len(w.delayed) > limit {
+		return 0, &writer.DelayedLimitError{}
+	}
+	return ev.SendTS, nil
+}
 func (w *fakeWriter) MarkTokenUsed(context.Context, int64) error {
 	w.calls = append(w.calls, "token_used")
 	return nil
@@ -287,8 +299,15 @@ type harness struct {
 	main *fakeMain
 }
 
-type fakeMain struct{ left []string }
+type fakeMain struct {
+	left    []string
+	delayed []int64
+}
 
+func (m *fakeMain) DelayedEventAdded(_ context.Context, next int64) error {
+	m.delayed = append(m.delayed, next)
+	return nil
+}
 func (m *fakeMain) UserLeftRoom(_ context.Context, roomID, userID string) error {
 	m.left = append(m.left, roomID+" "+userID)
 	return nil
@@ -307,6 +326,7 @@ func newHarness(t *testing.T) *harness {
 		Membership: synapsecfg.Membership{AllowPerRoomProfiles: true, IncludeProfileDataOnInvite: true,
 			JoinsLocal: lim, JoinsPerRoom: lim, InvitesPerRoom: lim, InvitesPerUser: lim, InvitesPerIssuer: lim},
 		MSC4155: true, MSC4293: true, Main: h.main,
+		Delayed:     synapsecfg.Delayed{MaxDelayMS: 86400000, PerUser: 2, RcMessage: synapsecfg.Ratelimit{Key: "rc_message", PerSecond: 1, Burst: 10}},
 		ShadowPause: func(time.Duration) time.Duration { return 0 },
 		Log:         zerolog.Nop(), Now: func() time.Time { return time.UnixMilli(1700000000000) }})
 	h.c.verify = func(pending) {}
@@ -514,7 +534,6 @@ func TestWriterDedupAnswersWithItsEvent(t *testing.T) {
 
 func TestRequestsLeftToSynapse(t *testing.T) {
 	for _, tc := range []struct{ path, auth, want string }{
-		{"/send/m.room.message/t?org.matrix.msc4140.delay=1000", "Bearer tok", "delayed"},
 		{"/send/m.room.message/t", "Bearer as-iprange", "appservice_ip"},
 		{"/send/m.room.message/t", "Bearer MDAxY2xvY2F0aW9uIGV4YW1wbGUub3JnCg", "guest_token"},
 	} {

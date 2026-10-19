@@ -65,6 +65,17 @@ func validateBuilder(in *input, content gjson.Result, room string) *stop {
 			return s
 		}
 		return ensureState()
+	case "m.room.member":
+		// Reached only by a delayed member event: update_membership builds
+		// a valid one.
+		v, ok := pdu.Field(content, "membership")
+		if !ok {
+			return badRequest("invalid_member", "Content has not membership key").stop()
+		}
+		if v.Type != gjson.String || !membershipList[v.Str] {
+			return badRequest("invalid_member", "Invalid membership key").stop()
+		}
+		return ensureState()
 	case "m.room.tombstone":
 		r, ok := pdu.Field(content, "replacement_room")
 		if !ok {

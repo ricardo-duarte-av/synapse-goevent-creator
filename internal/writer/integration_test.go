@@ -2,7 +2,9 @@ package writer
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -48,6 +50,7 @@ func TestWritesAsTheRole(t *testing.T) {
 		`INSERT INTO state_groups (id, room_id, event_id) VALUES (101, '!r:x', '$a'), (102, '!r:x', '$b')`,
 		`INSERT INTO state_groups_pending_deletion (state_group, insertion_ts) VALUES (101, 1)`,
 		`DELETE FROM access_tokens WHERE id = 7001`,
+		`DELETE FROM delayed_events WHERE user_localpart = 'd'`,
 		`INSERT INTO access_tokens (id, user_id, token) VALUES (7001, '@u:x', 'tok')`,
 	} {
 		if _, err := a.Exec(ctx, q); err != nil {
@@ -138,6 +141,22 @@ func TestWritesAsTheRole(t *testing.T) {
 		t.Error("marked a token that does not exist")
 	}
 
+	// Delayed events, up to the limit.
+	dev := "DEV"
+	for i, want := range []error{nil, nil, &DelayedLimitError{}} {
+		next, err := d.AddDelayedEvent(ctx, DelayedEvent{DelayID: "syd_" + strconv.Itoa(i), UserLocalpart: "d", DeviceID: &dev,
+			DelayMS: 1000, SendTS: int64(5000 + i), RoomID: "!r:x", EventType: "t", Content: "{}"}, 2)
+		if want == nil && (err != nil || next != 5000) {
+			t.Fatalf("delayed %d: %d %v", i, next, err)
+		}
+		if want != nil {
+			var le *DelayedLimitError
+			if !errors.As(err, &le) || le.RetryAfterMS != nil {
+				t.Fatalf("delayed over the limit: %v", err)
+			}
+		}
+	}
+
 	// Nothing else: Synapse's other tables are refused.
 	for _, q := range []string{
 		`INSERT INTO events (event_id, topological_ordering, stream_ordering, room_id, type, processed, outlier) VALUES ('$x', 1, 1, '!r:x', 't', true, false)`,
@@ -148,6 +167,8 @@ func TestWritesAsTheRole(t *testing.T) {
 		`SELECT token FROM access_tokens`,
 		`UPDATE access_tokens SET token = 'x' WHERE id = 7001`,
 		`DELETE FROM access_tokens`,
+		`DELETE FROM delayed_events`,
+		`UPDATE delayed_events SET is_processed = true`,
 	} {
 		if _, err := d.pool.Exec(ctx, q); err == nil || !strings.Contains(err.Error(), "permission denied") {
 			t.Errorf("%s: allowed (%v)", q, err)

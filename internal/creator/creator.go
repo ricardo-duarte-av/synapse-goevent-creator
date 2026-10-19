@@ -45,6 +45,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pushcalc"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/ratelimit"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/stateres"
@@ -108,6 +109,7 @@ type Store interface {
 	RoomBlocked(ctx context.Context, roomID string) (bool, error)
 	LocalMembership(ctx context.Context, userID, roomID string) (membership, eventID string, err error)
 	RatelimitExempt(ctx context.Context, userID string) (bool, error)
+	RatelimitOverride(ctx context.Context, userID string) (found bool, perSecond, burst *int64, err error)
 	RecentJoins(ctx context.Context, roomID string, sinceMS int64) ([]int64, error)
 	AccountData(ctx context.Context, userID, typ string) (content []byte, ok bool, err error)
 	// Appservices.
@@ -124,6 +126,7 @@ type Writer interface {
 	UnstagePush(ctx context.Context, eventID string) error
 	StoreStateGroup(ctx context.Context, eventID, roomID string, prev int64, delta []writer.StateRow, full func() ([]writer.StateRow, error)) (int64, error)
 	StoreFullStateGroup(ctx context.Context, eventID, roomID string, rows []writer.StateRow) (int64, error)
+	AddDelayedEvent(ctx context.Context, ev writer.DelayedEvent, limit int) (int64, error)
 }
 
 // UserIPs is insert_client_ip.
@@ -177,6 +180,8 @@ type Options struct {
 	UserIPs UserIPs
 	// TrackAppserviceUserIPs and TrackPuppetedUserIPs are homeserver.yaml's.
 	TrackAppserviceUserIPs, TrackPuppetedUserIPs bool
+	// Delayed is delayed events' settings.
+	Delayed synapsecfg.Delayed
 	// RemoteProfiles queries remote servers for profiles; nil leaves
 	// remote targets' membership to Synapse.
 	RemoteProfiles RemoteProfiles
@@ -200,6 +205,8 @@ type Creator struct {
 
 	limitersOnce sync.Once
 	lim          *membershipLimiters
+	msgOnce      sync.Once
+	msgLimiter   *ratelimit.Limiter
 	// verify is replaced in tests.
 	verify func(v pending)
 }
@@ -283,13 +290,12 @@ type input struct {
 	dedupKind string
 	// originTS is an appservice's ts.
 	originTS *int64
+	// delayMS is a delayed event's delay.
+	delayMS *int64
 }
 
 func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	q := r.URL.Query()
-	if q.Has(DelayParam) {
-		return fallback("delayed")
-	}
 	if req.Endpoint == route.State && r.Method != http.MethodPut {
 		return fallback("method")
 	}
@@ -325,8 +331,8 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	var txnKey string
 	if req.TxnID != "" {
 		txnKey = rq.txnKey(r)
-		if id, ok := c.answers.get(txnKey, c.o.Now()); ok {
-			writeEventID(w, id)
+		if body, ok := c.answers.get(txnKey, c.o.Now()); ok {
+			writeJSON(w, []byte(body))
 			return Outcome{Result: "txn_cached"}
 		}
 	}
@@ -337,6 +343,11 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	in, st := c.parse(ctx, req, rq, body, q)
 	if st != nil {
 		return c.end(w, st)
+	}
+	if in.delayMS != nil {
+		// _parse_request_for_delayed_event_delay: DelayedEventsHandler.add,
+		// before anything that creates an event.
+		return c.addDelayed(ctx, w, rq, in, *in.delayMS, txnKey)
 	}
 	content := gjson.ParseBytes(in.content)
 	if rq.ShadowBanned && in.redacts == nil {
@@ -360,7 +371,7 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		switch {
 		case err == nil:
 			c.respond(w, in, id)
-			c.answers.add(txnKey, id, c.o.Now())
+			c.answers.add(txnKey, eventBody(id), c.o.Now())
 			return Outcome{Result: "txn_dedup"}
 		case !errors.Is(err, pdustore.ErrNotFound):
 			return fallback("db_error")
@@ -388,9 +399,29 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	// Past here, writes. Everything Synapse could refuse has been checked.
 	out := c.persist(ctx, w, p)
 	if out.Result == "created" || out.Result == "writer_dedup" {
-		c.answers.add(txnKey, p.answer, c.o.Now())
+		c.answers.add(txnKey, eventBody(p.answer), c.o.Now())
 	}
 	return out
+}
+
+// parseDelay is _parse_request_for_delayed_event_delay.
+func parseDelay(q map[string][]string, in *input) *stop {
+	v, ok := q[DelayParam]
+	if !ok || len(v) == 0 {
+		return nil
+	}
+	n, st := parseIntegerParam(DelayParam, v[0])
+	if st != nil {
+		return st
+	}
+	in.delayMS = &n
+	return nil
+}
+
+// eventBody is {"event_id": id}.
+func eventBody(id string) string {
+	b, _ := json.Marshal(map[string]string{"event_id": id})
+	return string(b)
 }
 
 // appserviceTS is an appservice's ts query parameter: the event's
@@ -448,7 +479,10 @@ func (c *Creator) parse(ctx context.Context, req route.Request, rq *requester, b
 				in.sticky = &n
 			}
 		}
-		if req.Action == "m.room.member" {
+		if st := parseDelay(q, in); st != nil {
+			return nil, st
+		}
+		if req.Action == "m.room.member" && in.delayMS == nil {
 			// create_and_send_nonmember_event.
 			return nil, (&refusal{reason: "type_member", status: http.StatusInternalServerError, errcode: "M_UNKNOWN",
 				msg: "Tried to send member event through non-member codepath"}).stop()
@@ -460,6 +494,9 @@ func (c *Creator) parse(ctx context.Context, req route.Request, rq *requester, b
 		}
 		sk := req.StateKey
 		in.stateKey, in.txn = &sk, ""
+		if st := parseDelay(q, in); st != nil {
+			return nil, st
+		}
 	case route.Redact:
 		content := gjson.ParseBytes(body)
 		rvID, err := c.o.Store.RoomVersion(ctx, req.Room)

@@ -234,7 +234,7 @@ func TestLiveHomeserverYAML(t *testing.T) {
 	}
 	t.Logf("server_name=%s track_presence=%v writers=%+v notaries=%v",
 		cfg.ServerName, cfg.TrackPresence, cfg.Writers, cfg.TrustedKeyServers)
-	t.Logf("membership=%+v auth=%+v", cfg.Membership, cfg.Auth)
+	t.Logf("membership=%+v auth=%+v delayed=%+v", cfg.Membership, cfg.Auth, cfg.Delayed)
 	for _, l := range [][]string{cfg.Writers.Typing, cfg.Writers.Receipts, cfg.Writers.ToDevice,
 		cfg.Writers.Presence, cfg.Writers.DeviceLists} {
 		for _, name := range l {
@@ -401,5 +401,23 @@ func TestFederationIPRanges(t *testing.T) {
 	r, _ = federationIPRanges([]byte("federation_ip_range_blacklist: [8.8.8.0/24]\nip_range_whitelist: [8.8.8.8]\n"))
 	if !r.Blocked(netip.MustParseAddr("8.8.8.8")) || r.Blocked(netip.MustParseAddr("10.0.0.1")) {
 		t.Error("federation_ip_range_blacklist")
+	}
+}
+
+func TestDelayedSettings(t *testing.T) {
+	d, err := delayedSettings([]byte("max_event_delay_duration: 24h\nrc_message: {per_second: 100, burst_count: 100}\n"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.MaxDelayMS != 86400000 || d.PerUser != 100 || !d.Enabled() || d.RcMessage.PerSecond != 100 || d.RcMessage.Burst != 100 {
+		t.Errorf("%+v", d)
+	}
+	d, _ = delayedSettings(nil, map[string]any{"msc4140_max_delayed_events_per_user": 0})
+	if d.Enabled() || d.RcMessage.PerSecond != 0.2 || d.RcMessage.Burst != 10 {
+		t.Errorf("%+v", d)
+	}
+	d, _ = delayedSettings([]byte("max_event_delay_duration: 5000\nrc_messages_per_second: 3\n"), nil)
+	if d.MaxDelayMS != 5000 || d.RcMessage.PerSecond != 3 || d.RcMessage.Burst != 10 {
+		t.Errorf("%+v", d)
 	}
 }

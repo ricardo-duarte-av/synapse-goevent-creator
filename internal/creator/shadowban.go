@@ -18,7 +18,7 @@ import (
 func (c *Creator) shadowBanned(ctx context.Context, w http.ResponseWriter, txnKey string) Outcome {
 	c.shadowPause(ctx)
 	id := fakeEventID()
-	c.answers.add(txnKey, id, c.o.Now())
+	c.answers.add(txnKey, eventBody(id), c.o.Now())
 	writeEventID(w, id)
 	return Outcome{Result: "shadow_banned"}
 }
@@ -48,8 +48,8 @@ func fakeEventID() string {
 	return string(b)
 }
 
-// answerCache is HttpTransactionCache for the event endpoints: the event ID
-// a transaction was answered with, for 30 minutes, on this process.
+// answerCache is HttpTransactionCache for the event endpoints: the body a
+// transaction was answered with, for 30 minutes, on this process.
 type answerCache struct {
 	mu   sync.Mutex
 	byID map[string]answerEntry

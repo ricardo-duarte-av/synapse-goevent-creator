@@ -306,3 +306,15 @@ func (c *Client) UserLeftRoom(ctx context.Context, roomID, userID string) error 
 	_, err := c.call(ctx, t, "membership_change", url, []byte("{}"))
 	return err
 }
+
+// DelayedEventAdded is ReplicationAddedDelayedEventRestServlet: main, which
+// sends delayed events, is told the send time of the next one due.
+func (c *Client) DelayedEventAdded(ctx context.Context, nextSendTS int64) error {
+	t, ok := c.targets[synapsecfg.MainProcessInstanceName]
+	if !ok {
+		return fmt.Errorf("replication: main is not in instance_map")
+	}
+	body, _ := json.Marshal(map[string]int64{"next_send_ts": nextSendTS})
+	_, err := c.call(ctx, t, "added_delayed_event", t.base+"/_synapse/replication/added_delayed_event/", body)
+	return err
+}

@@ -368,6 +368,7 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		Persister:      repl,
 		Main:           repl,
 		RemoteProfiles: fed,
+		Delayed:        hs.Delayed,
 		UserIPs:        ips,
 		Key:            d.key,
 		Push:           d.push,

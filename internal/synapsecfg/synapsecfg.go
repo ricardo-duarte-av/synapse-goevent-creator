@@ -118,6 +118,9 @@ type Config struct {
 	// FederationIPRanges is where outbound federation may not connect.
 	FederationIPRanges IPRanges
 
+	// Delayed is delayed events' settings.
+	Delayed Delayed
+
 	signingKey, signingKeyPath string
 }
 
@@ -250,6 +253,9 @@ func parse(b []byte, path string) (*Config, error) {
 		return nil, err
 	}
 	if cfg.FederationIPRanges, err = federationIPRanges(b); err != nil {
+		return nil, err
+	}
+	if cfg.Delayed, err = delayedSettings(b, cfg.Experimental); err != nil {
 		return nil, err
 	}
 
