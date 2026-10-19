@@ -123,6 +123,12 @@ cases = [
     [T, "", '{"topic":"x","m.mentions":{"room":1}}'],
     [PL, "", '{"ban":"x","m.mentions":{"room":1}}'],
     ["pt.custom", None, '{"anything":[1,2,{"a":null}]}'],
+    ["pt.custom", None, '{"d":' + "[" * 125 + "]" * 125 + '}'],
+    ["pt.custom", None, '{"d":' + "[" * 126 + "]" * 126 + '}'],
+    ["pt.custom", None, '{"a":' + '{"a":' * 125 + '1' + '}' * 125 + '}'],
+    [M, None, '{"msgtype":"m.text","body":"x","d":' + "[" * 200 + "1.5" + "]" * 200 + '}'],
+    [M, None, '{"msgtype":"m.text","body":"x","d":' + "[" * 200 + "1E400" + "]" * 200 + '}'],
+    [M, None, '{"msgtype":"m.text","d":' + "[" * 200 + "]" * 200 + '}'],
     ["pt.custom", "k", '{}'],
 ]
 

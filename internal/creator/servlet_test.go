@@ -29,8 +29,10 @@ func TestParseJSONObject(t *testing.T) {
 		`{"a":1e400}`:       "",
 		`{"a":"\ud800"}`:    "surrogate_escape",
 		`{"a":1,"a":2}`:     "",
-		`{"a":` + strings.Repeat("1", 5000) + `}`:           "long_integer",
-		strings.Repeat("[", 101) + strings.Repeat("]", 101): "deep_json",
+		`{"a":` + strings.Repeat("1", 5000) + `}`:                             "long_integer",
+		strings.Repeat("[", 101) + strings.Repeat("]", 101):                   "refused:not_object",
+		`{"a":` + strings.Repeat("[", 5000) + strings.Repeat("]", 5000) + `}`: "",
+		`{"a":` + strings.Repeat("[", 9001) + strings.Repeat("]", 9001) + `}`: "deep_json",
 	} {
 		_, st := parseJSONObject([]byte(body), false)
 		got := ""

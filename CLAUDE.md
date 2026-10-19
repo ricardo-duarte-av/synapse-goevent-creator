@@ -174,8 +174,9 @@ Each native event is verified against what was persisted
   can be refused. All the inputs are bumped (`resolve_state_groups`). On
   2026-10-19 3.7% of the week's local events had several prev events (76 of
   them ten). The e2e step "send on a fork" races a native state event with
-  one main makes (JSON nested past 100 levels is main's) and checks the
-  resolved group (`state_before`).
+  a delayed one main sends (`?org.matrix.msc4140.delay=`, main's for good:
+  it schedules and sends delayed events) and checks the resolved group
+  (`state_before`). It usually forks on the second attempt.
 - **Synapse is not asked who the requester is** (M6, operator: "we must not
   depend on synapse"). `requester` is `get_user_by_req` on the database:
   Synapse's token rules (`Mixing Authorization headers...`, `Too many
@@ -230,8 +231,12 @@ Each native event is verified against what was persisted
   `Sequence` makes a string an array (`m.mentions.user_ids: "x"` passes); a
   non-string in `user_ids` is a TypeError, Synapse's 500. `1E400` is a float
   infinity that cannot be built into an event: a 500 before any "Bad JSON
-  value: float". Lone surrogate escapes, repeated keys, nesting past 100 and
-  integers past 4300 digits fall back. `internal/creator/testdata/oracle_validator.py`
+  value: float". Content 127 levels deep (the content object counted)
+  cannot be built into an event, Rust's serde_json stopping at 128 with the
+  event around it: `400 M_BAD_JSON "Invalid event JSON"`, before any
+  canonical JSON refusal. Python decodes and encodes up to ~9,996 levels;
+  past 9,000 the request is main's. Lone surrogate escapes and integers past
+  4300 digits fall back too. `internal/creator/testdata/oracle_validator.py`
   runs Synapse's own validator in its container (read-only) and its output is
   the test vectors; regenerate it rather than guessing.
 - **Every kind of requester whose token is in the database is served**:

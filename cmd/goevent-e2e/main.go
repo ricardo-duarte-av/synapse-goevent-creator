@@ -26,8 +26,8 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -289,8 +289,8 @@ func (s *suite) membership(me, probe, tag string) {
 
 // expectError checks a refusal: status and errcode.
 // fork makes the room's DAG fork and sends on it: a state event the worker
-// creates and one main creates (JSON nested deeper than the worker decodes
-// itself is main's), at once, so both build on the same extremity; then a message, whose state
+// creates and one main creates (a delayed event, due at once: main
+// schedules and sends delayed events), at the same moment, so both build on the same extremity; then a message, whose state
 // before must be resolved across both. The worker counts a stored resolved
 // group as the verify check state_before. Concurrency is not guaranteed:
 // it is tried a few times.
@@ -307,20 +307,13 @@ func (s *suite) fork(metricsURL, tag string) {
 			return
 		}
 		run := fmt.Sprintf("%s-%d", s.run, attempt)
-		var wg sync.WaitGroup
-		var native, main resp
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			native = s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/native"), map[string]any{"run": run}, true)
-		}()
-		go func() {
-			defer wg.Done()
-			deep := strings.Repeat("[", 101) + strings.Repeat("]", 101)
-			main = s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/main"), `{"run":"`+run+`","deep":`+deep+`}`, true)
-		}()
-		wg.Wait()
-		if native.status != 200 || main.status != 200 {
+		// The delayed event first: main sends it a moment after answering,
+		// while the worker is building its own on the same extremity.
+		main := s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/main")+"?org.matrix.msc4140.delay="+strconv.Itoa(attempt*20),
+			map[string]any{"run": run}, true)
+		native := s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/native"), map[string]any{"run": run}, true)
+		time.Sleep(time.Second)
+		if native.status != 200 || main.status != 200 || main.body.Get("delay_id").Str == "" {
 			s.record("send on a fork", false, "state %d %s / %d %s", native.status, native.raw, main.status, main.raw)
 			return
 		}
@@ -568,6 +561,8 @@ func run() int {
 	}
 
 	// Refusals: Synapse's words, whoever serves the request.
+	s.expectError("refuse content nested too deep", c.do(http.MethodPut, s.roomPath("/send/m.room.message/"+esc(s.txn("deep"))),
+		`{"msgtype":"m.text","body":"x","d":`+strings.Repeat("[", 126)+strings.Repeat("]", 126)+`}`, true), 400, "M_BAD_JSON")
 	s.expectError("refuse non-object", c.do(http.MethodPut, s.roomPath("/send/m.room.message/"+esc(s.txn("array"))), "[1]", true), 400, "M_BAD_JSON", "M_NOT_JSON")
 	s.expectError("refuse invalid JSON", c.do(http.MethodPut, s.roomPath("/send/m.room.message/"+esc(s.txn("garbage"))), "{nope", true), 400, "M_NOT_JSON")
 	s.expectError("refuse message without body", c.do(http.MethodPut, s.roomPath("/send/m.room.message/"+esc(s.txn("nobody"))),

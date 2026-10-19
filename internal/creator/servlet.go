@@ -16,9 +16,11 @@ import (
 
 // The request parsing of http/servlet.py (v1.163.0).
 
-// maxJSONDepth bounds the nesting served here. Python's decoder recurses,
-// and fails deep enough that it is not worth predicting where.
-const maxJSONDepth = 100
+// maxJSONDepth bounds the nesting served here. Python's decoder and
+// encoder recurse, and fail past about 9,996 levels (CPython 3.13's C
+// recursion limit); beyond this margin the request is Synapse's. Far
+// sooner, at 127, the event cannot be built (eventDepthRefusal).
+const maxJSONDepth = 9000
 
 // maxIntDigits is sys.int_info.default_max_str_digits: json.loads refuses a
 // longer integer.
@@ -42,11 +44,14 @@ func parseJSONObject(body []byte, allowEmpty bool) ([]byte, *stop) {
 		return nil, notJSON.stop()
 	}
 	dec := jsontext.NewDecoder(bytes.NewReader(body), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
-	depth, maxDepth, longInt, tokens := 0, 0, false, 0
+	depth, longInt, tokens := 0, false, 0
 	for ; ; tokens++ {
 		tok, err := dec.ReadToken()
 		if errors.Is(err, io.EOF) && tokens > 0 {
 			break
+		}
+		if depth > maxJSONDepth {
+			return nil, fb("deep_json")
 		}
 		if err != nil || (tokens > 0 && depth == 0) {
 			// Nothing, or more than one value: "Extra data".
@@ -55,7 +60,6 @@ func parseJSONObject(body []byte, allowEmpty bool) ([]byte, *stop) {
 		switch tok.Kind() {
 		case '{', '[':
 			depth++
-			maxDepth = max(maxDepth, depth)
 		case '}', ']':
 			depth--
 		case '0':
@@ -65,10 +69,7 @@ func parseJSONObject(body []byte, allowEmpty bool) ([]byte, *stop) {
 			}
 		}
 	}
-	switch {
-	case maxDepth > maxJSONDepth:
-		return nil, fb("deep_json")
-	case longInt:
+	if longInt {
 		return nil, fb("long_integer")
 	}
 	v := gjson.ParseBytes(body)

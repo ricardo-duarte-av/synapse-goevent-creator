@@ -85,6 +85,15 @@ func typeLabel(typ string) string { return strings.TrimPrefix(typ, "m.room.") }
 // checks of aliases, retention, server ACL and power levels events, and
 // m.mentions.
 func (c *Creator) validateNew(in *input, raw []byte, content gjson.Result) *stop {
+	// builder.build first: make_event_from_dict encodes the event (an
+	// infinite float cannot be) and hands it to Rust, whose parser stops at
+	// 128 levels, the event's own included.
+	if s := validateCanonicalJSON(content); s != nil && s.ref != nil && s.ref.status == 500 {
+		return s
+	}
+	if jsonDepth(content) >= maxContentDepth {
+		return badRequest("deep_json", "Invalid event JSON", "M_BAD_JSON").stop()
+	}
 	if s := validateCanonicalJSON(content); s != nil {
 		return s
 	}
@@ -261,6 +270,24 @@ func validateServerACL(raw []byte, serverName string) *stop {
 		return badRequest("acl_denies_us", "Can't create an ACL event that denies the local server").stop()
 	}
 	return nil
+}
+
+// maxContentDepth is the nesting of an event's content, counting the content
+// object, at which Synapse cannot build the event (serde_json's recursion
+// limit of 128, with the event around it), checked in its container.
+const maxContentDepth = 127
+
+// jsonDepth is how many containers deep a value goes: 0 for a scalar.
+func jsonDepth(v gjson.Result) int {
+	if !v.IsObject() && !v.IsArray() {
+		return 0
+	}
+	d := 0
+	v.ForEach(func(_, x gjson.Result) bool {
+		d = max(d, jsonDepth(x))
+		return true
+	})
+	return d + 1
 }
 
 // isPyInt is an int as json.loads decodes it: never a bool, a float or a
