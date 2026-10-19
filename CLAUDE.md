@@ -81,10 +81,10 @@ in gopro.
   event** (`room_member.py`, duplicate rule: same sender, membership and
   content). The shadow check predicts it (`membership_noop`).
 
-## Native mode (M3 /send, M4 /state and /redact)
+## Native mode (M3 /send, M4 /state and /redact, M5 membership)
 
-`modes.{send,state,redact}: native` serve those endpoints in the allowlisted
-rooms (`internal/creator`):
+`modes.{send,state,redact,membership,join}: native` serve those endpoints in
+the allowlisted rooms (`internal/creator`):
 requester from whoami plus `access_tokens`/`users`, txn dedup, one prev event
 only, relation and content validation, build, auth, push rows, then the
 creator's own writes (deletion bump, room participation, push staging) as the
@@ -125,6 +125,41 @@ Each native event is verified against what was persisted
   `validate_new`/`validate_builder` do (`creator/validate.go`): served only when
   the content certainly passes, otherwise Synapse's. Membership, create and
   policy fall back.
+- **Membership** (`creator/membership.go`): the servlets, then
+  `update_membership`/`update_membership_locked` for a local change in a room
+  we are in. Content is `{membership}` plus `reason` (and MSC4293's
+  `redact_events`) from the membership servlet, or the whole body from
+  `/join/`, plus the target's global profile (`profiles`) for joins and,
+  with `include_profile_data_on_invite`, invites; a missing profile row leaves
+  both fields out (Synapse's 404 is swallowed). `extra_users` is the target.
+  Order matters and is Synapse's: the PUT success cache
+  (`HttpTransactionCache`, 30 min, per process), ratelimits, the
+  state-independent checks, then under the room lock the old-membership
+  checks (kick of a leave, unban of a non-ban, anything but leave/ban/unban
+  on a ban), the restricted-join check, and only then the event transaction
+  lookup, as `_local_membership_update` has it. A join by a joined user with
+  an unchanged profile is the generic state dedup (`deduplicate_state_event`),
+  not `update_membership_locked`'s own comparison, which compares content
+  without `membership` and never matches. A leave from a join tells main
+  (`membership_change/.../left`, `_user_left_room`). Fallbacks: remote
+  targets of a join or invite (their profile is a federation query), 3pid
+  invites, `third_party_signed`, a per-room `displayname`/`avatar_url` in a
+  `/join/` body, invite filtering account data (MSC4380, MSC4155), server
+  notice rooms, blocked rooms, restricted joins needing an authorising
+  server, the host not in the room, and any module, `hs_disabled`/MAU limit
+  or consent requirement in homeserver.yaml.
+- **Membership ratelimits are this process's**, as each Synapse worker's are:
+  `rc_joins.local` (joins by a user not yet joined), `rc_invites.*`, and
+  `rc_joins_per_room`, which Synapse feeds from every join on the events
+  stream and we replay from `room_memberships` (`RecentJoins`). A
+  `ratelimit_override` row with no rate exempts. A refusal is answered here
+  (429 after Synapse's half-second pause). A request that passes our limits
+  and then falls back is counted again by main's.
+- **`m.call.invite` is refused in public rooms** (`create_new_client_event`);
+  native `/send` falls back for it (`call_invite_public`). Found while porting
+  M5: it had been missed in M3.
+- **Repeated JSON keys fall back** (`duplicate_keys`): Python keeps the last,
+  gjson finds the first.
 - **Presence, not `.get`**: jsonschema and `key in content` treat a present
   `null` as present and invalid; Python's `.get` (`pdu.Get`) reads it as
   absent. Use `pdu.Field` for the former (`m.mentions: null` is Synapse's
@@ -158,8 +193,13 @@ GOEVENT_E2E_PASSWORD=... GOEXPERIMENT=jsonv2 go run ./cmd/goevent-e2e \
 Run it against shadow mode first: that is Synapse's own behaviour, and the
 expectations are calibrated on it (57/57 on 2026-10-19, then 57/57 with send,
 state and redact native, 25 native events all verified, power levels, ACL,
-aliases and retention among them). It never sends a valid tombstone: that
-would mark the room as replaced in every client.
+aliases and retention among them; with M5's membership steps 69/69 on
+Synapse, then 69/69 twice with membership and join native too, 31 native
+events, 205 verify checks matched). It never sends a valid tombstone: that
+would mark the room as replaced in every client. Membership steps use
+`@goevent-e2e-probe` (no account, no profile) as the target, and the test
+account only joins: **it must never leave TEST7TESTE, which is
+invite-only**.
 
 ## Shadow mode (M2)
 

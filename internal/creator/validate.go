@@ -1,6 +1,7 @@
 package creator
 
 import (
+	"context"
 	"regexp"
 	"strconv"
 	"unicode/utf8"
@@ -146,4 +147,23 @@ func validateTombstone(content gjson.Result, room string) string {
 		return "invalid_tombstone"
 	}
 	return ""
+}
+
+// publicRoom is room_stats_state.join_rules being public, read from the
+// state before the event.
+func (c *Creator) publicRoom(ctx context.Context, before pdu.StateMap) (bool, error) {
+	id, ok := before[pdu.StateKey{Type: "m.room.join_rules"}]
+	if !ok {
+		return false, nil
+	}
+	evs, _, err := c.o.Store.GetStoredEvents(ctx, []string{id})
+	if err != nil {
+		return false, err
+	}
+	se := evs[id]
+	if se == nil {
+		return false, nil
+	}
+	rule := pdu.Get(se.Content, "join_rule")
+	return rule.Type == gjson.String && rule.Str == "public", nil
 }

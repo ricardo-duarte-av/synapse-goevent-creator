@@ -37,6 +37,8 @@ var Tables = []string{
 	"device_lists_remote_cache",
 	// Invite permission config, for push on invites of local users.
 	"account_data",
+	// Membership.
+	"profiles", "blocked_rooms", "ratelimit_override", "access_tokens", "users",
 }
 
 const qAccountData = `SELECT content FROM account_data WHERE user_id = $1 AND account_data_type = $2`

@@ -334,10 +334,12 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 	d.closers = append(d.closers, w.Close)
 	log.Info().Str("role", writer.Role).Msg("Connected as the write role")
 
+	repl := replication.NewClient(hs)
 	return creator.New(creator.Options{
 		Store:        d.db,
 		Writer:       w,
-		Persister:    replication.NewClient(hs),
+		Persister:    repl,
+		Main:         repl,
 		Auth:         d.authn,
 		Key:          d.key,
 		Push:         d.push,
@@ -347,6 +349,9 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		Log:          log,
 
 		RedactionAllowedPeriod: hs.RedactionAllowedPeriod,
+		Membership:             hs.Membership,
+		MSC4293:                hs.Flag("msc4293_enabled", false),
+		MSC4155:                hs.Flag("msc4155_enabled", false),
 	}), nil
 }
 

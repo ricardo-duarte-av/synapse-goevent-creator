@@ -90,6 +90,15 @@ func (c *Creator) check(v pending) {
 		record("txn_mapping", err == nil && id == p.ev.ID, func(e *zerolog.Event) { e.AnErr("err", err).Str("stored", id) })
 	}
 
+	if m := p.in.member; m != nil && c.isMine(m.target) {
+		// The writer keeps local_current_membership, which /sync and the
+		// membership checks read.
+		ms, id, err := c.o.Store.LocalMembership(ctx, m.target, p.req.Room)
+		record("local_membership", err == nil && ms == m.membership && id == p.ev.ID, func(e *zerolog.Event) {
+			e.AnErr("err", err).Str("stored", ms).Str("stored_event", id)
+		})
+	}
+
 	if c.o.Push != nil {
 		pv := c.o.Push.Check(ctx, p.ev.ID, p.before, p.maxStream, p.push)
 		switch pv.Outcome {

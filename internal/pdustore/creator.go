@@ -122,7 +122,7 @@ func (s *Store) ReadOnly(ctx context.Context) (bool, error) {
 
 const qTokenInfo = `SELECT t.id, t.user_id, COALESCE(t.device_id, ''), t.puppets_user_id IS NOT NULL,
 		COALESCE(u.shadow_banned, false), COALESCE(u.suspended, false), u.is_guest <> 0,
-		u.deactivated <> 0, COALESCE(u.locked, false), u.appservice_id IS NOT NULL
+		u.deactivated <> 0, COALESCE(u.locked, false), u.appservice_id IS NOT NULL, COALESCE(u.admin, 0) <> 0
 	FROM access_tokens t INNER JOIN users u ON u.name = t.user_id
 	WHERE t.token = $1`
 
@@ -140,6 +140,8 @@ type TokenInfo struct {
 	Deactivated bool
 	Locked      bool
 	AppService  bool
+	// Admin is users.admin: is_server_admin.
+	Admin bool
 }
 
 // Token looks up an access token Synapse has already accepted. ErrNotFound
@@ -147,7 +149,7 @@ type TokenInfo struct {
 func (s *Store) Token(ctx context.Context, token string) (*TokenInfo, error) {
 	var t TokenInfo
 	err := s.pool.QueryRow(ctx, qTokenInfo, token).Scan(&t.ID, &t.UserID, &t.DeviceID, &t.Puppet,
-		&t.ShadowBan, &t.Suspended, &t.Guest, &t.Deactivated, &t.Locked, &t.AppService)
+		&t.ShadowBan, &t.Suspended, &t.Guest, &t.Deactivated, &t.Locked, &t.AppService, &t.Admin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

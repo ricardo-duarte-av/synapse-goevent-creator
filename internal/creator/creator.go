@@ -43,6 +43,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pushcalc"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/synapsecfg"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/writer"
 )
 
@@ -93,6 +94,14 @@ type Store interface {
 	IsRelationTarget(ctx context.Context, eventID string) (bool, error)
 	HasRelation(ctx context.Context, eventID string) (bool, error)
 	HasAnnotated(ctx context.Context, parent, eventType, sender, key string) (bool, error)
+
+	// Membership.
+	Profile(ctx context.Context, userID string) (displayname, avatarURL *string, ok bool, err error)
+	RoomBlocked(ctx context.Context, roomID string) (bool, error)
+	LocalMembership(ctx context.Context, userID, roomID string) (membership, eventID string, err error)
+	RatelimitExempt(ctx context.Context, userID string) (bool, error)
+	RecentJoins(ctx context.Context, roomID string, sinceMS int64) ([]int64, error)
+	AccountData(ctx context.Context, userID, typ string) (content []byte, ok bool, err error)
 }
 
 // Writer is what the creator writes.
@@ -131,6 +140,13 @@ type Options struct {
 	// RedactionAllowedPeriod is redaction_allowed_period being set, which
 	// limits local redactions; they are then Synapse's.
 	RedactionAllowedPeriod bool
+	// Membership is what update_membership reads from homeserver.yaml.
+	Membership synapsecfg.Membership
+	// MSC4293 and MSC4155 are msc4293_enabled (redact_events on kicks and
+	// bans) and msc4155_enabled (invite filtering).
+	MSC4293, MSC4155 bool
+	// Main is told when a local user leaves a room they were joined to.
+	Main MembershipNotifier
 	// Timeout bounds one request's work, the persister's included.
 	Timeout time.Duration
 	Log     zerolog.Logger
@@ -141,6 +157,10 @@ type Options struct {
 type Creator struct {
 	o     Options
 	locks roomLocks
+	txns  txnCache
+
+	limitersOnce sync.Once
+	lim          *membershipLimiters
 	// verify is replaced in tests.
 	verify func(v pending)
 }
@@ -171,7 +191,11 @@ func fallback(reason string) Outcome { return Outcome{Fallback: reason} }
 
 // Serves reports whether an endpoint can be native.
 func Serves(ep route.Endpoint) bool {
-	return ep == route.Send || ep == route.State || ep == route.Redact
+	switch ep {
+	case route.Send, route.State, route.Redact, route.Membership, route.Join:
+		return true
+	}
+	return false
 }
 
 // Serve serves /send (PUT with a transaction, or POST), PUT /state and
@@ -179,7 +203,12 @@ func Serves(ep route.Endpoint) bool {
 // start, so a fallback can forward the request.
 func (c *Creator) Serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	start := c.o.Now()
-	out := c.serve(w, r, req)
+	var out Outcome
+	if req.Endpoint == route.Membership || req.Endpoint == route.Join {
+		out = c.serveMembership(w, r, req)
+	} else {
+		out = c.serve(w, r, req)
+	}
 	ep := string(req.Endpoint)
 	if out.Fallback != "" {
 		fallbacks.WithLabelValues(ep, out.Fallback).Inc()
@@ -200,6 +229,12 @@ type input struct {
 	redacts *string
 	txn     string
 	sticky  *int64
+	// room is the room the request names.
+	room string
+	// member is set for a membership change.
+	member *memberInput
+	// dedupKind labels an answer with an existing event.
+	dedupKind string
 }
 
 func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
@@ -224,6 +259,9 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	}
 	if !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() {
 		return fallback("not_object")
+	}
+	if hasDuplicateKeys(gjson.ParseBytes(body)) {
+		return fallback("duplicate_keys")
 	}
 
 	in, reason := c.parse(req, body, q)
@@ -252,7 +290,7 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		id, err := c.o.Store.TxnEvent(ctx, req.Room, rq.UserID, rq.DeviceID, in.txn)
 		switch {
 		case err == nil:
-			writeEventID(w, id)
+			c.respond(w, in, id)
 			return Outcome{Result: "txn_dedup"}
 		case !errors.Is(err, pdustore.ErrNotFound):
 			return fallback("db_error")
@@ -266,8 +304,8 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	if dup != "" {
 		// deduplicate_state_event: the same state, from the same sender, is
 		// already in the room; that event is the answer.
-		writeEventID(w, dup)
-		return Outcome{Result: "state_dedup"}
+		c.respond(w, in, dup)
+		return Outcome{Result: in.dedupKind}
 	}
 
 	// Past here, writes. Everything Synapse could refuse has been checked.
@@ -276,7 +314,7 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 
 // parse is the servlet: what the request asks for, or why it is Synapse's.
 func (c *Creator) parse(req route.Request, body []byte, q map[string][]string) (*input, string) {
-	in := &input{typ: req.Action, content: body, txn: req.TxnID}
+	in := &input{typ: req.Action, content: body, txn: req.TxnID, room: req.Room}
 	switch req.Endpoint {
 	case route.Send:
 		if c.o.Sticky {
@@ -350,7 +388,7 @@ func (c *Creator) requester(ctx context.Context, r *http.Request) (*requester, s
 	case t.Deactivated, t.Locked:
 		return nil, "deactivated"
 	}
-	return &requester{UserID: v.UserID, DeviceID: v.DeviceID, TokenID: t.ID}, ""
+	return &requester{UserID: v.UserID, DeviceID: v.DeviceID, TokenID: t.ID, Admin: t.Admin}, ""
 }
 
 // requester is Requester.serialize (rust/src/types/mod.rs) for a user's own
@@ -359,6 +397,8 @@ type requester struct {
 	UserID   string
 	DeviceID string
 	TokenID  int64
+	// Admin is is_server_admin; not serialized.
+	Admin bool
 }
 
 func (rq *requester) MarshalJSON() ([]byte, error) {
@@ -444,10 +484,27 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		return nil, "", "db_error"
 	}
 	// MSC4284: Synapse asks the room's policy server to sign every local
-	// event, and refuses what it calls spam.
-	for _, t := range []string{"m.room.policy", "org.matrix.msc4284.policy"} {
-		if _, ok := before[pdu.StateKey{Type: t}]; ok {
-			return nil, "", "policy_server"
+	// event it sends through the non-member path, and refuses what it calls
+	// spam.
+	if in.member == nil {
+		for _, t := range []string{"m.room.policy", "org.matrix.msc4284.policy"} {
+			if _, ok := before[pdu.StateKey{Type: t}]; ok {
+				return nil, "", "policy_server"
+			}
+		}
+	}
+	if in.typ == "m.call.invite" {
+		// create_new_client_event: no call invites in public rooms.
+		if public, err := c.publicRoom(ctx, before); err != nil {
+			return nil, "", "db_error"
+		} else if public {
+			return nil, "", "call_invite_public"
+		}
+	}
+	if in.member != nil {
+		id, reason := c.checkMembership(ctx, req, rq, in, rv, before)
+		if reason != "" || id != "" {
+			return nil, id, reason
 		}
 	}
 
@@ -455,6 +512,7 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		if id, err := c.duplicate(ctx, before, in, rq); err != nil {
 			return nil, "", "db_error"
 		} else if id != "" {
+			in.dedupKind = "state_dedup"
 			return nil, id, ""
 		}
 	}
@@ -698,10 +756,10 @@ func (c *Creator) persist(ctx context.Context, w http.ResponseWriter, p *prepare
 	if persisted != "" && persisted != p.ev.ID {
 		// Deduplicated by the writer: an event of the same transaction
 		// was persisted first. That is the answer.
-		writeEventID(w, persisted)
+		c.respond(w, p.in, persisted)
 		return Outcome{Result: "writer_dedup"}
 	}
-	writeEventID(w, p.ev.ID)
+	c.respond(w, p.in, p.ev.ID)
 	c.verify(pending{p: p})
 	return Outcome{Result: "created"}
 }
@@ -731,6 +789,11 @@ func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
 		deltas = append([]stateGroupDelta{own}, p.deltas[1:]...)
 		due = []any{[3]string{key.Type, key.StateKey, p.ev.ID}}
 	}
+	// _local_membership_update notifies the target too.
+	extra := []string{}
+	if p.in.member != nil {
+		extra = append(extra, p.in.member.target)
+	}
 	return json.Marshal(map[string]any{
 		"event":                json.RawMessage(ev),
 		"room_version":         p.rv.ID,
@@ -752,7 +815,7 @@ func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
 		},
 		"requester":   p.rq,
 		"ratelimit":   true,
-		"extra_users": []string{},
+		"extra_users": extra,
 	})
 }
 
@@ -872,7 +935,9 @@ func (c *Creator) validate(in *input, content gjson.Result, room string) string 
 	case "m.room.member":
 		// The non-member path refuses it on /send; on /state it is
 		// update_membership's.
-		return "type_member"
+		if in.member == nil {
+			return "type_member"
+		}
 	case "m.room.create":
 		return "type_create"
 	case "m.room.power_levels":

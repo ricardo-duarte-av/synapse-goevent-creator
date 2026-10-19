@@ -109,6 +109,9 @@ type Config struct {
 	// _check_redaction_allowed_period).
 	RedactionAllowedPeriod bool
 
+	// Membership is what update_membership reads.
+	Membership Membership
+
 	signingKey, signingKeyPath string
 }
 
@@ -228,6 +231,10 @@ func parse(b []byte, path string) (*Config, error) {
 	}
 
 	if cfg.Redis, err = redisConfig(r); err != nil {
+		return nil, err
+	}
+
+	if cfg.Membership, err = membership(b, r.ServerName); err != nil {
 		return nil, err
 	}
 

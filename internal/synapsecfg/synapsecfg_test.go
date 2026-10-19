@@ -233,6 +233,7 @@ func TestLiveHomeserverYAML(t *testing.T) {
 	}
 	t.Logf("server_name=%s track_presence=%v writers=%+v notaries=%v",
 		cfg.ServerName, cfg.TrackPresence, cfg.Writers, cfg.TrustedKeyServers)
+	t.Logf("membership=%+v", cfg.Membership)
 	for _, l := range [][]string{cfg.Writers.Typing, cfg.Writers.Receipts, cfg.Writers.ToDevice,
 		cfg.Writers.Presence, cfg.Writers.DeviceLists} {
 		for _, name := range l {
@@ -322,5 +323,41 @@ func TestRedis(t *testing.T) {
 				t.Errorf("redis = %+v, want %+v", cfg.Redis, tc.want)
 			}
 		})
+	}
+}
+
+func TestMembershipSettings(t *testing.T) {
+	m, err := membership([]byte(`
+server_notices:
+  system_mxid_localpart: notices
+rc_invites:
+  per_room: {per_second: 100, burst_count: 100}
+  per_user:
+    per_second: 0.5
+rc_joins_per_room: {burst_count: 3.9}
+allow_per_room_profiles: false
+`), "example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Membership{
+		ServerNoticesMXID:          "@notices:example.org",
+		IncludeProfileDataOnInvite: true,
+		JoinsLocal:                 Ratelimit{"rc_joins.local", 0.1, 10},
+		JoinsPerRoom:               Ratelimit{"rc_joins_per_room", 1, 3},
+		InvitesPerRoom:             Ratelimit{"rc_invites.per_room", 100, 100},
+		InvitesPerUser:             Ratelimit{"rc_invites.per_user", 0.5, 5},
+		InvitesPerIssuer:           Ratelimit{"rc_invites.per_issuer", 0.3, 10},
+	}
+	if m != want {
+		t.Errorf("got %+v\nwant %+v", m, want)
+	}
+
+	m, err = membership([]byte("modules:\n  - module: x\nuser_consent:\n  block_events_error: no\nhs_disabled: true\n"), "example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Modules || !m.ConsentRequired || !m.AuthBlocking || !m.AllowPerRoomProfiles || m.ServerNoticesMXID != "" {
+		t.Errorf("got %+v", m)
 	}
 }

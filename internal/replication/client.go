@@ -291,3 +291,18 @@ var (
 		Help: "Replication requests retried, by instance and reason.",
 	}, []string{"writer", "reason"})
 )
+
+// UserLeftRoom is ReplicationUserJoinedLeftRoomRestServlet, which a worker's
+// _user_left_room calls on main once a local user's leave from a room they
+// were joined to is persisted: main's distributor fires user_left_room (the
+// typing handler drops their typing notification). CACHE is False for it, so
+// the path carries no txn_id.
+func (c *Client) UserLeftRoom(ctx context.Context, roomID, userID string) error {
+	t, ok := c.targets[synapsecfg.MainProcessInstanceName]
+	if !ok {
+		return fmt.Errorf("replication: main is not in instance_map")
+	}
+	url := t.base + "/_synapse/replication/membership_change/" + quote(roomID) + "/" + quote(userID) + "/left"
+	_, err := c.call(ctx, t, "membership_change", url, []byte("{}"))
+	return err
+}

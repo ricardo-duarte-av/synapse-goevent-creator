@@ -22,6 +22,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/synapsecfg"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/writer"
 )
 
@@ -40,6 +41,12 @@ type fakeRoom struct {
 	txn           string
 	token         *pdustore.TokenInfo
 	partial       bool
+
+	key         *build.Key
+	profiles    map[string][2]*string
+	blocked     bool
+	accountData map[string]bool
+	exempt      bool
 }
 
 func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
@@ -72,7 +79,52 @@ func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
 	f.create = create
 	f.topic = add("m.room.topic", "", `{"topic":"old"}`, []string{create, member, pl})
 	f.prevs = prev
+	f.key = key
 	return f
+}
+
+// addState puts one more state event in the room, sent by @u, as the new
+// extremity.
+func (f *fakeRoom) addState(t *testing.T, typ, sk, content string) string {
+	t.Helper()
+	rv, _ := pdu.LookupRoomVersion("11")
+	s := sk
+	depth := f.events[f.prevs[0]].Depth + 1
+	auth := []string{f.create, f.state[pdu.StateKey{Type: "m.room.power_levels"}], f.state[pdu.StateKey{Type: "m.room.member", StateKey: user}]}
+	b, err := build.Build(build.Proto{RoomVersion: id.RoomV11, RoomID: room, Sender: user, Type: typ, StateKey: &s,
+		Content: jsontext.Value(content), PrevEvents: f.prevs, AuthEvents: auth, Depth: depth, OriginServerTS: 1}, f.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := pdu.ParseEvent(b.JSON, b.ID, rv, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.events[b.ID] = &pdustore.StoredEvent{Event: ev, StreamOrdering: depth}
+	f.state[pdu.StateKey{Type: typ, StateKey: sk}] = b.ID
+	f.prevs = []string{b.ID}
+	return b.ID
+}
+
+func (f *fakeRoom) Profile(_ context.Context, u string) (*string, *string, bool, error) {
+	p, ok := f.profiles[u]
+	return p[0], p[1], ok, nil
+}
+func (f *fakeRoom) RoomBlocked(context.Context, string) (bool, error) { return f.blocked, nil }
+func (f *fakeRoom) LocalMembership(_ context.Context, u, _ string) (string, string, error) {
+	id, ok := f.state[pdu.StateKey{Type: "m.room.member", StateKey: u}]
+	if !ok {
+		return "", "", nil
+	}
+	return gjson.Get(f.events[id].Content.Raw, "membership").Str, id, nil
+}
+func (f *fakeRoom) RatelimitExempt(context.Context, string) (bool, error)          { return f.exempt, nil }
+func (f *fakeRoom) RecentJoins(context.Context, string, int64) ([]int64, error) { return nil, nil }
+func (f *fakeRoom) AccountData(_ context.Context, u, typ string) ([]byte, bool, error) {
+	if f.accountData[u+" "+typ] {
+		return []byte("{}"), true, nil
+	}
+	return nil, false, nil
 }
 
 func (f *fakeRoom) Token(_ context.Context, token string) (*pdustore.TokenInfo, error) {
@@ -178,10 +230,18 @@ func (fakeAuth) AuthenticateAs(_ context.Context, c auth.Credentials) (auth.Verd
 }
 
 type harness struct {
-	c *Creator
-	f *fakeRoom
-	w *fakeWriter
-	p *fakePersister
+	c    *Creator
+	f    *fakeRoom
+	w    *fakeWriter
+	p    *fakePersister
+	main *fakeMain
+}
+
+type fakeMain struct{ left []string }
+
+func (m *fakeMain) UserLeftRoom(_ context.Context, roomID, userID string) error {
+	m.left = append(m.left, roomID+" "+userID)
+	return nil
 }
 
 func newHarness(t *testing.T) *harness {
@@ -190,9 +250,13 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{f: newFakeRoom(t, key), w: &fakeWriter{}, p: &fakePersister{}}
+	h := &harness{f: newFakeRoom(t, key), w: &fakeWriter{}, p: &fakePersister{}, main: &fakeMain{}}
+	lim := synapsecfg.Ratelimit{PerSecond: 1, Burst: 10}
 	h.c = New(Options{Store: h.f, Writer: h.w, Persister: h.p, Auth: fakeAuth{}, Key: key,
 		ServerName: "example.org", EventsWriter: func(string) string { return "persister" }, Sticky: true,
+		Membership: synapsecfg.Membership{AllowPerRoomProfiles: true, IncludeProfileDataOnInvite: true,
+			JoinsLocal: lim, JoinsPerRoom: lim, InvitesPerRoom: lim, InvitesPerUser: lim, InvitesPerIssuer: lim},
+		MSC4155: true, MSC4293: true, Main: h.main,
 		Log: zerolog.Nop(), Now: func() time.Time { return time.UnixMilli(1700000000000) }})
 	h.c.verify = func(pending) {}
 	return h

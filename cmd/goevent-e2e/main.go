@@ -78,6 +78,7 @@ type step struct {
 
 type suite struct {
 	c      *client
+	me     string
 	room   string
 	run    string
 	steps  []step
@@ -159,6 +160,95 @@ func (s *suite) redacted(id string) resp {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// memberEvent reads a user's member event until want accepts it, for up to
+// 5s: main serves the read, and catches up over replication.
+func (s *suite) memberEvent(user string, want func(gjson.Result) bool) gjson.Result {
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		r := s.c.do(http.MethodGet, s.roomPath("/state/m.room.member/"+esc(user)+"?format=event"), nil, true)
+		if (r.status == 200 && want(r.body)) || time.Now().After(deadline) {
+			return r.body
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// membershipStep sends one membership change and checks the member event it
+// leaves, as a client reads it.
+func (s *suite) membershipStep(name, method, path string, body map[string]any, wantBody string, user string, content map[string]any) string {
+	r := s.c.do(method, path, body, true)
+	if r.status != 200 || !jsonEqual([]byte(r.raw), []byte(wantBody)) {
+		s.record(name, false, "status %d %s (want %s)", r.status, r.raw, wantBody)
+		return ""
+	}
+	want, _ := json.Marshal(content)
+	ev := s.memberEvent(user, func(e gjson.Result) bool { return jsonEqual(want, []byte(e.Get("content").Raw)) })
+	ok := jsonEqual(want, []byte(ev.Get("content").Raw)) && ev.Get("sender").Str == s.me
+	s.record(name, ok, "%s %s", ev.Get("event_id").Str, ev.Get("content").Raw)
+	return ev.Get("event_id").Str
+}
+
+// sameMember checks a request made no new member event.
+func (s *suite) sameMember(name string, r resp, wantBody, user, eventID string) {
+	time.Sleep(300 * time.Millisecond)
+	ev := s.memberEvent(user, func(gjson.Result) bool { return true })
+	ok := r.status == 200 && jsonEqual([]byte(r.raw), []byte(wantBody)) && eventID != "" && ev.Get("event_id").Str == eventID
+	s.record(name, ok, "%d %s; member event %s (want %s)", r.status, r.raw, ev.Get("event_id").Str, eventID)
+}
+
+func (s *suite) membership(me, probe, tag string) {
+	c := s.c
+	path := func(action string) string { return s.roomPath("/" + action) }
+	room := `{"room_id":"` + s.room + `"}`
+
+	// Invite, its transaction retried, and the same invite again: both
+	// answer without a new event.
+	inv := map[string]any{"user_id": probe, "reason": tag}
+	invited := s.membershipStep("invite probe", http.MethodPut, path("invite/"+esc(s.txn("invite"))), inv, "{}",
+		probe, map[string]any{"membership": "invite", "reason": tag})
+	s.sameMember("invite txn retry", c.do(http.MethodPut, path("invite/"+esc(s.txn("invite"))), inv, true), "{}", probe, invited)
+	s.sameMember("invite again is deduplicated", c.do(http.MethodPost, path("invite"), inv, true), "{}", probe, invited)
+
+	s.membershipStep("kick invited probe", http.MethodPost, path("kick"), map[string]any{"user_id": probe, "reason": tag}, "{}",
+		probe, map[string]any{"membership": "leave", "reason": tag})
+	s.expectError("refuse kick of absent user", c.do(http.MethodPost, path("kick"), map[string]any{"user_id": probe}, true), 403, "M_FORBIDDEN")
+
+	banned := s.membershipStep("ban probe", http.MethodPost, path("ban"), map[string]any{"user_id": probe, "reason": tag}, "{}",
+		probe, map[string]any{"membership": "ban", "reason": tag})
+	s.sameMember("ban again is deduplicated", c.do(http.MethodPost, path("ban"), map[string]any{"user_id": probe, "reason": tag}, true),
+		"{}", probe, banned)
+	s.expectError("refuse invite of banned user", c.do(http.MethodPost, path("invite"), map[string]any{"user_id": probe}, true), 403, "M_BAD_STATE")
+	s.membershipStep("unban probe", http.MethodPost, path("unban"), map[string]any{"user_id": probe}, "{}",
+		probe, map[string]any{"membership": "leave"})
+	s.expectError("refuse unban of unbanned user", c.do(http.MethodPost, path("unban"), map[string]any{"user_id": probe}, true), 403, "M_BAD_STATE")
+
+	s.expectError("refuse ban without user_id", c.do(http.MethodPost, path("ban"), map[string]any{}, true), 400, "M_MISSING_PARAM")
+	s.expectError("refuse ban of a bad user_id", c.do(http.MethodPost, path("ban"), map[string]any{"user_id": "nobody"}, true), 400, "M_INVALID_PARAM")
+
+	// Joins by the account, which is joined: no-ops while the profile is
+	// unchanged, a new event with a reason, and back.
+	mine := s.memberEvent(me, func(gjson.Result) bool { return true })
+	profile := map[string]any{}
+	_ = json.Unmarshal([]byte(mine.Get("content").Raw), &profile)
+	if profile["membership"] != "join" {
+		s.skip("joins", "the test account is not joined: "+mine.Raw)
+		return
+	}
+	delete(profile, "reason")
+	if mine.Get("content.reason").Exists() {
+		// A previous run stopped half way: put the plain join back first.
+		s.membershipStep("join without reason (repair)", http.MethodPost, "/_matrix/client/v3/join/"+esc(s.room), map[string]any{}, room, me, profile)
+		mine = s.memberEvent(me, func(gjson.Result) bool { return true })
+	}
+	s.sameMember("join while joined", c.do(http.MethodPost, "/_matrix/client/v3/join/"+esc(s.room), map[string]any{}, true), room, me, mine.Get("event_id").Str)
+	s.sameMember("rooms join while joined", c.do(http.MethodPut, path("join/"+esc(s.txn("join"))), map[string]any{}, true), room, me, mine.Get("event_id").Str)
+	withReason := map[string]any{"reason": tag}
+	for k, v := range profile {
+		withReason[k] = v
+	}
+	s.membershipStep("join with reason", http.MethodPost, path("join"), map[string]any{"reason": tag}, room, me, withReason)
+	s.membershipStep("join without reason", http.MethodPost, "/_matrix/client/v3/join/"+esc(s.room), map[string]any{}, room, me, profile)
 }
 
 // expectError checks a refusal: status and errcode.
@@ -274,6 +364,7 @@ func run() int {
 		return 2
 	}
 	me := login.body.Get("user_id").Str
+	s.me = me
 	defer func() {
 		r := c.do(http.MethodPost, "/_matrix/client/v3/logout", map[string]any{}, true)
 		if r.status != 200 {
@@ -463,15 +554,11 @@ func run() int {
 		s.skip("refuse redacting the create event", fmt.Sprintf("create event not found: %d %s", create.status, create.raw))
 	}
 
-	// Membership: a user that does not exist, so nobody is disturbed.
+	// Membership: a user that does not exist, so nobody is disturbed, and
+	// joins by the test account that is already joined. The account never
+	// leaves: the room is invite-only.
 	probe := "@goevent-e2e-probe:" + strings.SplitN(me, ":", 2)[1]
-	r = c.do(http.MethodPost, s.roomPath("/ban"), map[string]any{"user_id": probe, "reason": tag}, true)
-	s.record("ban probe", r.status == 200, "%d %s", r.status, r.raw)
-	r = c.do(http.MethodPost, s.roomPath("/unban"), map[string]any{"user_id": probe}, true)
-	s.record("unban probe", r.status == 200, "%d %s", r.status, r.raw)
-	s.expectError("refuse kick of absent user", c.do(http.MethodPost, s.roomPath("/kick"), map[string]any{"user_id": probe}, true), 403, "M_FORBIDDEN")
-	r = c.do(http.MethodPost, "/_matrix/client/v3/join/"+esc(s.room), map[string]any{}, true)
-	s.record("join while joined", r.status == 200 && r.body.Get("room_id").Str == s.room, "%d %s", r.status, r.raw)
+	s.membership(me, probe, tag)
 
 	if before != nil {
 		// Checks run in the background; give them a moment.

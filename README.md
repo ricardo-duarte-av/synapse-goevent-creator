@@ -7,21 +7,25 @@ in place of the Python `event_creator` worker (`av-client-events-1`, which it
 is meant to retire) and proxies whatever it does not serve itself to Synapse's
 main process.
 
-**Status: M2, shadow.** Every request is forwarded unchanged and counted by
-endpoint and room (`goevent_requests_total{endpoint,write,room,served,status}`).
-For writes in the allowlisted rooms, the worker also re-derives what Synapse
-decided and rebuilds the event, which must come out with the same event ID
-(`goevent_shadow_checks_total{endpoint,check,result}`). It writes nothing.
-Native event creation comes in stages (`docs/plan.md`), and only ever for the
-rooms compiled into `internal/allowlist`.
+**Status: M5.** In the rooms compiled into `internal/allowlist`, `send`,
+`state`, `redact`, membership and `join/` can be served natively
+(`modes.*: native`). The worker builds and signs the event, auths it, computes
+its state group and push actions, writes what Synapse's event creator writes
+itself (push actions staging, room participation, state groups) as the role
+`goevent_creator`, and hands the event to the events writer over the
+`send_events` replication endpoint. The persister does the rest: storage, the
+stream, notifications and remote invites. gofederation sends it out from the
+stream. Each native event is checked afterwards against what was persisted
+(`goevent_native_verify_total{check,result}`).
 
-## How native creation will work
-
-As Synapse does it (`handlers/message.py`, v1.163.0), the creator builds and
-signs the event, auths it, computes its state group and push actions, then
-hands it to the events writer over the `send_events` replication endpoint. The
-persister does the rest: storage, the stream, notifications and remote invites.
-gofederation sends it out from the stream.
+Anything not reproduced exactly (a refusal, a remote join, a 3pid invite, a
+room with several forward extremities, ...) is proxied to main before the
+first write, counted (`goevent_native_fallback_total{endpoint,reason}`) and
+shadow-checked: Synapse's event is rebuilt and must come out with the same
+event ID (`goevent_shadow_checks_total{endpoint,check,result}`). Every request
+is counted by endpoint and room
+(`goevent_requests_total{endpoint,write,room,served,status}`). `knock/` and
+`profile/` are always proxied.
 
 ## Running
 
