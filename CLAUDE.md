@@ -142,12 +142,12 @@ Each native event is verified against what was persisted
   not `update_membership_locked`'s own comparison, which compares content
   without `membership` and never matches. A leave from a join tells main
   (`membership_change/.../left`, `_user_left_room`). Fallbacks: remote
-  targets of a join or invite (their profile is a federation query), 3pid
-  invites, `third_party_signed`, a per-room `displayname`/`avatar_url` in a
-  `/join/` body, invite filtering account data (MSC4380, MSC4155), server
-  notice rooms, blocked rooms, restricted joins needing an authorising
-  server, the host not in the room, and any module, `hs_disabled`/MAU limit
-  or consent requirement in homeserver.yaml.
+  joins (main's in Synapse too), knocks, 3pid invites, `third_party_signed`,
+  invite filtering account data (MSC4380, MSC4155), server notice rooms,
+  restricted joins needing an authorising server, the host not in the room,
+  an avatar with media limits configured, and any module,
+  `hs_disabled`/MAU limit or consent requirement in homeserver.yaml.
+  Blocked rooms are refused here.
 - **Membership ratelimits are this process's**, as each Synapse worker's are:
   `rc_joins.local` (joins by a user not yet joined), `rc_invites.*`, and
   `rc_joins_per_room`, which Synapse feeds from every join on the events
