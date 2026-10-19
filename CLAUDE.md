@@ -285,7 +285,8 @@ Each native event is verified against what was persisted
   the content (a float there is then the canonical JSON refusal). Outbound
   connections obey `federation_ip_range_blocklist` (Synapse's default
   private ranges, `ip_range_whitelist`) and `federation_domain_whitelist`.
-  Synapse retries a failed request up to three times; we ask once. The
+  Synapse asks once too: its retry loop retries only `if retries_left and
+  not timeout`, and `make_query` passes `timeout=10000`. The
   container needs outbound HTTPS for it. The invite itself is the events
   writer's to send: an invitee on a server that does not exist is its 502,
   relayed (`Can't connect to server nonexistent.invalid`, an e2e step).
