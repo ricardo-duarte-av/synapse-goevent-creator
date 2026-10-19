@@ -1,6 +1,7 @@
 package synapsecfg
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -380,5 +381,25 @@ func TestAuthSettings(t *testing.T) {
 	a, _ := authSettings(nil, map[string]any{"msc3861": map[string]any{"enabled": true}})
 	if !a.Delegated {
 		t.Error("msc3861 is delegated auth")
+	}
+}
+
+func TestFederationIPRanges(t *testing.T) {
+	r, err := federationIPRanges(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ip, blocked := range map[string]bool{"10.1.2.3": true, "::ffff:192.168.1.1": true, "0.0.0.0": true, "8.8.8.8": false, "2a00::1": false} {
+		if got := r.Blocked(netip.MustParseAddr(ip)); got != blocked {
+			t.Errorf("%s: blocked %v", ip, got)
+		}
+	}
+	r, _ = federationIPRanges([]byte("ip_range_whitelist: [10.1.0.0/16]\n"))
+	if r.Blocked(netip.MustParseAddr("10.1.2.3")) || !r.Blocked(netip.MustParseAddr("10.2.0.1")) {
+		t.Error("ip_range_whitelist")
+	}
+	r, _ = federationIPRanges([]byte("federation_ip_range_blacklist: [8.8.8.0/24]\nip_range_whitelist: [8.8.8.8]\n"))
+	if !r.Blocked(netip.MustParseAddr("8.8.8.8")) || r.Blocked(netip.MustParseAddr("10.0.0.1")) {
+		t.Error("federation_ip_range_blacklist")
 	}
 }

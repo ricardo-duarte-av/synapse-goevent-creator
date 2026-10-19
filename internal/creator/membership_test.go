@@ -1,6 +1,7 @@
 package creator
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -148,7 +149,6 @@ func TestMembershipFallbacks(t *testing.T) {
 			memberReq("unban", ""), `{"user_id":"` + other + `"}`, "refused:unban_not_banned"},
 		"invite of banned": {func(h *harness) { h.f.addState(t, "m.room.member", other, `{"membership":"ban"}`) },
 			memberReq("invite", ""), `{"user_id":"` + other + `"}`, "refused:target_banned"},
-		"remote invite":         {nil, memberReq("invite", ""), `{"user_id":"@x:remote.example"}`, "remote_profile"},
 		"missing user_id":       {nil, memberReq("ban", ""), `{}`, "refused:missing_user_id"},
 		"bad user_id":           {nil, memberReq("ban", ""), `{"user_id":"nope"}`, "refused:bad_user_id"},
 		"user_id number":        {nil, memberReq("ban", ""), `{"user_id":1}`, "refused:bad_user_id"},
@@ -342,5 +342,40 @@ func TestJoinWithPerRoomName(t *testing.T) {
 	}
 	if got := gjson.GetBytes(h.p.entries[0], "event.content").Raw; got != `{"displayname":"x","membership":"join"}` {
 		t.Errorf("content %s", got)
+	}
+}
+
+type fakeRemote map[string]gjson.Result
+
+func (f fakeRemote) ProfileField(_ context.Context, userID, field string) (gjson.Result, bool) {
+	v, ok := f[userID+" "+field]
+	return v, ok
+}
+
+// A remote invitee's profile comes from their server, a field at a time;
+// a failed query leaves the rest out, as Synapse's try does.
+func TestRemoteInvite(t *testing.T) {
+	for name, tc := range map[string]struct {
+		remote fakeRemote
+		want   string
+	}{
+		"both": {fakeRemote{"@x:remote.example displayname": gjson.Parse(`"Ex"`), "@x:remote.example avatar_url": gjson.Parse(`"mxc://remote.example/a"`)},
+			`{"avatar_url":"mxc://remote.example/a","displayname":"Ex","membership":"invite"}`},
+		"no displayname": {fakeRemote{"@x:remote.example displayname": gjson.Parse(`null`), "@x:remote.example avatar_url": gjson.Result{}},
+			`{"membership":"invite"}`},
+		"server down": {fakeRemote{}, `{"membership":"invite"}`},
+	} {
+		h := newHarness(t)
+		h.c.o.RemoteProfiles = tc.remote
+		if _, out := h.member(t, memberReq("invite", ""), `{"user_id":"@x:remote.example"}`); out.Result != "created" {
+			t.Fatalf("%s: %+v", name, out)
+		}
+		if got := gjson.GetBytes(h.p.entries[0], "event.content").Raw; got != tc.want {
+			t.Errorf("%s: %s", name, got)
+		}
+	}
+	h := newHarness(t)
+	if _, out := h.member(t, memberReq("invite", ""), `{"user_id":"@x:remote.example"}`); out.Fallback != "remote_profile" {
+		t.Errorf("without a federation client: %+v", out)
 	}
 }

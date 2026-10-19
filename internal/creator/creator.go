@@ -125,6 +125,11 @@ type Writer interface {
 	StoreFullStateGroup(ctx context.Context, eventID, roomID string, rows []writer.StateRow) (int64, error)
 }
 
+// RemoteProfiles is the federation profile query.
+type RemoteProfiles interface {
+	ProfileField(ctx context.Context, userID, field string) (gjson.Result, bool)
+}
+
 // Persister is the events writer, over replication.
 type Persister interface {
 	SendClientEvents(ctx context.Context, instance string, entries []json.RawMessage) (int64, string, error)
@@ -161,6 +166,9 @@ type Options struct {
 	MSC4293, MSC4155 bool
 	// Main is told when a local user leaves a room they were joined to.
 	Main MembershipNotifier
+	// RemoteProfiles queries remote servers for profiles; nil leaves
+	// remote targets' membership to Synapse.
+	RemoteProfiles RemoteProfiles
 	// ShadowPause, in tests, replaces the pause before a shadow-banned
 	// answer.
 	ShadowPause func(time.Duration) time.Duration

@@ -366,11 +366,27 @@ func (c *Creator) memberContent(ctx context.Context, rq *requester, in *input) *
 	if m.membership == "join" || (m.membership == "invite" && c.o.Membership.IncludeProfileDataOnInvite) {
 		_, hasDN := content["displayname"]
 		_, hasAV := content["avatar_url"]
-		if !hasDN || !hasAV {
-			if !c.isMine(m.target) {
-				// A federation profile query, whose failure is swallowed.
+		if (!hasDN || !hasAV) && !c.isMine(m.target) {
+			if c.o.RemoteProfiles == nil {
 				return fb("remote_profile")
 			}
+			// make_query per field; a failure ends the lookups, swallowed.
+			for _, f := range []struct {
+				key string
+				has bool
+			}{{"displayname", hasDN}, {"avatar_url", hasAV}} {
+				if f.has {
+					continue
+				}
+				v, ok := c.o.RemoteProfiles.ProfileField(ctx, m.target, f.key)
+				if !ok {
+					break
+				}
+				if v.Exists() && v.Type != gjson.Null {
+					content[f.key] = json.RawMessage(v.Raw)
+				}
+			}
+		} else if !hasDN || !hasAV {
 			dn, av, ok, err := c.o.Store.Profile(ctx, m.target)
 			if err != nil {
 				return fb("db_error")

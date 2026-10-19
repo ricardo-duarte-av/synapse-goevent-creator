@@ -28,6 +28,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/config"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/creator"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/dbrole"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/fedclient"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/proxy"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pushcalc"
@@ -339,18 +340,31 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 	if err != nil {
 		return nil, err
 	}
+	line, err := hs.SigningKeyLine()
+	if err != nil {
+		return nil, err
+	}
+	var allow func(string) bool
+	if hs.DomainWhitelist != nil {
+		allow = func(server string) bool { return hs.DomainWhitelist[server] }
+	}
+	fed, err := fedclient.New(hs.ServerName, line, allow, hs.FederationIPRanges)
+	if err != nil {
+		return nil, err
+	}
 	repl := replication.NewClient(hs)
 	return creator.New(creator.Options{
-		Store:        d.db,
-		Writer:       w,
-		Persister:    repl,
-		Main:         repl,
-		Key:          d.key,
-		Push:         d.push,
-		ServerName:   hs.ServerName,
-		EventsWriter: hs.Writers.EventsWriter,
-		Sticky:       hs.Flag("msc4354_enabled", false),
-		Log:          log,
+		Store:          d.db,
+		Writer:         w,
+		Persister:      repl,
+		Main:           repl,
+		RemoteProfiles: fed,
+		Key:            d.key,
+		Push:           d.push,
+		ServerName:     hs.ServerName,
+		EventsWriter:   hs.Writers.EventsWriter,
+		Sticky:         hs.Flag("msc4354_enabled", false),
+		Log:            log,
 
 		AppServices:            appservices,
 		DelegatedAuth:          hs.Auth.Delegated,

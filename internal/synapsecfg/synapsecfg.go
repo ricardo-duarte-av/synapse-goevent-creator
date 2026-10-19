@@ -115,6 +115,9 @@ type Config struct {
 	// Auth is what get_user_by_req reads.
 	Auth Auth
 
+	// FederationIPRanges is where outbound federation may not connect.
+	FederationIPRanges IPRanges
+
 	signingKey, signingKeyPath string
 }
 
@@ -244,6 +247,9 @@ func parse(b []byte, path string) (*Config, error) {
 	cfg.TrackPresence = trackPresence(r)
 	cfg.Experimental = lastWins(&r.ExperimentalFeatures)
 	if cfg.Auth, err = authSettings(b, cfg.Experimental); err != nil {
+		return nil, err
+	}
+	if cfg.FederationIPRanges, err = federationIPRanges(b); err != nil {
 		return nil, err
 	}
 

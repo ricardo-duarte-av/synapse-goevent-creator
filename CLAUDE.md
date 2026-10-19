@@ -254,6 +254,17 @@ Each native event is verified against what was persisted
   no-op (same sender, membership, and content compared as Python dicts, so
   `true == 1`) answers with the old event (`membership_noop`); for the
   membership servlet it never matches, the content having no membership.
+- **Remote invitees' profiles are asked of their server** (the one outbound
+  federation request: `internal/fedclient`, goinbound's client). Synapse's
+  `make_query`, one field at a time (10 s), and a failure ends the lookups,
+  swallowed by `update_membership_locked`; whatever the server answers is
+  the content (a float there is then the canonical JSON refusal). Outbound
+  connections obey `federation_ip_range_blocklist` (Synapse's default
+  private ranges, `ip_range_whitelist`) and `federation_domain_whitelist`.
+  Synapse retries a failed request up to three times; we ask once. The
+  container needs outbound HTTPS for it. The invite itself is the events
+  writer's to send: an invitee on a server that does not exist is its 502,
+  relayed (`Can't connect to server nonexistent.invalid`, an e2e step).
 - **Writer-side refusals** (`persist_and_notify_client_events`): redacting
   the create event (403), an event of another room (400) or a server ACL
   (403) is refused here, never sent. The writer ratelimits (`rc_message`)
