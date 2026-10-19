@@ -379,3 +379,38 @@ func TestRemoteInvite(t *testing.T) {
 		t.Errorf("without a federation client: %+v", out)
 	}
 }
+
+func (h *harness) knock(t *testing.T, body string) (*httptest.ResponseRecorder, Outcome) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "/_matrix/client/v3/knock/"+room, strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	return rec, h.c.Serve(rec, r, route.Request{Endpoint: route.Knock, Write: true, Room: room})
+}
+
+// A knock on a knockable room this server is in: a local event with the
+// knocker's profile and reason, answered with the room.
+func TestKnock(t *testing.T) {
+	h := newHarness(t)
+	h.f.addState(t, "m.room.join_rules", "", `{"join_rule":"knock"}`)
+	h.f.token.UserID = "@k:example.org"
+	h.f.profiles = map[string][2]*string{"@k:example.org": {str("Kay"), nil}}
+	rec, out := h.knock(t, `{"reason":"let me in"}`)
+	if out.Result != "created" || rec.Body.String() != `{"room_id":"`+room+`"}` {
+		t.Fatalf("%+v %s", out, rec.Body)
+	}
+	if got := gjson.GetBytes(h.p.entries[0], "event.content").Raw; got != `{"displayname":"Kay","membership":"knock","reason":"let me in"}` {
+		t.Errorf("content %s", got)
+	}
+	// The joined user cannot knock: the auth rules say so.
+	h = newHarness(t)
+	h.f.addState(t, "m.room.join_rules", "", `{"join_rule":"knock"}`)
+	rec, out = h.knock(t, `{}`)
+	if out.Refused != "auth_rules" || !strings.Contains(rec.Body.String(), "You cannot knock on a room you are already in") {
+		t.Errorf("%+v %s", out, rec.Body)
+	}
+	// No body is no JSON.
+	if rec, out := newHarness(t).knock(t, ``); out.Refused != "not_json" {
+		t.Errorf("%+v %s", out, rec.Body)
+	}
+}

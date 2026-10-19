@@ -240,7 +240,7 @@ func fallback(reason string) Outcome { return Outcome{Fallback: reason} }
 // Serves reports whether an endpoint can be native.
 func Serves(ep route.Endpoint) bool {
 	switch ep {
-	case route.Send, route.State, route.Redact, route.Membership, route.Join:
+	case route.Send, route.State, route.Redact, route.Membership, route.Join, route.Knock:
 		return true
 	}
 	return false
@@ -252,7 +252,7 @@ func Serves(ep route.Endpoint) bool {
 func (c *Creator) Serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	start := c.o.Now()
 	var out Outcome
-	if req.Endpoint == route.Membership || req.Endpoint == route.Join ||
+	if req.Endpoint == route.Membership || req.Endpoint == route.Join || req.Endpoint == route.Knock ||
 		(req.Endpoint == route.State && req.Action == "m.room.member" && r.Method == http.MethodPut) {
 		// RoomStateEventRestServlet hands m.room.member to update_membership.
 		out = c.serveMembership(w, r, req)

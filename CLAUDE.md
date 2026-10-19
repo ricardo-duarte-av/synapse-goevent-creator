@@ -142,7 +142,7 @@ Each native event is verified against what was persisted
   not `update_membership_locked`'s own comparison, which compares content
   without `membership` and never matches. A leave from a join tells main
   (`membership_change/.../left`, `_user_left_room`). Fallbacks: remote
-  joins (main's in Synapse too), knocks, 3pid invites, `third_party_signed`,
+  joins and knocks (main's in Synapse too), 3pid invites, `third_party_signed`,
   invite filtering account data (MSC4380, MSC4155), server notice rooms,
   restricted joins needing an authorising server, the host not in the room,
   an avatar with media limits configured, and any module,
@@ -290,6 +290,12 @@ Each native event is verified against what was persisted
   container needs outbound HTTPS for it. The invite itself is the events
   writer's to send: an invitee on a server that does not exist is its 502,
   relayed (`Can't connect to server nonexistent.invalid`, an e2e step).
+- **Knocks on rooms this server is in are served** (`modes.knock:
+  native`): `KnockRoomAliasServlet` is POST only, refuses guests
+  (`M_GUEST_ACCESS_FORBIDDEN`), needs a body, and keeps only `reason`; the
+  knocker's profile is added as for a join, and the auth rules judge it. A
+  knock on a room we are not in is a remote knock, main's, and so is an
+  alias.
 - **Delayed events are added here** (MSC4140, `DelayedEventsHandler.add`):
   `?org.matrix.msc4140.delay=` on `/send` and `/state` (member events too,
   as sent, before the member path), after the servlet's JSON, `ts` and

@@ -42,9 +42,9 @@ func TestEveryModeIsRequired(t *testing.T) {
 }
 
 func TestModeNotYetAvailable(t *testing.T) {
-	_, err := parse([]byte(strings.Replace(valid, "knock: proxy", "knock: native", 1)))
+	_, err := parse([]byte(strings.Replace(valid, "knock: proxy", "knock: shadow", 1)))
 	if err == nil || !strings.Contains(err.Error(), "not available") {
-		t.Fatalf("native knock: err = %v", err)
+		t.Fatalf("shadow knock: err = %v", err)
 	}
 	// Profile writes touch every room the user is in: never shadowed.
 	_, err = parse([]byte(strings.Replace(valid, "profile: proxy", "profile: shadow", 1)))

@@ -44,7 +44,7 @@ var accepted = map[route.Endpoint][]Mode{
 	route.Redact:     {ModeProxy, ModeShadow, ModeNative},
 	route.Membership: {ModeProxy, ModeShadow, ModeNative},
 	route.Join:       {ModeProxy, ModeShadow, ModeNative},
-	route.Knock:      {ModeProxy},
+	route.Knock:      {ModeProxy, ModeNative},
 	route.Profile:    {ModeProxy},
 }
 

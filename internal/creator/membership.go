@@ -82,6 +82,10 @@ func (c *Creator) limiters() *membershipLimiters {
 // serveMembership serves the membership servlets.
 func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	q := r.URL.Query()
+	if req.Endpoint == route.Knock && (r.Method != http.MethodPost || req.TxnID != "") {
+		// KnockRoomAliasServlet has on_POST only.
+		return fallback("method")
+	}
 	if reason := c.configFallback(); reason != "" {
 		// user_may_invite, user_may_join_room, check_event_allowed.
 		return fallback(reason)
@@ -115,12 +119,17 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 			return Outcome{Result: "txn_cached"}
 		}
 	}
+	if rq.Guest && req.Endpoint == route.Knock {
+		// get_user_by_req(allow_guest=False).
+		return c.refuse(w, &refusal{reason: "guest", status: http.StatusForbidden, errcode: "M_GUEST_ACCESS_FORBIDDEN",
+			msg: "Guest access not allowed"})
+	}
 	if rq.Guest && req.Endpoint == route.Membership && req.Action != "join" && req.Action != "leave" {
 		return c.refuse(w, forbidden("guest", "Guest access not allowed"))
 	}
 
-	// The state servlet takes no empty body.
-	body, st := parseJSONObject(body, req.Endpoint != route.State)
+	// The state and knock servlets take no empty body.
+	body, st := parseJSONObject(body, req.Endpoint != route.State && req.Endpoint != route.Knock)
 	if st != nil {
 		return c.end(w, st)
 	}
@@ -195,7 +204,7 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 // {} otherwise.
 func writeMembershipAnswer(w http.ResponseWriter, req route.Request) {
 	out := map[string]string{}
-	if req.Endpoint == route.Join || req.Action == "join" {
+	if req.Endpoint == route.Join || req.Endpoint == route.Knock || req.Action == "join" {
 		out["room_id"] = req.Room
 	}
 	b, _ := json.Marshal(out)
@@ -256,6 +265,12 @@ func (c *Creator) parseMembership(req route.Request, rq *requester, body []byte)
 	case route.Join:
 		m.action, m.join = "join", true
 		whole()
+	case route.Knock:
+		// KnockRoomAliasServlet: only the reason.
+		m.action, m.join = "knock", true
+		if v, ok := pdu.Field(b, "reason"); ok {
+			m.content["reason"] = json.RawMessage(v.Raw)
+		}
 	case route.State:
 		// `content.get("membership", None)`, then
 		// UserID.from_string(state_key).
@@ -309,7 +324,7 @@ func (c *Creator) parseMembership(req route.Request, rq *requester, body []byte)
 			}
 		}
 	}
-	if req.Endpoint != route.State {
+	if req.Endpoint != route.State && req.Endpoint != route.Knock {
 		if v := pdu.Get(b, "third_party_signed"); v.Exists() && v.Type != gjson.Null {
 			return nil, fb("third_party_signed")
 		}
@@ -367,11 +382,7 @@ func (c *Creator) memberContent(ctx context.Context, rq *requester, in *input) *
 	if !membershipList[m.membership] {
 		return badRequest("invalid_membership", "Invalid membership key").stop()
 	}
-	if m.membership == "knock" {
-		return fb("knock")
-	}
-
-	if m.membership == "join" || (m.membership == "invite" && c.o.Membership.IncludeProfileDataOnInvite) {
+	if m.membership == "join" || m.membership == "knock" || (m.membership == "invite" && c.o.Membership.IncludeProfileDataOnInvite) {
 		_, hasDN := content["displayname"]
 		_, hasAV := content["avatar_url"]
 		if (!hasDN || !hasAV) && !c.isMine(m.target) {
@@ -561,6 +572,9 @@ func (c *Creator) checkMembershipRequest(ctx context.Context, req route.Request,
 	}
 	if rq.Suspended && m.action == "join" {
 		return userSuspended("Joining rooms while account is suspended is not allowed.").stop()
+	}
+	if rq.Suspended && m.action == "knock" {
+		return userSuspended("Knocking on rooms while account is suspended is not allowed.").stop()
 	}
 	if st := c.memberContent(ctx, rq, in); st != nil {
 		return st

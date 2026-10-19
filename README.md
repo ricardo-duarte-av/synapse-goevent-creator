@@ -33,8 +33,8 @@ before the first write, counted
 (`goevent_native_fallback_total{endpoint,reason}`) and shadow-checked: Synapse's event is rebuilt and must come out with the same
 event ID (`goevent_shadow_checks_total{endpoint,check,result}`). Every request
 is counted by endpoint and room
-(`goevent_requests_total{endpoint,write,room,served,status}`). `knock/` and
-`profile/` are always proxied.
+(`goevent_requests_total{endpoint,write,room,served,status}`). `knock/` can be native for
+rooms this server is in; `profile/` is always proxied.
 
 ## Running
 

@@ -42,7 +42,7 @@ modes:
   redact: shadow
   membership: shadow
   join: shadow
-  knock: proxy       # proxy only: knocks are remote, main's job
+  knock: proxy       # or native: knocks on rooms this server is in (remote ones are main's)
   profile: proxy     # proxy only: profile writes touch every room the user is in
 
 # Needed by shadow. The session is read-only (default_transaction_read_only),

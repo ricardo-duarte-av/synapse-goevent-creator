@@ -234,6 +234,11 @@ func (s *suite) membership(me, probe, tag string) {
 	// both, and nothing is created.
 	s.expectError("refuse invite to a server that does not exist", c.do(http.MethodPost, path("invite"),
 		map[string]any{"user_id": "@goevent-e2e-probe:nonexistent.invalid"}, true), 502, "M_UNKNOWN")
+	// A knock by the joined account on the invite-only room: the auth
+	// rules refuse it.
+	s.expectError("refuse knock on an invite-only room", c.do(http.MethodPost, "/_matrix/client/v3/knock/"+esc(s.room),
+		map[string]any{"reason": "e2e"}, true), 403, "M_FORBIDDEN")
+	s.expectError("refuse knock without a body", c.do(http.MethodPost, "/_matrix/client/v3/knock/"+esc(s.room), "", true), 400, "M_NOT_JSON")
 	s.expectError("refuse ban without user_id", c.do(http.MethodPost, path("ban"), map[string]any{}, true), 400, "M_MISSING_PARAM")
 	s.expectError("refuse ban of a bad user_id", c.do(http.MethodPost, path("ban"), map[string]any{"user_id": "nobody"}, true), 400, "M_INVALID_PARAM")
 

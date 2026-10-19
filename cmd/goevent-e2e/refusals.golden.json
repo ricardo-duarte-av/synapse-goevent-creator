@@ -17,6 +17,8 @@
   "refuse invite of banned user": "403 {\"errcode\":\"M_BAD_STATE\",\"error\":\"Cannot invite user who was banned\"}",
   "refuse invite to a server that does not exist": "502 {\"errcode\":\"M_UNKNOWN\",\"error\":\"Can't connect to server nonexistent.invalid\"}",
   "refuse kick of absent user": "403 {\"errcode\":\"M_FORBIDDEN\",\"error\":\"The target user is not in the room\"}",
+  "refuse knock on an invite-only room": "403 {\"errcode\":\"M_FORBIDDEN\",\"error\":\"You don't have permission to knock\"}",
+  "refuse knock without a body": "400 {\"errcode\":\"M_NOT_JSON\",\"error\":\"Content not JSON.\"}",
   "refuse member state with a bad membership": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"Invalid membership key\"}",
   "refuse member state without membership": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"Invalid membership (must be a string)\"}",
   "refuse message without body": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"'body' not in content\"}",
