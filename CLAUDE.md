@@ -218,9 +218,15 @@ Each native event is verified against what was persisted
   as it keys: path plus user and device, guest, appservice, or token). The
   doublepuppet registration claims every local user, so bridged messages
   from real users come this way. `ip_range_whitelist` is Synapse's. Not run
-  live: it needs a bridge's token, which is the operator's. Not reproduced: `_record_request`
-  (`user_ips`, MAU), which goes to main over TCP replication; clients'
-  other requests keep last-seen current.
+  live: it needs a bridge's token, which is the operator's (since covered by the
+  suite's own appservice).
+- **`_record_request` is reproduced** (`internal/userips`): a `USER_IP`
+  command on the Redis bus, channel `<server_name>/USER_IP`, at most once per
+  user, token and address every two minutes per process, as
+  `insert_client_ip` sends it from a worker; main writes `user_ips`, the
+  device's last seen and MAU. The address is the first of X-Forwarded-For's
+  (`x_forwarded: true`), the user the token's owner; appservices and puppets
+  only when `track_appservice_user_ips` / `track_puppeted_user_ips` say so.
 - **Refusals are given here, in Synapse's order and words** (M6). A check
   answers nil, a refusal (status, errcode, message, extra fields) or a
   fallback (`creator.stop`). A fallback may sit anywhere before the first
