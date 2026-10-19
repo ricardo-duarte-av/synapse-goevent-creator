@@ -14,6 +14,7 @@ import (
 )
 
 type registration struct {
+	ASToken    string `yaml:"as_token"`
 	Namespaces struct {
 		Users []struct {
 			Exclusive bool   `yaml:"exclusive"`
@@ -51,4 +52,24 @@ func ExclusiveUsers(files []string) (*regexp.Regexp, error) {
 		return nil, fmt.Errorf("appservice: exclusive user regex: %w", err)
 	}
 	return re, nil
+}
+
+// Tokens are the registrations' as_tokens: get_app_service_by_token's
+// lookup, which get_user_by_req makes before the access_tokens table.
+func Tokens(files []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("appservice: %w", err)
+		}
+		var r registration
+		if err := yaml.Unmarshal(b, &r); err != nil {
+			return nil, fmt.Errorf("appservice: %s: %w", f, err)
+		}
+		if r.ASToken != "" {
+			out[r.ASToken] = true
+		}
+	}
+	return out, nil
 }

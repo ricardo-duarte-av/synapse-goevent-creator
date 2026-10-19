@@ -20,9 +20,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -83,6 +85,8 @@ type suite struct {
 	run    string
 	steps  []step
 	failed bool
+	// bodies are the refusals' bodies, normalised, by step.
+	bodies map[string]string
 }
 
 func (s *suite) record(name string, ok bool, detail string, args ...any) {
@@ -255,6 +259,61 @@ func (s *suite) membership(me, probe, tag string) {
 func (s *suite) expectError(name string, r resp, status int, errcodes ...string) {
 	ok := r.status == status && slices.Contains(errcodes, r.body.Get("errcode").Str)
 	s.record(name, ok, "status %d errcode %s (want %d %v)", r.status, r.body.Get("errcode").Str, status, errcodes)
+	s.bodies[name] = fmt.Sprintf("%d %s", r.status, s.normalise(r.raw))
+}
+
+var (
+	eventIDs   = regexp.MustCompile(`\$[A-Za-z0-9+/_-]{43}`)
+	retryAfter = regexp.MustCompile(`"retry_after_ms":\d+`)
+)
+
+// normalise makes a refusal's body comparable across runs: canonical, with
+// the run, the account and event IDs replaced, and retry_after_ms zeroed.
+func (s *suite) normalise(raw string) string {
+	var v any
+	if json.Unmarshal([]byte(raw), &v) == nil {
+		b, _ := json.Marshal(v)
+		raw = string(b)
+	}
+	raw = strings.ReplaceAll(raw, s.run, "RUN")
+	raw = strings.ReplaceAll(raw, s.me, "@ME")
+	raw = eventIDs.ReplaceAllString(raw, "$$EVENT")
+	return retryAfter.ReplaceAllString(raw, `"retry_after_ms":0`)
+}
+
+// golden compares the refusals' bodies with a recording of Synapse's, or
+// writes the recording.
+func (s *suite) golden(path string, write bool) {
+	if write {
+		b, _ := json.MarshalIndent(s.bodies, "", "  ")
+		if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+			s.record("refusal bodies", false, "%v", err)
+			return
+		}
+		s.record("refusal bodies", true, "%d recorded in %s", len(s.bodies), path)
+		return
+	}
+	b, err := os.ReadFile(path)
+	want := map[string]string{}
+	if err == nil {
+		err = json.Unmarshal(b, &want)
+	}
+	if err != nil {
+		s.record("refusal bodies", false, "%v", err)
+		return
+	}
+	var diffs []string
+	for _, name := range slices.Sorted(maps.Keys(s.bodies)) {
+		w, ok := want[name]
+		switch {
+		case !ok:
+			diffs = append(diffs, name+": not recorded")
+		case w != s.bodies[name]:
+			diffs = append(diffs, fmt.Sprintf("%s:\n       got  %s\n       want %s", name, s.bodies[name], w))
+		}
+	}
+	s.record("refusal bodies", len(diffs) == 0, "%d compared with Synapse's%s", len(s.bodies),
+		strings.Join(append([]string{""}, diffs...), "\n     "))
 }
 
 func jsonEqual(a, b []byte) bool {
@@ -320,6 +379,8 @@ func run() int {
 	user := flag.String("user", "test", "localpart of the test account")
 	room := flag.String("room", "!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt", "an allowlisted room the account may write to")
 	metricsURL := flag.String("metrics", "", "the worker's /metrics, to check its counters (optional)")
+	goldenPath := flag.String("golden", "cmd/goevent-e2e/refusals.golden.json", "Synapse's refusal bodies, recorded")
+	record := flag.Bool("record", false, "record the refusal bodies to -golden instead of comparing (run against Synapse)")
 	flag.Parse()
 
 	if !slices.Contains(allowlist.Permitted, *room) {
@@ -333,7 +394,7 @@ func run() int {
 	}
 
 	c := &client{base: strings.TrimRight(*base, "/"), http: &http.Client{Timeout: 60 * time.Second}}
-	s := &suite{c: c, room: *room, run: fmt.Sprint(time.Now().Unix())}
+	s := &suite{c: c, room: *room, run: fmt.Sprint(time.Now().Unix()), bodies: map[string]string{}}
 
 	var before metrics
 	if *metricsURL != "" {
@@ -559,6 +620,7 @@ func run() int {
 	// leaves: the room is invite-only.
 	probe := "@goevent-e2e-probe:" + strings.SplitN(me, ":", 2)[1]
 	s.membership(me, probe, tag)
+	s.golden(*goldenPath, *record)
 
 	if before != nil {
 		// Checks run in the background; give them a moment.

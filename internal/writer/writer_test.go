@@ -91,6 +91,7 @@ func TestGrantsAreNarrow(t *testing.T) {
 		"state_group_edges":             "SELECT, INSERT",
 		"state_groups_state":            "SELECT, INSERT",
 		"state_groups_pending_deletion": "SELECT, UPDATE",
+		"access_tokens":                 "SELECT (id, used), UPDATE (used)",
 	}
 	if len(Grants) != len(writes) {
 		t.Fatalf("Grants has %d tables, the test knows %d", len(Grants), len(writes))

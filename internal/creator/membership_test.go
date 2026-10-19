@@ -139,26 +139,27 @@ func TestMembershipFallbacks(t *testing.T) {
 		body  string
 		want  string
 	}{
-		"kick of absent user": {nil, memberReq("kick", ""), `{"user_id":"` + other + `"}`, "kick_absent"},
+		"kick of absent user": {nil, memberReq("kick", ""), `{"user_id":"` + other + `"}`, "refused:kick_absent"},
 		"kick of a leave": {func(h *harness) { h.f.addState(t, "m.room.member", other, `{"membership":"leave"}`) },
-			memberReq("kick", ""), `{"user_id":"` + other + `"}`, "kick_absent"},
+			memberReq("kick", ""), `{"user_id":"` + other + `"}`, "refused:kick_absent"},
 		"unban not banned": {func(h *harness) { h.f.addState(t, "m.room.member", other, `{"membership":"leave"}`) },
-			memberReq("unban", ""), `{"user_id":"` + other + `"}`, "unban_not_banned"},
+			memberReq("unban", ""), `{"user_id":"` + other + `"}`, "refused:unban_not_banned"},
 		"invite of banned": {func(h *harness) { h.f.addState(t, "m.room.member", other, `{"membership":"ban"}`) },
-			memberReq("invite", ""), `{"user_id":"` + other + `"}`, "target_banned"},
-		"remote invite":   {nil, memberReq("invite", ""), `{"user_id":"@x:remote.example"}`, "remote_profile"},
-		"missing user_id": {nil, memberReq("ban", ""), `{}`, "missing_user_id"},
-		"bad user_id":     {nil, memberReq("ban", ""), `{"user_id":"nope"}`, "bad_user_id"},
-		"user_id number":  {nil, memberReq("ban", ""), `{"user_id":1}`, "bad_user_id"},
-		"3pid invite":     {nil, memberReq("invite", ""), `{"medium":"email","address":"a@b"}`, "3pid_invite"},
-		"per-room name":   {nil, route.Request{Endpoint: route.Join, Room: room}, `{"displayname":"x"}`, "per_room_profile"},
+			memberReq("invite", ""), `{"user_id":"` + other + `"}`, "refused:target_banned"},
+		"remote invite":         {nil, memberReq("invite", ""), `{"user_id":"@x:remote.example"}`, "remote_profile"},
+		"missing user_id":       {nil, memberReq("ban", ""), `{}`, "refused:missing_user_id"},
+		"bad user_id":           {nil, memberReq("ban", ""), `{"user_id":"nope"}`, "refused:bad_user_id"},
+		"user_id number":        {nil, memberReq("ban", ""), `{"user_id":1}`, "refused:bad_user_id"},
+		"3pid invite":           {nil, memberReq("invite", ""), `{"medium":"email","address":"a@b"}`, "refused:3pid_invite"},
+		"3pid invite, complete": {nil, memberReq("invite", ""), `{"medium":"email","address":"a@b","id_server":"x","id_access_token":"y"}`, "3pid_invite"},
+		"per-room name":         {nil, route.Request{Endpoint: route.Join, Room: room}, `{"displayname":"x"}`, "per_room_profile"},
 		"membership in body": {nil, route.Request{Endpoint: route.Join, Room: room}, `{"membership":"join"}`,
 			"membership_in_body"},
 		"third party signed": {nil, memberReq("join", ""), `{"third_party_signed":{}}`, "third_party_signed"},
 		"invite config": {func(h *harness) { h.f.accountData = map[string]bool{other + " " + invitePermissionConfig: true} },
 			memberReq("invite", ""), `{"user_id":"` + other + `"}`, "invite_config"},
-		"blocked room":  {func(h *harness) { h.f.blocked = true }, memberReq("join", ""), ``, "room_blocked"},
-		"not an object": {nil, memberReq("leave", ""), `[]`, "not_object"},
+		"blocked room":  {func(h *harness) { h.f.blocked = true }, memberReq("join", ""), ``, "refused:room_blocked"},
+		"not an object": {nil, memberReq("leave", ""), `[]`, "refused:not_object"},
 		"duplicate key": {nil, memberReq("leave", ""), `{"reason":"a","reason":"b"}`, "duplicate_keys"},
 		"restricted join": {func(h *harness) {
 			h.f.addState(t, "m.room.join_rules", "", `{"join_rule":"restricted","allow":[]}`)
@@ -179,8 +180,8 @@ func TestMembershipFallbacks(t *testing.T) {
 				}
 				return
 			}
-			if out.Fallback != tc.want {
-				t.Fatalf("fallback %q, want %q", out.Fallback, tc.want)
+			if stopped(out) != tc.want {
+				t.Fatalf("stopped %q, want %q", stopped(out), tc.want)
 			}
 			if len(h.w.calls) != 0 || len(h.p.entries) != 0 {
 				t.Errorf("a fallback wrote: %v", h.w.calls)
@@ -214,7 +215,7 @@ func TestCallInviteInPublicRoom(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+"/send/m.call.invite/c", strings.NewReader(`{"call_id":"x"}`))
 	r.Header.Set("Authorization", "Bearer tok")
 	out := h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.call.invite", TxnID: "c"})
-	if out.Fallback != "call_invite_public" {
+	if out.Refused != "call_invite_public" {
 		t.Fatalf("%+v", out)
 	}
 }

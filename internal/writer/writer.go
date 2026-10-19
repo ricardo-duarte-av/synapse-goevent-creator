@@ -41,6 +41,9 @@ var Grants = []dbrole.Grant{
 	{Table: "state_groups_state", Privileges: "SELECT, INSERT"},
 	// check_state_groups_and_bump_deletion.
 	{Table: "state_groups_pending_deletion", Privileges: "SELECT, UPDATE"},
+	// mark_access_token_as_used, on a token's first request. Only the flag:
+	// the role never reads a token.
+	{Table: "access_tokens", Privileges: "SELECT (id, used), UPDATE (used)"},
 }
 
 // Sequences are granted USAGE: new state group IDs, and the pending deletion
@@ -73,6 +76,10 @@ const (
 			WHERE user_id = $1 AND room_id = $2
 		)
 		AND NOT participant`
+
+	// qMarkTokenUsed is mark_access_token_as_used's simple_update_one
+	// (storage/databases/main/registration.py).
+	qMarkTokenUsed = `UPDATE access_tokens SET used = true WHERE id = $1`
 
 	// qExistingGroups is _get_existing_groups_with_lock with lock=False
 	// (storage/databases/state/deletion.py).
@@ -182,6 +189,20 @@ func (d *DB) UnstagePush(ctx context.Context, eventID string) error {
 func (d *DB) SetRoomParticipation(ctx context.Context, userID, roomID string) error {
 	if _, err := d.pool.Exec(ctx, qRoomParticipation, userID, roomID); err != nil {
 		return fmt.Errorf("writer: room participation: %w", err)
+	}
+	return nil
+}
+
+// MarkTokenUsed is mark_access_token_as_used: the token has served a
+// request, which invalidates the refresh token that issued it.
+func (d *DB) MarkTokenUsed(ctx context.Context, tokenID int64) error {
+	tag, err := d.pool.Exec(ctx, qMarkTokenUsed, tokenID)
+	if err != nil {
+		return fmt.Errorf("writer: mark token used: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		// simple_update_one's StoreError.
+		return fmt.Errorf("writer: mark token used: %d rows", tag.RowsAffected())
 	}
 	return nil
 }

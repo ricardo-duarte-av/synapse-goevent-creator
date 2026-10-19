@@ -76,14 +76,9 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 	if q.Has("user_id") || q.Has("device_id") {
 		return fallback("appservice")
 	}
-	switch m := c.o.Membership; {
-	case m.Modules:
+	if reason := c.configFallback(); reason != "" {
 		// user_may_invite, user_may_join_room, check_event_allowed.
-		return fallback("modules")
-	case m.AuthBlocking:
-		return fallback("auth_blocking")
-	case m.ConsentRequired:
-		return fallback("consent")
+		return fallback(reason)
 	}
 
 	body, tooLarge, err := readBody(r)
@@ -93,29 +88,14 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 	case tooLarge:
 		return fallback("too_large")
 	}
-	// parse_json_object_from_request(allow_empty_body=True).
-	if len(body) == 0 {
-		body = []byte("{}")
-	}
-	if !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() {
-		return fallback("not_object")
-	}
-	if hasDuplicateKeys(gjson.ParseBytes(body)) {
-		return fallback("duplicate_keys")
-	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), c.o.Timeout)
 	defer cancel()
-	rq, reason := c.requester(ctx, r)
-	if reason != "" {
-		return fallback(reason)
-	}
-
-	in, reason := c.parseMembership(ctx, req, rq, body)
-	if reason != "" {
-		return fallback(reason)
-	}
-	if reason := c.validate(in, gjson.ParseBytes(in.content), req.Room); reason != "" {
+	rq, reason, ref := c.requester(ctx, r)
+	switch {
+	case ref != nil:
+		return c.refuse(w, ref)
+	case reason != "":
 		return fallback(reason)
 	}
 
@@ -125,24 +105,33 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 	if req.TxnID != "" {
 		txnKey = r.URL.EscapedPath() + "\x00" + rq.UserID + "\x00" + rq.DeviceID
 		if c.txns.seenAt(txnKey, c.o.Now()) {
-			c.respond(w, in, "")
+			writeMembershipAnswer(w, req)
 			return Outcome{Result: "txn_cached"}
 		}
+	}
+
+	body, st := parseJSONObject(body, true)
+	if st != nil {
+		return c.end(w, st)
+	}
+	in, st := c.parseMembership(ctx, req, rq, body)
+	if st != nil {
+		return c.end(w, st)
 	}
 
 	if out, limited := c.ratelimitMembership(ctx, w, req, rq, in.member); limited {
 		return out
 	}
-	if reason := c.checkMembershipRequest(ctx, req, rq, in); reason != "" {
-		return fallback(reason)
+	if st := c.checkMembershipRequest(ctx, req, rq, in); st != nil {
+		return c.end(w, st)
 	}
 
 	unlock := c.locks.lock(req.Room)
 	defer unlock()
 
-	p, dup, reason := c.prepare(ctx, req, rq, in, gjson.ParseBytes(in.content))
-	if reason != "" {
-		return fallback(reason)
+	p, dup, st := c.prepare(ctx, req, rq, in, gjson.ParseBytes(in.content))
+	if st != nil {
+		return c.end(w, st)
 	}
 	if dup != "" {
 		c.respond(w, in, dup)
@@ -163,9 +152,56 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 	return out
 }
 
+// writeMembershipAnswer is the servlets' answer: {"room_id"} for a join,
+// {} otherwise.
+func writeMembershipAnswer(w http.ResponseWriter, req route.Request) {
+	out := map[string]string{}
+	if req.Endpoint == route.Join || req.Action == "join" {
+		out["room_id"] = req.Room
+	}
+	b, _ := json.Marshal(out)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
+}
+
+// targetUserID is UserID.from_string(request_body["user_id"]) as the
+// membership servlet calls it: Synapse's 400s, its TypeErrors (500), and a
+// fallback for what it accepts but is no user ID here.
+func targetUserID(v gjson.Result) (string, *stop) {
+	start := badRequest("bad_user_id", "Expected UserID string to start with '@'", "M_INVALID_PARAM").stop()
+	switch {
+	case v.Type == gjson.String:
+		if surrogateEscape.MatchString(v.Raw) {
+			return "", fb("surrogate_escape")
+		}
+		if !strings.HasPrefix(v.Str, "@") {
+			return "", start
+		}
+		if !strings.Contains(v.Str, ":") {
+			return "", badRequest("bad_user_id", "Expected UserID of the form '@localname:domain'", "M_INVALID_PARAM").stop()
+		}
+		if !validUserID(v.Str) {
+			return "", fb("bad_user_id")
+		}
+		return v.Str, nil
+	case v.IsArray():
+		// len() works; a list never equals "@".
+		return "", start
+	case v.IsObject():
+		if len(v.Map()) == 0 {
+			return "", start
+		}
+		// s[0:1] on a dict.
+		return "", internalError("bad_user_id").stop()
+	}
+	// len() of a number, a bool or None.
+	return "", internalError("bad_user_id").stop()
+}
+
 // parseMembership is the servlet and the content update_membership_locked
 // builds, or why the request is Synapse's.
-func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *requester, body []byte) (*input, string) {
+func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *requester, body []byte) (*input, *stop) {
 	b := gjson.ParseBytes(body)
 	m := &memberInput{action: req.Action, target: rq.UserID}
 	content := map[string]json.RawMessage{}
@@ -180,30 +216,36 @@ func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *re
 		if _, ok := content["membership"]; ok {
 			// Compared with == against the old content before membership is
 			// set: a dict comparison, 1 == True and all.
-			return nil, "membership_in_body"
+			return nil, fb("membership_in_body")
 		}
 	} else {
 		if m.action == "invite" {
 			_, medium := pdu.Field(b, "medium")
 			_, address := pdu.Field(b, "address")
 			if medium && address {
-				return nil, "3pid_invite"
+				_, idServer := pdu.Field(b, "id_server")
+				_, idToken := pdu.Field(b, "id_access_token")
+				if !idServer || !idToken {
+					return nil, badRequest("3pid_invite",
+						"`id_server` and `id_access_token` are required when doing 3pid invite", "M_MISSING_PARAM").stop()
+				}
+				return nil, fb("3pid_invite")
 			}
 		}
 		switch m.action {
 		case "invite", "ban", "unban", "kick":
 			v, ok := pdu.Field(b, "user_id")
 			if !ok {
-				// assert_params_in_dict: Synapse's 400.
-				return nil, "missing_user_id"
+				return nil, badRequest("missing_user_id", "Missing params: ['user_id']", "M_MISSING_PARAM").stop()
 			}
-			if v.Type != gjson.String || !validUserID(v.Str) {
-				return nil, "bad_user_id"
+			target, st := targetUserID(v)
+			if st != nil {
+				return nil, st
 			}
-			m.target = v.Str
+			m.target = target
 		case "join", "leave":
 		default:
-			return nil, "action"
+			return nil, fb("action")
 		}
 		m.join = m.action == "join"
 		if v, ok := pdu.Field(b, "reason"); ok {
@@ -216,7 +258,7 @@ func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *re
 		}
 	}
 	if v := pdu.Get(b, "third_party_signed"); v.Exists() && v.Type != gjson.Null {
-		return nil, "third_party_signed"
+		return nil, fb("third_party_signed")
 	}
 
 	m.membership = m.action
@@ -230,7 +272,7 @@ func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *re
 	_, dn := content["displayname"]
 	_, av := content["avatar_url"]
 	if dn || av {
-		return nil, "per_room_profile"
+		return nil, fb("per_room_profile")
 	}
 	delete(content, authorisingUser)
 
@@ -238,11 +280,11 @@ func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *re
 	if m.membership == "join" || (m.membership == "invite" && c.o.Membership.IncludeProfileDataOnInvite) {
 		if !c.isMine(m.target) {
 			// A federation profile query, whose failure is swallowed.
-			return nil, "remote_profile"
+			return nil, fb("remote_profile")
 		}
 		dn, av, ok, err := c.o.Store.Profile(ctx, m.target)
 		if err != nil {
-			return nil, "db_error"
+			return nil, fb("db_error")
 		}
 		// get_displayname raises for a missing profile, and the try around
 		// both lookups leaves both out.
@@ -258,11 +300,11 @@ func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *re
 	content["membership"], _ = json.Marshal(m.membership)
 	raw, err := json.Marshal(content)
 	if err != nil {
-		return nil, "not_object"
+		return nil, fb("not_object")
 	}
 
 	sk := m.target
-	return &input{typ: "m.room.member", stateKey: &sk, content: raw, txn: req.TxnID, room: req.Room, member: m}, ""
+	return &input{typ: "m.room.member", stateKey: &sk, content: raw, txn: req.TxnID, room: req.Room, member: m}, nil
 }
 
 // ratelimitMembership is update_membership's ratelimiting: joins by a user
@@ -357,57 +399,69 @@ func (c *Creator) limitExceeded(ctx context.Context, w http.ResponseWriter, limi
 
 // checkMembershipRequest is update_membership_locked's checks that need no
 // room state.
-func (c *Creator) checkMembershipRequest(ctx context.Context, req route.Request, rq *requester, in *input) string {
+func (c *Creator) checkMembershipRequest(ctx context.Context, req route.Request, rq *requester, in *input) *stop {
 	m := in.member
+	sn := c.o.Membership.ServerNoticesMXID
+	if sn != "" && rq.UserID == sn {
+		return fb("server_notices")
+	}
 	if m.membership != "leave" && m.membership != "ban" {
 		blocked, err := c.o.Store.RoomBlocked(ctx, req.Room)
 		if err != nil {
-			return "db_error"
+			return fb("db_error")
 		}
 		if blocked {
-			return "room_blocked"
+			return (&refusal{reason: "room_blocked", status: http.StatusForbidden, errcode: "M_UNKNOWN",
+				msg: "This room has been blocked on this server"}).stop()
 		}
 	}
-	if sn := c.o.Membership.ServerNoticesMXID; sn != "" {
-		if rq.UserID == sn || m.target == sn {
-			return "server_notices"
+	if m.membership == "invite" {
+		if sn != "" && m.target == sn {
+			return (&refusal{reason: "server_notices", status: http.StatusForbidden, errcode: "M_UNKNOWN",
+				msg: "Cannot invite this user"}).stop()
+		}
+		if !rq.Admin {
+			if c.o.Membership.BlockNonAdminInvites {
+				return forbidden("invites_blocked", "Invites have been disabled on this server").stop()
+			}
+			// get_invite_config_for_user: any rules at all are Synapse's
+			// to apply.
+			types := []string{invitePermissionConfig}
+			if c.o.MSC4155 {
+				types = append(types, msc4155InvitePermissionConfig)
+			}
+			for _, t := range types {
+				_, ok, err := c.o.Store.AccountData(ctx, m.target, t)
+				if err != nil {
+					return fb("db_error")
+				}
+				if ok {
+					return fb("invite_config")
+				}
+			}
+		}
+	}
+	if sn != "" {
+		if m.target == sn {
+			return fb("server_notices")
 		}
 		// is_server_notice_room: invites there cannot be rejected, and
 		// joining it needs no consent.
 		cur, _, err := c.o.Store.LocalMembership(ctx, sn, req.Room)
 		if err != nil {
-			return "db_error"
+			return fb("db_error")
 		}
 		if cur == "join" {
-			return "server_notice_room"
+			return fb("server_notice_room")
 		}
 	}
-	if m.membership == "invite" && !rq.Admin {
-		if c.o.Membership.BlockNonAdminInvites {
-			return "invites_blocked"
-		}
-		// get_invite_config_for_user: any rules at all are Synapse's to apply.
-		types := []string{invitePermissionConfig}
-		if c.o.MSC4155 {
-			types = append(types, msc4155InvitePermissionConfig)
-		}
-		for _, t := range types {
-			_, ok, err := c.o.Store.AccountData(ctx, m.target, t)
-			if err != nil {
-				return "db_error"
-			}
-			if ok {
-				return "invite_config"
-			}
-		}
-	}
-	return ""
+	return nil
 }
 
 // checkMembership is update_membership_locked's checks against the state
 // before the event, then _local_membership_update's transaction lookup. A
 // reason means Synapse's; dup is the event a transaction already made.
-func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *requester, in *input, rv *pdu.RoomVersion, before pdu.StateMap) (dup, reason string) {
+func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *requester, in *input, rv *pdu.RoomVersion, before pdu.StateMap) (dup string, st *stop) {
 	m := in.member
 	ids := []string{}
 	for k, id := range before {
@@ -417,7 +471,7 @@ func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *re
 	}
 	evs, bad, err := c.o.Store.GetStoredEvents(ctx, ids)
 	if err != nil {
-		return "", "db_error"
+		return "", fb("db_error")
 	}
 	membershipOf := func(user string) (string, bool) {
 		id, ok := before[pdu.StateKey{Type: "m.room.member", StateKey: user}]
@@ -448,21 +502,24 @@ func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *re
 		}
 	}
 	if !inRoom {
-		return "", "host_not_in_room"
+		return "", fb("host_not_in_room")
 	}
 
 	old, hasOld := membershipOf(m.target)
+	notInRoom := forbidden("kick_absent", "The target user is not in the room").stop()
 	switch {
 	case hasOld && old == "":
-		return "", "old_membership_unknown"
+		return "", fb("old_membership_unknown")
 	case !hasOld && m.action == "kick":
-		return "", "kick_absent"
+		return "", notInRoom
 	case hasOld && m.action == "unban" && old != "ban":
-		return "", "unban_not_banned"
+		return "", (&refusal{reason: "unban_not_banned", status: http.StatusForbidden, errcode: "M_BAD_STATE",
+			msg: "Cannot unban user who was not banned (membership=" + old + ")"}).stop()
 	case old == "ban" && m.action != "ban" && m.action != "unban" && m.action != "leave":
-		return "", "target_banned"
+		return "", (&refusal{reason: "target_banned", status: http.StatusForbidden, errcode: "M_BAD_STATE",
+			msg: "Cannot " + m.action + " user who was banned"}).stop()
 	case (old == "ban" || old == "leave") && m.action == "kick":
-		return "", "kick_absent"
+		return "", notInRoom
 	}
 	m.leftFrom = old
 
@@ -470,7 +527,7 @@ func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *re
 		// _should_perform_remote_join: restricted rooms need an authorising
 		// user unless the user is already joined or invited.
 		if restrictedJoinRules(rv, before, evs) && old != "join" && old != "invite" {
-			return "", "restricted_join"
+			return "", fb("restricted_join")
 		}
 	}
 
@@ -480,12 +537,12 @@ func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *re
 		switch {
 		case err == nil:
 			in.dedupKind = "txn_dedup"
-			return id, ""
+			return id, nil
 		case !errors.Is(err, pdustore.ErrNotFound):
-			return "", "db_error"
+			return "", fb("db_error")
 		}
 	}
-	return "", ""
+	return "", nil
 }
 
 // restrictedJoinRules is has_restricted_join_rules, on the events loaded.

@@ -112,6 +112,9 @@ type Config struct {
 	// Membership is what update_membership reads.
 	Membership Membership
 
+	// Auth is what get_user_by_req reads.
+	Auth Auth
+
 	signingKey, signingKeyPath string
 }
 
@@ -240,6 +243,9 @@ func parse(b []byte, path string) (*Config, error) {
 
 	cfg.TrackPresence = trackPresence(r)
 	cfg.Experimental = lastWins(&r.ExperimentalFeatures)
+	if cfg.Auth, err = authSettings(b, cfg.Experimental); err != nil {
+		return nil, err
+	}
 
 	for _, f := range r.AppServiceConfigFiles {
 		dir := filepath.Dir(path)

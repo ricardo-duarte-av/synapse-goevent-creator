@@ -81,11 +81,11 @@ in gopro.
   event** (`room_member.py`, duplicate rule: same sender, membership and
   content). The shadow check predicts it (`membership_noop`).
 
-## Native mode (M3 /send, M4 /state and /redact, M5 membership)
+## Native mode (M3 /send, M4 /state and /redact, M5 membership, M6 refusals)
 
 `modes.{send,state,redact,membership,join}: native` serve those endpoints in
 the allowlisted rooms (`internal/creator`):
-requester from whoami plus `access_tokens`/`users`, txn dedup, one prev event
+requester from `access_tokens`/`users` (no whoami), txn dedup, one prev event
 only, relation and content validation, build, auth, push rows, then the
 creator's own writes (deletion bump, room participation, push staging) as the
 role `goevent_creator` (`internal/writer`, exactly `writer.Grants`), and
@@ -160,6 +160,56 @@ Each native event is verified against what was persisted
   M5: it had been missed in M3.
 - **Repeated JSON keys fall back** (`duplicate_keys`): Python keeps the last,
   gjson finds the first.
+- **Synapse is not asked who the requester is** (M6, operator: "we must not
+  depend on synapse"). `requester` is `get_user_by_req` on the database:
+  Synapse's token rules (`Mixing Authorization headers...`, `Too many
+  Authorization headers.`, `Invalid Authorization header.`, `Missing access
+  token`), `_query_for_auth`'s join on `COALESCE(puppets_user_id, user_id)`,
+  expiry (`soft_logout: true`), locked accounts, and
+  `mark_access_token_as_used` on a token's first request. That is the one
+  write outside the creator's tables: `UPDATE (used)` on `access_tokens`, and
+  `SELECT (id, used)` for its WHERE; the role cannot read a token. On
+  2026-10-19 5245 of 5306 tokens were not marked used (old ones, whose
+  traffic goes to other Go workers), so falling back for them was no
+  option. Appservice tokens (the registrations' `as_token`), anything
+  pymacaroons could deserialize (guest macaroons need
+  `macaroon_secret_key`), delegated auth (MAS, MSC3861) and
+  `account_validity` are Synapse's. Not reproduced: `_record_request`
+  (`user_ips`, MAU), which goes to main over TCP replication; clients'
+  other requests keep last-seen current.
+- **Refusals are given here, in Synapse's order and words** (M6). A check
+  answers nil, a refusal (status, errcode, message, extra fields) or a
+  fallback (`creator.stop`). A fallback may sit anywhere before the first
+  write (main then decides); a refusal must come after every check Synapse
+  makes before it, so `serve` and `prepare` follow Synapse's order: auth,
+  `parse_json_object_from_request`, the servlet (sticky `parse_integer`,
+  the redact servlet's `redacts`, a member event on `/send` is a 500), the
+  txn lookup, `check_local_user_in_room`, `validate_builder`, the create
+  resend check, `validate_new` (canonical JSON, aliases, retention, ACL, the
+  power levels and mentions schemas), `_validate_event_relation`, the call
+  invite check, state dedup, the writer's redaction checks, size limits,
+  then the auth rules (`pdu.AuthError` now carries Synapse's exact text,
+  status and MSC3848 errcode; `Inexact` ones fall back). Membership:
+  `assert_params_in_dict`, `UserID.from_string` (its TypeErrors are 500s),
+  the 3pid params check, blocked rooms, `Cannot invite this user`,
+  `Invites have been disabled on this server`, then the old-membership
+  refusals.
+- **Python's words need Python's values**: jsonschema messages and some
+  others hold `repr()` of the decoded JSON (`pyRepr`: quotes, `\x`/`\u`
+  escapes, `True`/`None`), and `best_match` (jsonschema 4.26) picks the
+  shallowest error, then the *greatest* path among siblings. Python's
+  `Sequence` makes a string an array (`m.mentions.user_ids: "x"` passes); a
+  non-string in `user_ids` is a TypeError, Synapse's 500. `1E400` is a float
+  infinity that cannot be built into an event: a 500 before any "Bad JSON
+  value: float". Lone surrogate escapes, repeated keys, nesting past 100 and
+  integers past 4300 digits fall back. `internal/creator/testdata/oracle_validator.py`
+  runs Synapse's own validator in its container (read-only) and its output is
+  the test vectors; regenerate it rather than guessing.
+- **Writer-side refusals** (`persist_and_notify_client_events`): redacting
+  the create event (403), an event of another room (400) or a server ACL
+  (403) is refused here, never sent. The writer ratelimits (`rc_message`)
+  before those checks, so a refusal here is not counted there. A redaction
+  of an event we do not hold is sent: the writer checks nothing either.
 - **Presence, not `.get`**: jsonschema and `key in content` treat a present
   `null` as present and invalid; Python's `.get` (`pdu.Get`) reads it as
   absent. Use `pdu.Field` for the former (`m.mentions: null` is Synapse's
@@ -190,12 +240,19 @@ GOEVENT_E2E_PASSWORD=... GOEXPERIMENT=jsonv2 go run ./cmd/goevent-e2e \
   -base https://goevent.aguiarvieira.pt -metrics http://<container ip>:9102/metrics
 ```
 
+Every refusal's body is compared with Synapse's recording,
+`cmd/goevent-e2e/refusals.golden.json` (run IDs, the account and event IDs
+normalised). Record it against a worker that proxies the refusals (shadow, or
+the M5 image) with `-record`; on 2026-10-19 it holds 24 bodies.
+
 Run it against shadow mode first: that is Synapse's own behaviour, and the
 expectations are calibrated on it (57/57 on 2026-10-19, then 57/57 with send,
 state and redact native, 25 native events all verified, power levels, ACL,
 aliases and retention among them; with M5's membership steps 69/69 on
 Synapse, then 69/69 twice with membership and join native too, 31 native
-events, 205 verify checks matched). It never sends a valid tombstone: that
+events, 205 verify checks matched; with M6 70/70 fully native, the 24
+refusal bodies equal to Synapse's, and the only fallback left the create
+event's redaction, since answered natively too). It never sends a valid tombstone: that
 would mark the room as replaced in every client. Membership steps use
 `@goevent-e2e-probe` (no account, no profile) as the target, and the test
 account only joins: **it must never leave TEST7TESTE, which is

@@ -47,6 +47,8 @@ func TestWritesAsTheRole(t *testing.T) {
 		`INSERT INTO local_current_membership (room_id, user_id, event_id, membership) VALUES ('!r:x', '@u:x', '$m', 'join')`,
 		`INSERT INTO state_groups (id, room_id, event_id) VALUES (101, '!r:x', '$a'), (102, '!r:x', '$b')`,
 		`INSERT INTO state_groups_pending_deletion (state_group, insertion_ts) VALUES (101, 1)`,
+		`DELETE FROM access_tokens WHERE id = 7001`,
+		`INSERT INTO access_tokens (id, user_id, token) VALUES (7001, '@u:x', 'tok')`,
 	} {
 		if _, err := a.Exec(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
@@ -115,6 +117,17 @@ func TestWritesAsTheRole(t *testing.T) {
 		t.Error("stored a group on a prev group that does not exist")
 	}
 
+	if err := d.MarkTokenUsed(ctx, 7001); err != nil {
+		t.Fatal(err)
+	}
+	var used bool
+	if err := a.QueryRow(ctx, `SELECT used FROM access_tokens WHERE id = 7001`).Scan(&used); err != nil || !used {
+		t.Errorf("token used %v (%v)", used, err)
+	}
+	if err := d.MarkTokenUsed(ctx, 7002); err == nil {
+		t.Error("marked a token that does not exist")
+	}
+
 	// Nothing else: Synapse's other tables are refused.
 	for _, q := range []string{
 		`INSERT INTO events (event_id, topological_ordering, stream_ordering, room_id, type, processed, outlier) VALUES ('$x', 1, 1, '!r:x', 't', true, false)`,
@@ -122,7 +135,9 @@ func TestWritesAsTheRole(t *testing.T) {
 		`DELETE FROM room_memberships`,
 		`UPDATE state_groups SET room_id = '!other:x'`,
 		`DELETE FROM state_groups_state`,
-		`SELECT count(*) FROM access_tokens`,
+		`SELECT token FROM access_tokens`,
+		`UPDATE access_tokens SET token = 'x' WHERE id = 7001`,
+		`DELETE FROM access_tokens`,
 	} {
 		if _, err := d.pool.Exec(ctx, q); err == nil || !strings.Contains(err.Error(), "permission denied") {
 			t.Errorf("%s: allowed (%v)", q, err)

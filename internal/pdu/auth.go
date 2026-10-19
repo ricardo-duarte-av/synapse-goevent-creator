@@ -116,26 +116,26 @@ func CheckStateIndependentAuthRules(ev *Event, authEvents map[string]*Event) err
 			return raise("unknown auth event " + id)
 		}
 		if ae.RoomID != ev.RoomID {
-			return deny("auth event %s is in room %s", id, ae.RoomID)
+			return denyInexact("auth event %s is in room %s", id, ae.RoomID)
 		}
 		if !ae.IsState() {
 			// (type, None) is never an expected auth type.
-			return deny("unexpected auth_event %s (not state)", id)
+			return denyInexact("unexpected auth_event %s (not state)", id)
 		}
 		k := ae.Key()
 		if prev, dup := authDict[k]; dup {
-			return deny("duplicate auth_events for %v: %s and %s", k, prev, id)
+			return denyInexact("duplicate auth_events for %v: %s and %s", k, prev, id)
 		}
 		if !isExpected[k] {
-			return deny("unexpected auth_event for %v: %s", k, id)
+			return denyInexact("unexpected auth_event for %v: %s", k, id)
 		}
 		if ae.Rejected {
-			return deny("rejected auth event %s", id)
+			return denyInexact("rejected auth event %s", id)
 		}
 		authDict[k] = id
 	}
 	if authDict[createKey] == "" {
-		return deny("no create event in auth events")
+		return deny("No create event in auth events")
 	}
 	return nil
 }
@@ -143,12 +143,12 @@ func CheckStateIndependentAuthRules(ev *Event, authEvents map[string]*Event) err
 // checkCreate is _check_create (:504).
 func checkCreate(ev *Event) error {
 	if len(ev.PrevEvents) > 0 {
-		return deny("create event has prev events")
+		return deny("Create event has prev events")
 	}
 	rv := ev.Room
 	if rv.MSC4291RoomIDsAsHashes {
 		if has(gjson.ParseBytes(ev.JSON), "room_id") {
-			return deny("create event has a room_id")
+			return deny("Create event has a room_id")
 		}
 	} else {
 		senderDomain, err := domainOf(ev.Sender)
@@ -160,7 +160,7 @@ func checkCreate(ev *Event) error {
 			return err
 		}
 		if roomDomain != senderDomain {
-			return deny("creation event's room_id domain does not match sender's")
+			return deny("Creation event's room_id domain does not match sender's")
 		}
 	}
 
@@ -178,11 +178,11 @@ func checkCreate(ev *Event) error {
 	case rvProp.IsArray() || rvProp.IsObject():
 		return raise("room_version is unhashable")
 	default:
-		return deny("room appears to have unsupported version %s", rvProp.Raw)
+		return denyInexact("room appears to have unsupported version %s", rvProp.Raw)
 	}
 
 	if !rv.ImplicitRoomCreator && !has(ev.Content, "creator") {
-		return deny("create event lacks a 'creator' property")
+		return deny("Create event lacks a 'creator' property")
 	}
 	if rv.MSC4289CreatorPower && has(ev.Content, "additional_creators") {
 		v, _ := field(ev.Content, "additional_creators")
@@ -196,17 +196,17 @@ func checkCreate(ev *Event) error {
 // checkValidAdditionalCreators is check_valid_additional_creators (:1298).
 func checkValidAdditionalCreators(v gjson.Result) error {
 	if !v.IsArray() {
-		return deny("additional_creators must be an array")
+		return &AuthError{Msg: "additional_creators must be an array", Status: 400}
 	}
 	for _, e := range v.Array() {
 		if e.Type != gjson.String {
-			return deny("entry in additional_creators is not a string")
+			return &AuthError{Msg: "entry in additional_creators is not a string", Status: 400}
 		}
 		if !userIDIsValid(e.Str) {
-			return deny("entry in additional_creators is not a valid user ID")
+			return &AuthError{Msg: "entry in additional_creators is not a valid user ID", Status: 400}
 		}
 		if utf8.RuneCountInString(e.Str) > 255 || len(e.Str) > 255 {
-			return deny("entry in additional_creators too long")
+			return &AuthError{Msg: "entry in additional_creators too long", Status: 400}
 		}
 	}
 	return nil
@@ -227,7 +227,7 @@ func CheckStateDependentAuthRules(ev *Event, authEvents []*Event) error {
 	}
 	create := auth[createKey]
 	if create == nil {
-		return deny("event %s is missing a create event in auth_events", ev.ID)
+		return deny("Event %s is missing a create event in auth_events.", ev.ID)
 	}
 
 	creating, err := domainOf(create.Sender)
@@ -239,19 +239,19 @@ func CheckStateDependentAuthRules(ev *Event, authEvents []*Event) error {
 		return err
 	}
 	if creating != originating && !canFederate(auth) {
-		return deny("this room has been marked as unfederatable")
+		return deny("This room has been marked as unfederatable.")
 	}
 
 	rv := ev.Room
 	if ev.Type == "m.room.aliases" && rv.SpecialCaseAliasesAuth {
 		if !ev.IsState() {
-			return deny("alias event must be a state event")
+			return deny("Alias event must be a state event")
 		}
 		if *ev.StateKey == "" {
-			return deny("alias event must have non-empty state_key")
+			return deny("Alias event must have non-empty state_key")
 		}
 		if *ev.StateKey != originating {
-			return deny("alias event's state_key does not match sender's domain")
+			return deny("Alias event's state_key does not match sender's domain")
 		}
 		return nil
 	}
@@ -260,7 +260,7 @@ func CheckStateDependentAuthRules(ev *Event, authEvents []*Event) error {
 		return isMembershipChangeAllowed(rv, ev, auth)
 	}
 
-	if err := checkJoinedRoom(auth[StateKey{Type: "m.room.member", StateKey: ev.Sender}], ev.Sender); err != nil {
+	if err := checkJoinedRoom(auth[StateKey{Type: "m.room.member", StateKey: ev.Sender}], ev.Sender, ev.RoomID); err != nil {
 		return err
 	}
 
@@ -274,7 +274,7 @@ func CheckStateDependentAuthRules(ev *Event, authEvents []*Event) error {
 			return err
 		}
 		if userLevel < inviteLevel {
-			return deny("you don't have permission to invite users")
+			return denyUnstable(CodeInsufficientPower, "You don't have permission to invite users")
 		}
 		return nil
 	}
@@ -337,7 +337,7 @@ func isMembershipChangeAllowed(rv *RoomVersion, ev *Event, auth AuthState) error
 
 	create := auth[createKey]
 	if create == nil {
-		return deny("create event missing from auth_events")
+		return deny("Create event missing from auth_events")
 	}
 	creating, err := domainOf(create.Sender)
 	if err != nil {
@@ -348,7 +348,7 @@ func isMembershipChangeAllowed(rv *RoomVersion, ev *Event, auth AuthState) error
 		return err
 	}
 	if creating != targetDomain && !canFederate(auth) {
-		return deny("this room has been marked as unfederatable")
+		return deny("This room has been marked as unfederatable.")
 	}
 
 	memberOf := func(e *Event) (string, bool, error) {
@@ -407,7 +407,7 @@ func isMembershipChangeAllowed(rv *RoomVersion, ev *Event, auth AuthState) error
 			return err
 		}
 		if !ok {
-			return deny("you are not invited to this room")
+			return deny("You are not invited to this room.")
 		}
 		if targetBanned {
 			return deny("%s is banned from the room", target)
@@ -420,7 +420,7 @@ func isMembershipChangeAllowed(rv *RoomVersion, ev *Event, auth AuthState) error
 			return nil
 		}
 		if !callerInRoom {
-			return deny("%s not in room %s", ev.Sender, ev.RoomID)
+			return denyUnstable(CodeNotJoined, "%s not in room %s.", ev.Sender, ev.RoomID)
 		}
 	}
 
@@ -430,27 +430,27 @@ func isMembershipChangeAllowed(rv *RoomVersion, ev *Event, auth AuthState) error
 		case targetBanned:
 			return deny("%s is banned from the room", target)
 		case targetInRoom:
-			return deny("%s is already in the room", target)
+			return denyUnstable(CodeAlreadyJoined, "%s is already in the room.", target)
 		case userLevel < inviteLevel:
-			return deny("you don't have permission to invite users")
+			return denyUnstable(CodeInsufficientPower, "You don't have permission to invite users")
 		}
 	case membership == "join":
 		switch {
 		case ev.Sender != target:
-			return deny("cannot force another user to join")
+			return deny("Cannot force another user to join.")
 		case targetBanned:
-			return deny("you are banned from this room")
+			return deny("You are banned from this room")
 		case isRule("public"):
 		case (rv.RestrictedJoinRule && isRule("restricted")) || (rv.KnockRestrictedJoinRule && isRule("knock_restricted")):
 			if !callerInRoom && !callerInvited {
 				au := get(ev.Content, "join_authorised_via_users_server")
 				if isNone(au) {
-					return deny("join event is missing authorising user")
+					return deny("Join event is missing authorising user.")
 				}
 				if au.Type != gjson.String {
 					return raise("join_authorised_via_users_server is not a string")
 				}
-				if err := checkJoinedRoom(auth[StateKey{Type: "m.room.member", StateKey: au.Str}], au.Str); err != nil {
+				if err := checkJoinedRoom(auth[StateKey{Type: "m.room.member", StateKey: au.Str}], au.Str, ev.RoomID); err != nil {
 					return err
 				}
 				auLevel, err := getUserPowerLevel(au.Str, auth)
@@ -458,65 +458,66 @@ func isMembershipChangeAllowed(rv *RoomVersion, ev *Event, auth AuthState) error
 					return err
 				}
 				if auLevel < inviteLevel {
-					return deny("join event authorised by invalid server")
+					return deny("Join event authorised by invalid server.")
 				}
 			}
 		case isRule("invite") || (rv.KnockJoinRule && isRule("knock")) || (rv.KnockRestrictedJoinRule && isRule("knock_restricted")):
 			if !(callerInRoom || callerInvited) {
-				return deny("you are not invited to this room")
+				return deny("You are not invited to this room.")
 			}
 		default:
-			return deny("you are not allowed to join this room")
+			return deny("You are not allowed to join this room")
 		}
 	case membership == "leave":
 		if targetBanned && userLevel < banLevel {
-			return deny("you cannot unban user %s", target)
+			return denyUnstable(CodeInsufficientPower, "You cannot unban user %s.", target)
 		} else if target != ev.Sender {
 			kickLevel, err := getNamedLevel(auth, "kick", 50)
 			if err != nil {
 				return err
 			}
 			if userLevel < kickLevel || userLevel <= targetLevel {
-				return deny("you cannot kick user %s", target)
+				return denyUnstable(CodeInsufficientPower, "You cannot kick user %s.", target)
 			}
 		}
 	case membership == "ban":
 		if userLevel < banLevel {
-			return deny("you don't have permission to ban")
+			return denyUnstable(CodeInsufficientPower, "You don't have permission to ban")
 		} else if userLevel <= targetLevel {
-			return deny("you don't have permission to ban this user")
+			return denyUnstable(CodeInsufficientPower, "You don't have permission to ban this user")
 		}
 	case rv.KnockJoinRule && membership == "knock":
 		switch {
 		case !isRule("knock") && (!rv.KnockRestrictedJoinRule || !isRule("knock_restricted")):
-			return deny("you don't have permission to knock")
+			return deny("You don't have permission to knock")
 		case target != ev.Sender:
-			return deny("you cannot knock for other users")
+			return deny("You cannot knock for other users")
 		case targetInRoom:
-			return deny("you cannot knock on a room you are already in")
+			return denyUnstable(CodeAlreadyJoined, "You cannot knock on a room you are already in")
 		case callerInvited:
-			return deny("you are already invited to this room")
+			return deny("You are already invited to this room")
 		case targetBanned:
-			return deny("you are banned from this room")
+			return deny("You are banned from this room")
 		}
 	default:
 		// AuthError(500, ...) is still an AuthError.
-		return deny("unknown membership %s", membership)
+		return &AuthError{Msg: "Unknown membership " + membership, Status: 500}
 	}
 	return nil
 }
 
-// checkJoinedRoom is _check_joined_room (:832).
-func checkJoinedRoom(member *Event, userID string) error {
+// checkJoinedRoom is _check_joined_room (:832). Its message holds the
+// member event's Python repr, which is not reproduced.
+func checkJoinedRoom(member *Event, userID, roomID string) error {
 	if member == nil {
-		return deny("user %s not in room", userID)
+		return deny("User %s not in room %s (None)", userID, roomID)
 	}
 	m, err := member.Membership()
 	if err != nil {
 		return err
 	}
 	if m != "join" {
-		return deny("user %s not in room (%s)", userID, m)
+		return denyInexact("User %s not in room %s (%s)", userID, roomID, m)
 	}
 	return nil
 }
@@ -673,13 +674,14 @@ func canSendEvent(ev *Event, auth AuthState) error {
 		return err
 	}
 	if userLevel < sendLevel {
-		return deny("user_level (%d) < send_level (%d)", userLevel, sendLevel)
+		return denyUnstable(CodeInsufficientPower, "You don't have permission to post that to the room. "+
+			"user_level (%d) < send_level (%d)", userLevel, sendLevel)
 	}
 	if ev.StateKey != nil && strings.HasPrefix(*ev.StateKey, "@") && *ev.StateKey != ev.Sender {
 		if ev.Room.MSC3757 {
 			return raise("MSC3757 is not implemented")
 		}
-		return deny("you are not allowed to set others state")
+		return deny("You are not allowed to set others state")
 	}
 	return nil
 }
@@ -717,7 +719,7 @@ func checkRedaction(rv *RoomVersion, ev *Event, auth AuthState) error {
 	if redacter == redactee {
 		return nil
 	}
-	return deny("you don't have permission to redact events")
+	return deny("You don't have permission to redact events")
 }
 
 var intLevelKeys = map[string]bool{
@@ -867,10 +869,10 @@ func checkPowerLevels(rv *RoomVersion, ev *Event, auth AuthState) error {
 			continue
 		}
 		if c.dir == "users" && c.name != ev.Sender && oldLevel != nil && *oldLevel == userLevel {
-			return deny("you don't have permission to remove ops level equal to your own")
+			return deny("You don't have permission to remove ops level equal to your own")
 		}
 		if (oldLevel != nil && *oldLevel > userLevel) || (newLevel != nil && *newLevel > userLevel) {
-			return deny("you don't have permission to add ops level greater than your own")
+			return deny("You don't have permission to add ops level greater than your own")
 		}
 	}
 	return nil

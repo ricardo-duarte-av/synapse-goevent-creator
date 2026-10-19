@@ -48,3 +48,15 @@ func TestLiveRegistrations(t *testing.T) {
 	}
 	t.Logf("%d registrations; exclusive regex: %v", len(hs.AppServiceFiles), re)
 }
+
+func TestTokens(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "reg.yaml")
+	_ = os.WriteFile(f, []byte("as_token: secret\nhs_token: other\n"), 0o600)
+	toks, err := Tokens([]string{f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !toks["secret"] || toks["other"] || len(toks) != 1 {
+		t.Errorf("tokens %v", toks)
+	}
+}

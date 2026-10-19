@@ -22,6 +22,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/allowlist"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/appservice"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/build"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/config"
@@ -334,13 +335,16 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 	d.closers = append(d.closers, w.Close)
 	log.Info().Str("role", writer.Role).Msg("Connected as the write role")
 
+	asTokens, err := appservice.Tokens(hs.AppServiceFiles)
+	if err != nil {
+		return nil, err
+	}
 	repl := replication.NewClient(hs)
 	return creator.New(creator.Options{
 		Store:        d.db,
 		Writer:       w,
 		Persister:    repl,
 		Main:         repl,
-		Auth:         d.authn,
 		Key:          d.key,
 		Push:         d.push,
 		ServerName:   hs.ServerName,
@@ -348,8 +352,12 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		Sticky:       hs.Flag("msc4354_enabled", false),
 		Log:          log,
 
+		AppServiceTokens:       asTokens,
+		DelegatedAuth:          hs.Auth.Delegated,
+		AccountValidity:        hs.Auth.AccountValidity,
 		RedactionAllowedPeriod: hs.RedactionAllowedPeriod,
 		Membership:             hs.Membership,
+		MSC3848:                hs.Flag("msc3848_enabled", false),
 		MSC4293:                hs.Flag("msc4293_enabled", false),
 		MSC4155:                hs.Flag("msc4155_enabled", false),
 	}), nil

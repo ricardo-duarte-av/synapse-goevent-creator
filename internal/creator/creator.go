@@ -8,9 +8,11 @@
 // Anything it does not reproduce exactly is left to Synapse: the request is
 // proxied, untouched, and the reason counted
 // (goevent_native_fallback_total). That decision is always made before the
-// first write, so a proxied request leaves nothing behind. Errors are
-// Synapse's to give too, for the same reason: a request Synapse would refuse
-// is proxied, and Synapse refuses it in its own words.
+// first write, so a proxied request leaves nothing behind. A request Synapse
+// would refuse is refused here, with Synapse's status, errcode and words,
+// at the point in Synapse's order where Synapse refuses it
+// (goevent_native_refusals_total); where the words cannot be reproduced
+// exactly, the request is Synapse's.
 //
 // Each native event is verified afterwards against what the events writer
 // persisted (goevent_native_verify_total).
@@ -28,6 +30,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -36,7 +39,6 @@ import (
 	"maunium.net/go/mautrix/crypto/canonicaljson"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/build"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
@@ -106,6 +108,7 @@ type Store interface {
 
 // Writer is what the creator writes.
 type Writer interface {
+	MarkTokenUsed(ctx context.Context, tokenID int64) error
 	BumpDeletion(ctx context.Context, groups []int64) ([]int64, error)
 	SetRoomParticipation(ctx context.Context, userID, roomID string) error
 	StagePush(ctx context.Context, eventID string, rows []writer.PushRow) error
@@ -118,20 +121,21 @@ type Persister interface {
 	SendClientEvents(ctx context.Context, instance string, entries []json.RawMessage) (int64, string, error)
 }
 
-// Authenticator says who a request is from.
-type Authenticator interface {
-	AuthenticateAs(ctx context.Context, creds auth.Credentials) (auth.Verdict, error)
-}
-
 // Options configure a Creator.
 type Options struct {
 	Store      Store
 	Writer     Writer
 	Persister  Persister
-	Auth       Authenticator
 	Key        *build.Key
 	Push       *pushcalc.Calculator
 	ServerName string
+	// AppServiceTokens are the registrations' as_tokens: their requests
+	// are Synapse's.
+	AppServiceTokens map[string]bool
+	// DelegatedAuth is MAS or MSC3861: tokens are not in the database.
+	DelegatedAuth bool
+	// AccountValidity is account_validity.enabled.
+	AccountValidity bool
 	// EventsWriter is the instance that persists a room's events
 	// (stream_writers.events).
 	EventsWriter func(roomID string) string
@@ -142,6 +146,8 @@ type Options struct {
 	RedactionAllowedPeriod bool
 	// Membership is what update_membership reads from homeserver.yaml.
 	Membership synapsecfg.Membership
+	// MSC3848 is msc3848_enabled: auth refusals carry their new errcode.
+	MSC3848 bool
 	// MSC4293 and MSC4155 are msc4293_enabled (redact_events on kicks and
 	// bans) and msc4155_enabled (invite filtering).
 	MSC4293, MSC4155 bool
@@ -185,6 +191,8 @@ type Outcome struct {
 	Fallback string
 	// Result labels a served request.
 	Result string
+	// Refused is why a request was refused, in Synapse's words.
+	Refused string
 }
 
 func fallback(reason string) Outcome { return Outcome{Fallback: reason} }
@@ -213,6 +221,9 @@ func (c *Creator) Serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	if out.Fallback != "" {
 		fallbacks.WithLabelValues(ep, out.Fallback).Inc()
 	} else {
+		if out.Refused != "" {
+			refusals.WithLabelValues(ep, out.Refused).Inc()
+		}
 		native.WithLabelValues(ep, out.Result).Inc()
 		nativeSeconds.WithLabelValues(ep, out.Result).Observe(c.o.Now().Sub(start).Seconds())
 	}
@@ -249,6 +260,9 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	if req.Endpoint == route.State && r.Method != http.MethodPut {
 		return fallback("method")
 	}
+	if reason := c.configFallback(); reason != "" {
+		return fallback(reason)
+	}
 
 	body, tooLarge, err := readBody(r)
 	switch {
@@ -257,29 +271,27 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	case tooLarge:
 		return fallback("too_large")
 	}
-	if !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() {
-		return fallback("not_object")
-	}
-	if hasDuplicateKeys(gjson.ParseBytes(body)) {
-		return fallback("duplicate_keys")
-	}
-
-	in, reason := c.parse(req, body, q)
-	if reason != "" {
-		return fallback(reason)
-	}
-	content := gjson.ParseBytes(in.content)
-	if reason := c.validate(in, content, req.Room); reason != "" {
-		return fallback(reason)
-	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), c.o.Timeout)
 	defer cancel()
 
-	rq, reason := c.requester(ctx, r)
-	if reason != "" {
+	// The servlet: get_user_by_req, then parse_json_object_from_request.
+	rq, reason, ref := c.requester(ctx, r)
+	switch {
+	case ref != nil:
+		return c.refuse(w, ref)
+	case reason != "":
 		return fallback(reason)
 	}
+	body, st := parseJSONObject(body, false)
+	if st != nil {
+		return c.end(w, st)
+	}
+	in, st := c.parse(ctx, req, body, q)
+	if st != nil {
+		return c.end(w, st)
+	}
+	content := gjson.ParseBytes(in.content)
 
 	unlock := c.locks.lock(req.Room)
 	defer unlock()
@@ -297,9 +309,9 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		}
 	}
 
-	p, dup, reason := c.prepare(ctx, req, rq, in, content)
-	if reason != "" {
-		return fallback(reason)
+	p, dup, st := c.prepare(ctx, req, rq, in, content)
+	if st != nil {
+		return c.end(w, st)
 	}
 	if dup != "" {
 		// deduplicate_state_event: the same state, from the same sender, is
@@ -312,83 +324,137 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 	return c.persist(ctx, w, p)
 }
 
-// parse is the servlet: what the request asks for, or why it is Synapse's.
-func (c *Creator) parse(req route.Request, body []byte, q map[string][]string) (*input, string) {
+// configFallback is what homeserver.yaml configures that the native path
+// does not reproduce: module callbacks (third-party rules, spam checks),
+// auth blocking and the privacy policy.
+func (c *Creator) configFallback() string {
+	switch m := c.o.Membership; {
+	case m.Modules:
+		return "modules"
+	case m.AuthBlocking:
+		return "auth_blocking"
+	case m.ConsentRequired:
+		return "consent"
+	}
+	return ""
+}
+
+// parse is the servlet: what the request asks for, or why it is refused or
+// Synapse's.
+func (c *Creator) parse(ctx context.Context, req route.Request, body []byte, q map[string][]string) (*input, *stop) {
 	in := &input{typ: req.Action, content: body, txn: req.TxnID, room: req.Room}
 	switch req.Endpoint {
 	case route.Send:
 		if c.o.Sticky {
 			if v, ok := q[StickyParam]; ok && len(v) > 0 {
-				// parse_integer: anything else is Synapse's 400.
-				n, err := strconv.ParseInt(v[0], 10, 64)
-				if err != nil {
-					return nil, "bad_sticky"
+				n, s := parseIntegerParam(StickyParam, v[0])
+				if s != nil {
+					return nil, s
 				}
 				in.sticky = &n
 			}
 		}
+		if req.Action == "m.room.member" {
+			// create_and_send_nonmember_event.
+			return nil, (&refusal{reason: "type_member", status: http.StatusInternalServerError, errcode: "M_UNKNOWN",
+				msg: "Tried to send member event through non-member codepath"}).stop()
+		}
 	case route.State:
 		if req.Action == "m.room.member" {
 			// update_membership, not the non-member path.
-			return nil, "type_member"
+			return nil, fb("type_member")
 		}
 		sk := req.StateKey
 		in.stateKey, in.txn = &sk, ""
 	case route.Redact:
-		if c.o.RedactionAllowedPeriod {
-			return nil, "redaction_period"
-		}
 		content := gjson.ParseBytes(body)
+		rvID, err := c.o.Store.RoomVersion(ctx, req.Room)
+		if err != nil {
+			return nil, fb("unknown_room")
+		}
+		rv, ok := pdu.LookupRoomVersion(rvID)
+		if !ok {
+			return nil, fb("room_version")
+		}
+		// MSC2174: "redacts" in content and content["redacts"] != event_id.
+		if r, ok := pdu.Field(content, "redacts"); rv.UpdatedRedactionRules && ok && !(r.Type == gjson.String && r.Str == req.Action) {
+			return nil, badRequest("redacts_mismatch",
+				"Cannot provide a redacts value incoherent with the event_id of the URL parameter", "M_INVALID_PARAM").stop()
+		}
+		if c.o.RedactionAllowedPeriod {
+			return nil, fb("redaction_period")
+		}
 		if pdu.Get(content, "org.matrix.msc3912.with_relations").Exists() {
 			// Synapse strips it and redacts the relations too.
-			return nil, "with_relations"
+			return nil, fb("with_relations")
 		}
 		target := req.Action
 		in.typ, in.redacts = "m.room.redaction", &target
 	default:
-		return nil, "endpoint"
+		return nil, fb("endpoint")
 	}
-	return in, ""
+	return in, nil
 }
 
-// requester identifies the caller as get_user_by_req would, or says why
-// the request is Synapse's.
-func (c *Creator) requester(ctx context.Context, r *http.Request) (*requester, string) {
-	creds := auth.ExtractCredentials(r)
-	if creds.Token == "" {
-		return nil, "unauthenticated"
+// requester identifies the caller as get_user_by_req does
+// (api/auth/internal.py), from the database: a refusal is Synapse's answer,
+// a reason means the request is Synapse's.
+func (c *Creator) requester(ctx context.Context, r *http.Request) (*requester, string, *refusal) {
+	if c.o.DelegatedAuth {
+		// Tokens are the OAuth server's.
+		return nil, "delegated_auth", nil
 	}
-	v, err := c.o.Auth.AuthenticateAs(ctx, creds)
+	token, ref, ok := accessToken(r)
 	switch {
-	case err != nil:
-		return nil, "whoami_error"
-	case !v.Valid:
-		return nil, "unauthenticated"
-	case v.IsGuest:
-		return nil, "guest"
-	case v.DeviceID == "":
-		return nil, "no_device"
+	case !ok:
+		return nil, "token_encoding", nil
+	case ref != nil:
+		return nil, "", ref
+	case c.o.AppServiceTokens[token]:
+		// get_appservice_user, and its masquerading.
+		return nil, "appservice", nil
 	}
-	t, err := c.o.Store.Token(ctx, creds.Token)
+	t, err := c.o.Store.Token(ctx, token)
 	switch {
 	case errors.Is(err, pdustore.ErrNotFound):
-		return nil, "token_not_stored"
+		if mightBeMacaroon(token) {
+			// verify_guest_token needs macaroon_secret_key.
+			return nil, "guest_token", nil
+		}
+		return nil, "", unknownToken("unknown_token", "Invalid access token passed.", false)
 	case err != nil:
-		return nil, "db_error"
-	case t.UserID != v.UserID || t.DeviceID != v.DeviceID:
-		return nil, "token_mismatch"
-	case t.Puppet:
-		return nil, "puppet"
-	case t.ShadowBan:
-		return nil, "shadow_banned"
-	case t.Suspended:
-		return nil, "suspended"
-	case t.Guest, t.AppService:
-		return nil, "guest"
-	case t.Deactivated, t.Locked:
-		return nil, "deactivated"
+		return nil, "db_error", nil
+	case t.ValidUntilMS != nil && *t.ValidUntilMS < c.o.Now().UnixMilli():
+		return nil, "", unknownToken("token_expired", "Access token has expired", true)
 	}
-	return &requester{UserID: v.UserID, DeviceID: v.DeviceID, TokenID: t.ID, Admin: t.Admin}, ""
+	if !t.Used {
+		// mark_access_token_as_used, which Synapse does on every lookup
+		// (cached, so once): the refresh token that issued it is spent.
+		if err := c.o.Writer.MarkTokenUsed(ctx, t.ID); err != nil {
+			c.o.Log.Warn().Err(err).Int64("token_id", t.ID).Msg("Could not mark an access token used")
+			return nil, "db_error", nil
+		}
+	}
+	switch {
+	case t.Locked:
+		return nil, "", userLocked
+	case c.o.AccountValidity:
+		// is_user_expired.
+		return nil, "account_validity", nil
+	case t.Puppet:
+		return nil, "puppet", nil
+	case t.ShadowBan:
+		return nil, "shadow_banned", nil
+	case t.Suspended:
+		return nil, "suspended", nil
+	case t.Guest, t.AppService:
+		return nil, "guest", nil
+	case t.Deactivated:
+		return nil, "deactivated", nil
+	case t.DeviceID == "":
+		return nil, "no_device", nil
+	}
+	return &requester{UserID: t.UserID, DeviceID: t.DeviceID, TokenID: t.ID, Admin: t.Admin}, "", nil
 }
 
 // requester is Requester.serialize (rust/src/types/mod.rs) for a user's own
@@ -433,30 +499,42 @@ type prepared struct {
 	after int64
 }
 
-// prepare builds and checks the event. A reason means Synapse's; dup is the
-// event a state event duplicates.
-func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester, in *input, content gjson.Result) (p *prepared, dup, reason string) {
+// prepare builds and checks the event, in the order Synapse checks it
+// (_create_and_send_nonmember_event_locked, create_event,
+// create_new_client_event, handle_new_client_event). A stop is a refusal
+// or a fallback; dup is the event a state event duplicates.
+func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester, in *input, content gjson.Result) (p *prepared, dup string, st *stop) {
 	rvID, err := c.o.Store.RoomVersion(ctx, req.Room)
 	if err != nil {
-		return nil, "", "unknown_room"
+		return nil, "", fb("unknown_room")
 	}
 	rv, ok := pdu.LookupRoomVersion(rvID)
 	if !ok || rv.EventFormat < 3 {
-		return nil, "", "room_version"
+		return nil, "", fb("room_version")
 	}
 	if partial, err := c.o.Store.PartialState(ctx, req.Room); err != nil {
-		return nil, "", "db_error"
+		return nil, "", fb("db_error")
 	} else if partial {
-		return nil, "", "partial_state"
+		return nil, "", fb("partial_state")
+	}
+	if in.member == nil {
+		// check_local_user_in_room.
+		ms, _, err := c.o.Store.LocalMembership(ctx, rq.UserID, req.Room)
+		if err != nil {
+			return nil, "", fb("db_error")
+		}
+		if ms != "join" {
+			return nil, "", forbidden("not_in_room", fmt.Sprintf("User %s not in room %s", rq.UserID, req.Room)).stop()
+		}
+		if st := validateBuilder(in, content, req.Room); st != nil {
+			return nil, "", st
+		}
 	}
 	if in.redacts != nil && rv.UpdatedRedactionRules {
 		// RoomRedactEventRestServlet: MSC2174 puts redacts in the content.
-		if reason := c.checkRedacts(rv, *in.redacts, content); reason != "" {
-			return nil, "", reason
-		}
 		b, err := withField(in.content, "redacts", *in.redacts)
 		if err != nil {
-			return nil, "", "not_object"
+			return nil, "", fb("not_object")
 		}
 		in.content, content = b, gjson.ParseBytes(b)
 	}
@@ -464,24 +542,31 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	// The stream position first: the push check reads members as of now.
 	maxStream, err := c.o.Store.RoomMaxStream(ctx, req.Room)
 	if err != nil {
-		return nil, "", "db_error"
+		return nil, "", fb("db_error")
 	}
 	prevs, err := c.o.Store.PrevEventsForRoom(ctx, req.Room)
 	if err != nil {
-		return nil, "", "db_error"
+		return nil, "", fb("db_error")
 	}
 	if len(prevs) != 1 {
 		// Several extremities need state resolution, and a new state group
 		// for the result; Synapse does both.
-		return nil, "", "prev_events_" + strconv.Itoa(min(len(prevs), 2))
+		return nil, "", fb("prev_events_" + strconv.Itoa(min(len(prevs), 2)))
+	}
+	if in.typ == "m.room.create" {
+		if in.stateKey != nil {
+			// create_new_client_event: the room has prev events.
+			return nil, "", badRequest("type_create", "Cannot resend m.room.create event", "M_INVALID_PARAM").stop()
+		}
+		return nil, "", fb("type_create")
 	}
 	group, err := c.o.Store.StateGroupForEvent(ctx, prevs[0])
 	if err != nil {
-		return nil, "", "no_state_group"
+		return nil, "", fb("no_state_group")
 	}
 	before, err := c.o.Store.StateForGroup(ctx, group)
 	if err != nil {
-		return nil, "", "db_error"
+		return nil, "", fb("db_error")
 	}
 	// MSC4284: Synapse asks the room's policy server to sign every local
 	// event it sends through the non-member path, and refuses what it calls
@@ -489,57 +574,59 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	if in.member == nil {
 		for _, t := range []string{"m.room.policy", "org.matrix.msc4284.policy"} {
 			if _, ok := before[pdu.StateKey{Type: t}]; ok {
-				return nil, "", "policy_server"
+				return nil, "", fb("policy_server")
 			}
 		}
 	}
-	if in.typ == "m.call.invite" {
-		// create_new_client_event: no call invites in public rooms.
-		if public, err := c.publicRoom(ctx, before); err != nil {
-			return nil, "", "db_error"
-		} else if public {
-			return nil, "", "call_invite_public"
-		}
-	}
 	if in.member != nil {
-		id, reason := c.checkMembership(ctx, req, rq, in, rv, before)
-		if reason != "" || id != "" {
-			return nil, id, reason
+		id, st := c.checkMembership(ctx, req, rq, in, rv, before)
+		if st != nil {
+			return nil, "", st
+		}
+		if id != "" {
+			return nil, id, nil
 		}
 	}
 
+	// validate_new, then _validate_event_relation and the call invite
+	// check.
+	if st := c.validateNew(in, in.content, content); st != nil {
+		return nil, "", st
+	}
+	if st := c.checkRelation(ctx, req, rq, in.typ, content); st != nil {
+		return nil, "", st
+	}
+	if in.typ == "m.call.invite" {
+		if public, err := c.publicRoom(ctx, before); err != nil {
+			return nil, "", fb("db_error")
+		} else if public {
+			return nil, "", forbidden("call_invite_public", "Call invites are not allowed in public rooms.").stop()
+		}
+	}
+
+	// handle_new_client_event: dedup, then the auth rules.
 	if in.stateKey != nil {
 		if id, err := c.duplicate(ctx, before, in, rq); err != nil {
-			return nil, "", "db_error"
+			return nil, "", fb("db_error")
 		} else if id != "" {
 			in.dedupKind = "state_dedup"
-			return nil, id, ""
+			return nil, id, nil
 		}
 	}
 	if in.redacts != nil {
-		if reason := c.checkRedaction(ctx, req, *in.redacts); reason != "" {
-			return nil, "", reason
+		if st := c.checkRedaction(ctx, req, *in.redacts); st != nil {
+			return nil, "", st
 		}
 	}
 
 	depths, err := c.o.Store.Depths(ctx, prevs)
 	if err != nil || len(depths) != len(prevs) {
-		return nil, "", "db_error"
+		return nil, "", fb("db_error")
 	}
-	if reason := c.checkRelation(ctx, req, rq, in.typ, content); reason != "" {
-		return nil, "", reason
-	}
-
-	// validate_canonicaljson, on the content alone first: a float or an
-	// out-of-range integer would otherwise fail to build at all.
-	if err := pdu.CheckPDUJSON([]byte(`{"type":"","depth":0,"content":`+string(in.content)+`}`), rv); err != nil {
-		return nil, "", "invalid_json"
-	}
-
 	proto := &pdu.Event{Type: in.typ, Sender: rq.UserID, RoomID: req.Room, StateKey: in.stateKey, Content: content, Room: rv}
 	authIDs, err := pdu.ComputeAuthEvents(rv, proto, before)
 	if err != nil {
-		return nil, "", "auth_events"
+		return nil, "", fb("auth_events")
 	}
 	ts := c.o.Now().UnixMilli()
 	bp := build.Proto{
@@ -558,7 +645,7 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	}
 	built, err := build.Build(bp, c.o.Key)
 	if err != nil {
-		return nil, "", "build"
+		return nil, "", fb("build")
 	}
 
 	// calculate_context_info: a state event replacing another says so.
@@ -570,41 +657,61 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	}
 	withUnsigned, err := withUnsignedFields(built.JSON, ts, replaces)
 	if err != nil {
-		return nil, "", "build"
+		return nil, "", fb("build")
 	}
-	// validate_new and _check_size_limits.
+	// The whole event's canonical JSON: ours, past the content.
 	if err := pdu.CheckPDUJSON(withUnsigned, rv); err != nil {
-		return nil, "", "invalid_json"
+		return nil, "", fb("invalid_json")
 	}
+	// validate_event_for_room_version: _check_size_limits.
 	if se := pdu.CheckPDUSize(withUnsigned); se != nil {
-		return nil, "", "too_large"
+		return nil, "", tooLarge(se).stop()
 	}
 	ev, err := pdu.ParseEvent(built.JSON, built.ID, rv, false)
 	if err != nil {
-		return nil, "", "build"
+		return nil, "", fb("build")
 	}
 	if se := pdu.CheckFieldSizes(ev); se != nil {
-		return nil, "", "too_large"
+		return nil, "", tooLarge(se).stop()
 	}
 
 	if err := c.checkAuth(ctx, ev); err != nil {
-		// Synapse refuses it, with its own words.
-		return nil, "", "auth_rules"
+		return nil, "", c.authRefusal(err)
 	}
 
 	deltas, err := c.contextDeltas(ctx, group)
 	if err != nil {
-		return nil, "", "db_error"
+		return nil, "", fb("db_error")
 	}
 	var rows map[string]pushcalc.Row
 	if c.o.Push != nil {
 		if rows, err = c.o.Push.Rows(ctx, ev, before); err != nil {
-			return nil, "", "push"
+			return nil, "", fb("push")
 		}
 	}
 
 	return &prepared{req: req, in: in, rq: rq, rv: rv, ev: ev, built: built, ts: ts, group: group,
-		deltas: deltas, before: before, replaces: replaces, maxStream: maxStream, push: rows}, "", ""
+		deltas: deltas, before: before, replaces: replaces, maxStream: maxStream, push: rows}, "", nil
+}
+
+// tooLarge is EventSizeError: 413 M_TOO_LARGE.
+func tooLarge(se *pdu.SizeError) *refusal {
+	return &refusal{reason: "too_large", status: http.StatusRequestEntityTooLarge, errcode: "M_TOO_LARGE", msg: se.Msg}
+}
+
+// authRefusal is check_auth_rules_from_context's AuthError, as the client
+// sees it. Anything else the auth checks raise, and a message not written as
+// Synapse writes it, is Synapse's.
+func (c *Creator) authRefusal(err error) *stop {
+	var ae *pdu.AuthError
+	if !errors.As(err, &ae) || ae.Inexact {
+		return fb("auth_rules")
+	}
+	f := &refusal{reason: "auth_rules", status: ae.Status, errcode: "M_FORBIDDEN", msg: ae.Msg}
+	if ae.Unstable != "" && c.o.MSC3848 {
+		f.extra = map[string]any{"org.matrix.msc3848.unstable.errcode": ae.Unstable}
+	}
+	return f.stop()
 }
 
 // duplicate is deduplicate_state_event: the event of this key in the state
@@ -630,15 +737,6 @@ func (c *Creator) duplicate(ctx context.Context, before pdu.StateMap, in *input,
 	return prevID, nil
 }
 
-// checkRedacts is the redact servlet's refusal of a body whose redacts is
-// not the event in the path.
-func (c *Creator) checkRedacts(rv *pdu.RoomVersion, target string, content gjson.Result) string {
-	if r := pdu.Get(content, "redacts"); r.Exists() && !(r.Type == gjson.String && r.Str == target) {
-		return "redacts_mismatch"
-	}
-	return ""
-}
-
 // withField sets one top-level field of a JSON object.
 func withField(raw []byte, key string, value any) ([]byte, error) {
 	var m map[string]json.RawMessage
@@ -655,26 +753,28 @@ func withField(raw []byte, key string, value any) ([]byte, error) {
 
 // checkRedaction is the refusals persist_and_notify_client_events makes on
 // the events writer, made here before any write: a redaction is never sent
-// that the writer would refuse.
-func (c *Creator) checkRedaction(ctx context.Context, req route.Request, target string) string {
+// that the writer would refuse. The writer ratelimits first (rc_message, the
+// one limiter that counts): a refusal given here is not counted there.
+func (c *Creator) checkRedaction(ctx context.Context, req route.Request, target string) *stop {
 	evs, _, err := c.o.Store.GetStoredEvents(ctx, []string{target})
 	if err != nil {
-		return "db_error"
+		return fb("db_error")
 	}
 	orig := evs[target]
-	if orig == nil {
-		// Unknown to us: the writer decides on what it holds.
-		return "redaction_target_unknown"
+	if orig == nil || orig.Reason != "" {
+		// get_event(allow_rejected=False, allow_none=True): nothing to
+		// check; the redaction waits for its target.
+		return nil
 	}
 	switch {
 	case orig.Type == "m.room.create":
-		return "redact_create"
-	case orig.Type == "m.room.server_acl":
-		return "redact_acl"
+		return forbidden("redact_create", "Redacting create events is not permitted").stop()
 	case orig.RoomID != req.Room:
-		return "redact_other_room"
+		return badRequest("redact_other_room", "Cannot redact event from a different room").stop()
+	case orig.Type == "m.room.server_acl":
+		return forbidden("redact_acl", "Redacting server ACL events is not permitted").stop()
 	}
-	return ""
+	return nil
 }
 
 // persist writes what the creator writes, then sends the event to its
@@ -851,57 +951,62 @@ func (c *Creator) contextDeltas(ctx context.Context, group int64) ([]stateGroupD
 	return out, nil
 }
 
-// checkRelation is _validate_event_relation: a reason when Synapse would
-// refuse the relation.
-func (c *Creator) checkRelation(ctx context.Context, req route.Request, rq *requester, eventType string, content gjson.Result) string {
+// checkRelation is _validate_event_relation.
+func (c *Creator) checkRelation(ctx context.Context, req route.Request, rq *requester, eventType string, content gjson.Result) *stop {
 	rel := pdu.Get(content, "m.relates_to")
 	if !rel.Exists() || !pyTruthy(rel) || !rel.IsObject() {
-		return ""
+		return nil
 	}
 	relType, parent := pdu.Get(rel, "rel_type"), pdu.Get(rel, "event_id")
 	if relType.Type != gjson.String || parent.Type != gjson.String {
-		return ""
+		return nil
+	}
+	if surrogateEscape.MatchString(rel.Raw) {
+		return fb("surrogate_escape")
 	}
 	room, err := c.o.Store.EventRoom(ctx, parent.Str)
 	switch {
 	case err == nil:
 		if room != req.Room {
-			return "relation_other_room"
+			return badRequest("relation_other_room", "Relations must be in the same room").stop()
 		}
 	case errors.Is(err, pdustore.ErrNotFound):
 		target, err := c.o.Store.IsRelationTarget(ctx, parent.Str)
 		if err != nil {
-			return "db_error"
+			return fb("db_error")
 		}
 		if !target {
-			return "relation_unknown"
+			return badRequest("relation_unknown", "Can't send relation to unknown event").stop()
 		}
 	default:
-		return "db_error"
+		return fb("db_error")
 	}
 	switch relType.Str {
 	case "m.annotation":
 		key := pdu.Get(rel, "key")
-		if key.Type != gjson.String || len([]rune(key.Str)) > 500 {
-			return "annotation_key"
+		if key.Type != gjson.String {
+			return badRequest("annotation_key", "Missing aggregation key").stop()
+		}
+		if utf8.RuneCountInString(key.Str) > 500 {
+			return badRequest("annotation_key", "Aggregation key is too long").stop()
 		}
 		dup, err := c.o.Store.HasAnnotated(ctx, parent.Str, eventType, rq.UserID, key.Str)
 		if err != nil {
-			return "db_error"
+			return fb("db_error")
 		}
 		if dup {
-			return "duplicate_annotation"
+			return badRequest("duplicate_annotation", "Can't send same reaction twice", "M_DUPLICATE_ANNOTATION").stop()
 		}
 	case "m.thread":
 		has, err := c.o.Store.HasRelation(ctx, parent.Str)
 		if err != nil {
-			return "db_error"
+			return fb("db_error")
 		}
 		if has {
-			return "thread_from_relation"
+			return badRequest("thread_from_relation", "Cannot start threads from an event with a relation").stop()
 		}
 	}
-	return ""
+	return nil
 }
 
 // checkAuth runs the auth rules against the event's auth events.
@@ -924,87 +1029,6 @@ func (c *Creator) checkAuth(ctx context.Context, ev *pdu.Event) error {
 		return err
 	}
 	return pdu.CheckStateDependentAuthRules(ev, list)
-}
-
-// validate is validate_builder and validate_new for the event, plus the
-// types the non-member path refuses. A reason means Synapse's. Synapse runs
-// these before deduplicating a state event, and so do we.
-func (c *Creator) validate(in *input, content gjson.Result, room string) string {
-	state := in.stateKey != nil
-	switch in.typ {
-	case "m.room.member":
-		// The non-member path refuses it on /send; on /state it is
-		// update_membership's.
-		if in.member == nil {
-			return "type_member"
-		}
-	case "m.room.create":
-		return "type_create"
-	case "m.room.power_levels":
-		if reason := validatePowerLevels(content); reason != "" {
-			return reason
-		}
-	case "m.room.server_acl":
-		if reason := validateServerACL(in.content, c.o.ServerName); reason != "" {
-			return reason
-		}
-	case "m.room.aliases":
-		if reason := validateAliases(content); reason != "" {
-			return reason
-		}
-	case "m.room.retention":
-		if reason := validateRetention(state, content); reason != "" {
-			return reason
-		}
-	case "m.room.policy", "org.matrix.msc4284.policy":
-		return "policy_server"
-	case "m.room.topic", "m.room.name", "m.room.tombstone":
-		if !state {
-			// validate_builder insists these are state events.
-			return "type_state_only"
-		}
-		switch in.typ {
-		case "m.room.topic":
-			if pdu.Get(content, "topic").Type != gjson.String {
-				return "invalid_topic"
-			}
-		case "m.room.name":
-			if pdu.Get(content, "name").Type != gjson.String {
-				return "invalid_name"
-			}
-		case "m.room.tombstone":
-			if reason := validateTombstone(content, room); reason != "" {
-				return reason
-			}
-		}
-	case "m.room.message":
-		for _, k := range []string{"body", "msgtype"} {
-			if pdu.Get(content, k).Type != gjson.String {
-				return "invalid_message"
-			}
-		}
-	}
-	// `if "m.mentions" in event.content`, then MENTIONS_SCHEMA: presence,
-	// null included, is what both test.
-	if m, ok := pdu.Field(content, "m.mentions"); ok {
-		if !m.IsObject() {
-			return "invalid_mentions"
-		}
-		if u, ok := pdu.Field(m, "user_ids"); ok {
-			if !u.IsArray() {
-				return "invalid_mentions"
-			}
-			for _, x := range u.Array() {
-				if x.Type != gjson.String {
-					return "invalid_mentions"
-				}
-			}
-		}
-		if r, ok := pdu.Field(m, "room"); ok && r.Type != gjson.True && r.Type != gjson.False {
-			return "invalid_mentions"
-		}
-	}
-	return ""
 }
 
 // withUnsignedFields adds unsigned as Synapse fills it before sending the

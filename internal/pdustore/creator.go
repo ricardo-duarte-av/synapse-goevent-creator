@@ -120,20 +120,31 @@ func (s *Store) ReadOnly(ctx context.Context) (bool, error) {
 	return v == "on", nil
 }
 
-const qTokenInfo = `SELECT t.id, t.user_id, COALESCE(t.device_id, ''), t.puppets_user_id IS NOT NULL,
+// qTokenInfo is _query_for_auth (storage/databases/main/registration.py),
+// plus the user flags the requester and the native path need.
+const qTokenInfo = `SELECT t.id, u.name, t.user_id, COALESCE(t.device_id, ''), t.puppets_user_id IS NOT NULL,
+		t.valid_until_ms, COALESCE(t.used, false),
 		COALESCE(u.shadow_banned, false), COALESCE(u.suspended, false), u.is_guest <> 0,
 		u.deactivated <> 0, COALESCE(u.locked, false), u.appservice_id IS NOT NULL, COALESCE(u.admin, 0) <> 0
-	FROM access_tokens t INNER JOIN users u ON u.name = t.user_id
+	FROM access_tokens t INNER JOIN users u ON u.name = COALESCE(t.puppets_user_id, t.user_id)
 	WHERE t.token = $1`
 
-// TokenInfo is what get_user_by_access_token knows about a token, beyond
-// whoami's answer: the token's ID, which the requester carries, and the
-// user's flags.
+// TokenInfo is what get_user_by_access_token knows about a token: the
+// token's ID, which the requester carries, its validity, and the user's
+// flags.
 type TokenInfo struct {
-	ID          int64
-	UserID      string
-	DeviceID    string
-	Puppet      bool
+	ID int64
+	// UserID is the user the token acts as; Owner is the token's own user,
+	// the authenticated entity. They differ for a puppet token.
+	UserID   string
+	Owner    string
+	DeviceID string
+	Puppet   bool
+	// ValidUntilMS is valid_until_ms: nil for a token that never expires.
+	ValidUntilMS *int64
+	// Used is access_tokens.used: Synapse marks a token used on its first
+	// request (mark_access_token_as_used).
+	Used        bool
 	ShadowBan   bool
 	Suspended   bool
 	Guest       bool
@@ -144,12 +155,12 @@ type TokenInfo struct {
 	Admin bool
 }
 
-// Token looks up an access token Synapse has already accepted. ErrNotFound
-// for a token not in access_tokens (an appservice's, or a guest macaroon).
+// Token is get_user_by_access_token's database lookup. ErrNotFound for a
+// token not in access_tokens (an appservice's, a guest macaroon, or none).
 func (s *Store) Token(ctx context.Context, token string) (*TokenInfo, error) {
 	var t TokenInfo
-	err := s.pool.QueryRow(ctx, qTokenInfo, token).Scan(&t.ID, &t.UserID, &t.DeviceID, &t.Puppet,
-		&t.ShadowBan, &t.Suspended, &t.Guest, &t.Deactivated, &t.Locked, &t.AppService, &t.Admin)
+	err := s.pool.QueryRow(ctx, qTokenInfo, token).Scan(&t.ID, &t.UserID, &t.Owner, &t.DeviceID, &t.Puppet,
+		&t.ValidUntilMS, &t.Used, &t.ShadowBan, &t.Suspended, &t.Guest, &t.Deactivated, &t.Locked, &t.AppService, &t.Admin)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

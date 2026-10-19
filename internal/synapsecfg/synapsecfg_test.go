@@ -233,7 +233,7 @@ func TestLiveHomeserverYAML(t *testing.T) {
 	}
 	t.Logf("server_name=%s track_presence=%v writers=%+v notaries=%v",
 		cfg.ServerName, cfg.TrackPresence, cfg.Writers, cfg.TrustedKeyServers)
-	t.Logf("membership=%+v", cfg.Membership)
+	t.Logf("membership=%+v auth=%+v", cfg.Membership, cfg.Auth)
 	for _, l := range [][]string{cfg.Writers.Typing, cfg.Writers.Receipts, cfg.Writers.ToDevice,
 		cfg.Writers.Presence, cfg.Writers.DeviceLists} {
 		for _, name := range l {
@@ -359,5 +359,26 @@ allow_per_room_profiles: false
 	}
 	if !m.Modules || !m.ConsentRequired || !m.AuthBlocking || !m.AllowPerRoomProfiles || m.ServerNoticesMXID != "" {
 		t.Errorf("got %+v", m)
+	}
+}
+
+func TestAuthSettings(t *testing.T) {
+	for in, want := range map[string]Auth{
+		"": {},
+		"matrix_authentication_service: {enabled: true}\n":  {Delegated: true},
+		"matrix_authentication_service: {enabled: false}\n": {},
+		"account_validity:\n  enabled: true\n":              {AccountValidity: true},
+	} {
+		a, err := authSettings([]byte(in), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a != want {
+			t.Errorf("%q: got %+v, want %+v", in, a, want)
+		}
+	}
+	a, _ := authSettings(nil, map[string]any{"msc3861": map[string]any{"enabled": true}})
+	if !a.Delegated {
+		t.Error("msc3861 is delegated auth")
 	}
 }

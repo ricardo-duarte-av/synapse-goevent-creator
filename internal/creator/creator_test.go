@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/json/jsontext"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,6 @@ import (
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/auth"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/build"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdustore"
@@ -52,7 +52,7 @@ type fakeRoom struct {
 func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
 	t.Helper()
 	f := &fakeRoom{events: map[string]*pdustore.StoredEvent{}, state: pdu.StateMap{},
-		token: &pdustore.TokenInfo{ID: 42, UserID: user, DeviceID: "DEV"}}
+		token: &pdustore.TokenInfo{ID: 42, UserID: user, DeviceID: "DEV", Used: true}}
 	rv, _ := pdu.LookupRoomVersion("11")
 	var prev []string
 	depth := int64(1)
@@ -184,6 +184,10 @@ type fakeWriter struct {
 	groupDelta []writer.StateRow
 }
 
+func (w *fakeWriter) MarkTokenUsed(context.Context, int64) error {
+	w.calls = append(w.calls, "token_used")
+	return nil
+}
 func (w *fakeWriter) BumpDeletion(_ context.Context, g []int64) ([]int64, error) {
 	w.calls = append(w.calls, "bump")
 	return nil, nil
@@ -220,15 +224,6 @@ func (p *fakePersister) SendClientEvents(_ context.Context, instance string, ent
 	return 99, p.answer, nil
 }
 
-type fakeAuth struct{}
-
-func (fakeAuth) AuthenticateAs(_ context.Context, c auth.Credentials) (auth.Verdict, error) {
-	if c.Token != "tok" {
-		return auth.Verdict{Valid: false}, nil
-	}
-	return auth.Verdict{Valid: true, UserID: user, DeviceID: "DEV"}, nil
-}
-
 type harness struct {
 	c    *Creator
 	f    *fakeRoom
@@ -252,7 +247,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	h := &harness{f: newFakeRoom(t, key), w: &fakeWriter{}, p: &fakePersister{}, main: &fakeMain{}}
 	lim := synapsecfg.Ratelimit{PerSecond: 1, Burst: 10}
-	h.c = New(Options{Store: h.f, Writer: h.w, Persister: h.p, Auth: fakeAuth{}, Key: key,
+	h.c = New(Options{Store: h.f, Writer: h.w, Persister: h.p, Key: key,
 		ServerName: "example.org", EventsWriter: func(string) string { return "persister" }, Sticky: true,
 		Membership: synapsecfg.Membership{AllowPerRoomProfiles: true, IncludeProfileDataOnInvite: true,
 			JoinsLocal: lim, JoinsPerRoom: lim, InvitesPerRoom: lim, InvitesPerUser: lim, InvitesPerIssuer: lim},
@@ -371,7 +366,16 @@ func TestStickyIsSent(t *testing.T) {
 	}
 }
 
-// Every fallback is decided before the first write.
+// stopped is why a request was not served: its fallback, or "refused:" and
+// the refusal.
+func stopped(out Outcome) string {
+	if out.Refused != "" {
+		return "refused:" + out.Refused
+	}
+	return out.Fallback
+}
+
+// Every fallback and refusal is decided before the first write.
 func TestFallbacksWriteNothing(t *testing.T) {
 	cases := map[string]func(h *harness) (string, string){
 		"two extremities": func(h *harness) (string, string) {
@@ -379,40 +383,42 @@ func TestFallbacksWriteNothing(t *testing.T) {
 			return `{"msgtype":"m.text","body":"hi"}`, "prev_events_2"
 		},
 		"not joined": func(h *harness) (string, string) {
-			h.f.token = &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV"}
+			h.f.token = &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", Used: true}
 			delete(h.f.state, pdu.StateKey{Type: "m.room.member", StateKey: user})
-			return `{"msgtype":"m.text","body":"hi"}`, "auth_rules"
+			return `{"msgtype":"m.text","body":"hi"}`, "refused:not_in_room"
 		},
 		"shadow banned": func(h *harness) (string, string) {
-			h.f.token = &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", ShadowBan: true}
+			h.f.token = &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", Used: true, ShadowBan: true}
 			return `{"msgtype":"m.text","body":"hi"}`, "shadow_banned"
 		},
 		"partial state": func(h *harness) (string, string) {
 			h.f.partial = true
 			return `{"msgtype":"m.text","body":"hi"}`, "partial_state"
 		},
-		"bad message":   func(*harness) (string, string) { return `{"msgtype":"m.text"}`, "invalid_message" },
-		"not an object": func(*harness) (string, string) { return `[1]`, "not_object" },
+		"bad message":   func(*harness) (string, string) { return `{"msgtype":"m.text"}`, "refused:invalid_message" },
+		"not an object": func(*harness) (string, string) { return `[1]`, "refused:not_object" },
 		"bad mentions": func(*harness) (string, string) {
-			return `{"msgtype":"m.text","body":"x","m.mentions":{"room":1}}`, "invalid_mentions"
+			return `{"msgtype":"m.text","body":"x","m.mentions":{"room":1}}`, "refused:invalid_mentions"
 		},
 		"unknown relation": func(*harness) (string, string) {
-			return `{"msgtype":"m.text","body":"x","m.relates_to":{"rel_type":"m.replace","event_id":"$nope"}}`, "relation_unknown"
+			return `{"msgtype":"m.text","body":"x","m.relates_to":{"rel_type":"m.replace","event_id":"$nope"}}`, "refused:relation_unknown"
 		},
-		"float": func(*harness) (string, string) { return `{"msgtype":"m.text","body":"x","n":1.5}`, "invalid_json" },
+		"float": func(*harness) (string, string) {
+			return `{"msgtype":"m.text","body":"x","n":1.5}`, "refused:non_canonical_json"
+		},
 	}
 	for name, setup := range cases {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t)
 			body, want := setup(h)
 			rec, out := h.send(t, http.MethodPut, "t1", body)
-			if out.Fallback != want {
-				t.Fatalf("fallback %q, want %q", out.Fallback, want)
+			if stopped(out) != want {
+				t.Fatalf("stopped %q, want %q", stopped(out), want)
 			}
 			if len(h.w.calls) != 0 || len(h.p.entries) != 0 {
 				t.Errorf("a fallback wrote: %v, %d entries", h.w.calls, len(h.p.entries))
 			}
-			if rec.Code != 200 || rec.Body.Len() != 0 {
+			if out.Fallback != "" && (rec.Code != 200 || rec.Body.Len() != 0) {
 				t.Errorf("a fallback answered the client: %d %s", rec.Code, rec.Body)
 			}
 		})
@@ -458,10 +464,11 @@ func TestRequestsLeftToSynapse(t *testing.T) {
 	for _, tc := range []struct{ path, auth, want string }{
 		{"/send/m.room.message/t?org.matrix.msc4140.delay=1000", "Bearer tok", "delayed"},
 		{"/send/m.room.message/t?user_id=@ghost:example.org", "Bearer tok", "appservice"},
-		{"/send/m.room.message/t", "", "unauthenticated"},
-		{"/send/m.room.message/t", "Bearer nope", "unauthenticated"},
+		{"/send/m.room.message/t", "Bearer as-secret", "appservice"},
+		{"/send/m.room.message/t", "Bearer MDAxY2xvY2F0aW9uIGV4YW1wbGUub3JnCg", "guest_token"},
 	} {
 		h := newHarness(t)
+		h.c.o.AppServiceTokens = map[string]bool{"as-secret": true}
 		r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+tc.path, strings.NewReader(`{"msgtype":"m.text","body":"hi"}`))
 		if tc.auth != "" {
 			r.Header.Set("Authorization", tc.auth)
@@ -469,6 +476,80 @@ func TestRequestsLeftToSynapse(t *testing.T) {
 		out := h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
 		if out.Fallback != tc.want {
 			t.Errorf("%s: fallback %q, want %q", tc.path, out.Fallback, tc.want)
+		}
+	}
+}
+
+// get_user_by_req's refusals, in Synapse's words.
+func TestAuthRefusals(t *testing.T) {
+	past := int64(1)
+	for name, tc := range map[string]struct {
+		query   string
+		headers []string
+		token   *pdustore.TokenInfo
+		status  int
+		body    string
+	}{
+		"no token": {"", nil, nil, 401, `{"errcode":"M_MISSING_TOKEN","error":"Missing access token"}`},
+		"both": {"?access_token=tok", []string{"Bearer tok"}, nil, 401,
+			`{"errcode":"M_MISSING_TOKEN","error":"Mixing Authorization headers and access_token query parameters."}`},
+		"two headers": {"", []string{"Bearer tok", "Bearer tok"}, nil, 401,
+			`{"errcode":"M_MISSING_TOKEN","error":"Too many Authorization headers."}`},
+		"not bearer": {"", []string{"Basic tok"}, nil, 401, `{"errcode":"M_MISSING_TOKEN","error":"Invalid Authorization header."}`},
+		"unknown": {"", []string{"Bearer syt_dGVzdA_abcdefghijklmnopqrst_0AbCdE"}, nil, 401,
+			`{"errcode":"M_UNKNOWN_TOKEN","error":"Invalid access token passed.","soft_logout":false}`},
+		"empty query": {"?access_token=", nil, nil, 401,
+			`{"errcode":"M_UNKNOWN_TOKEN","error":"Invalid access token passed.","soft_logout":false}`},
+		"expired": {"", []string{"Bearer tok"}, &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", Used: true, ValidUntilMS: &past}, 401,
+			`{"errcode":"M_UNKNOWN_TOKEN","error":"Access token has expired","soft_logout":true}`},
+		"locked": {"", []string{"Bearer tok"}, &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", Used: true, Locked: true}, 401,
+			`{"errcode":"M_USER_LOCKED","error":"User account has been locked","soft_logout":true}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			if tc.token != nil {
+				h.f.token = tc.token
+			}
+			r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+"/send/m.room.message/t"+tc.query,
+				strings.NewReader(`{"msgtype":"m.text","body":"hi"}`))
+			for _, v := range tc.headers {
+				r.Header.Add("Authorization", v)
+			}
+			rec := httptest.NewRecorder()
+			out := h.c.Serve(rec, r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "t"})
+			if out.Result != "refused" || rec.Code != tc.status || rec.Body.String() != tc.body {
+				t.Fatalf("%+v %d %s", out, rec.Code, rec.Body)
+			}
+			if len(h.w.calls) != 0 {
+				t.Errorf("wrote %v", h.w.calls)
+			}
+		})
+	}
+}
+
+// A token's first request marks it used, as Synapse does.
+func TestFirstRequestMarksTokenUsed(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.Used = false
+	if _, out := h.send(t, http.MethodPut, "t1", `{"msgtype":"m.text","body":"hi"}`); out.Result != "created" {
+		t.Fatalf("%+v", out)
+	}
+	if h.w.calls[0] != "token_used" {
+		t.Errorf("writes %v", h.w.calls)
+	}
+}
+
+func TestMightBeMacaroon(t *testing.T) {
+	for tok, want := range map[string]bool{
+		"syt_dGVzdA_abcdefghijklmnopqrst_0AbCdE": false,
+		"MDAxY2xvY2F0aW9uIGV4YW1wbGUub3JnCg":     true, // "001clocation example.org"
+		"AgEL":                                   true, // v2: version byte 2
+		`{"v":2}`:                                true,
+		"":                                       false,
+		"abcde":                                  false, // 4n+1 characters
+	} {
+		if got := mightBeMacaroon(tok); got != want {
+			t.Errorf("%q: %v, want %v", tok, got, want)
 		}
 	}
 }
@@ -488,22 +569,45 @@ func TestFallbackLeavesBodyReadable(t *testing.T) {
 	}
 }
 
-func TestValidateSend(t *testing.T) {
-	for _, tc := range []struct{ typ, content, want string }{
-		{"m.room.message", `{"msgtype":"m.text","body":"x"}`, ""},
-		{"m.room.message", `{"msgtype":"m.text","body":1}`, "invalid_message"},
-		{"m.reaction", `{}`, ""},
-		{"m.room.member", `{}`, "type_member"},
-		{"m.room.topic", `{"topic":"x"}`, "type_state_only"},
-		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{"user_ids":["@a:b"],"room":true}}`, ""},
-		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{"user_ids":[1]}}`, "invalid_mentions"},
-		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":[]}`, "invalid_mentions"},
-		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":null}`, "invalid_mentions"},
-		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{"user_ids":null}}`, "invalid_mentions"},
-		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{}}`, ""},
-	} {
-		if got := (&Creator{o: Options{ServerName: "example.org"}}).validate(&input{typ: tc.typ}, gjson.Parse(tc.content), room); got != tc.want {
-			t.Errorf("%s %s: %q, want %q", tc.typ, tc.content, got, tc.want)
+// TestValidatorAgainstSynapse runs validate_builder and validate_new's port
+// over vectors Synapse answered itself (testdata/oracle_validator.py).
+func TestValidatorAgainstSynapse(t *testing.T) {
+	raw, err := os.ReadFile("testdata/oracle_validator.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases [][]json.RawMessage
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatal(err)
+	}
+	c := &Creator{o: Options{ServerName: "example.org"}}
+	for _, cs := range cases {
+		var typ, content string
+		var sk *string
+		var want []any
+		_ = json.Unmarshal(cs[0], &typ)
+		_ = json.Unmarshal(cs[1], &sk)
+		_ = json.Unmarshal(cs[2], &content)
+		_ = json.Unmarshal(cs[3], &want)
+		in := &input{typ: typ, stateKey: sk, content: []byte(content)}
+		v := gjson.Parse(content)
+		st := validateBuilder(in, v, room)
+		if st == nil {
+			st = c.validateNew(in, in.content, v)
+		}
+		name := fmt.Sprintf("%s %v %s", typ, sk != nil, content)
+		switch {
+		case want == nil && st != nil:
+			t.Errorf("%s: Synapse accepts it, we %+v %+v", name, st.fallback, st.ref)
+		case want != nil && st == nil:
+			t.Errorf("%s: Synapse refuses it (%v), we accept it", name, want)
+		case want != nil && st.ref == nil:
+			t.Errorf("%s: Synapse refuses it (%v), we fall back (%s)", name, want, st.fallback)
+		case want != nil:
+			got := []any{float64(st.ref.status), st.ref.errcode, st.ref.msg}
+			if fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("%s:\n got  %v\n want %v", name, got, want)
+			}
 		}
 	}
 }
@@ -594,20 +698,20 @@ func TestStateFallbacks(t *testing.T) {
 		typ, key, body, want string
 	}{
 		{"m.room.member", "@x:example.org", `{"membership":"join"}`, "type_member"},
-		{"m.room.power_levels", "", `{"users":{"@u:example.org":"100"}}`, "invalid_power_levels"},
-		{"m.room.server_acl", "", `{"allow":["*"],"deny":["example.org"]}`, "acl_denies_us"},
-		{"m.room.create", "", `{}`, "type_create"},
-		{"m.room.topic", "", `{"topic":1}`, "invalid_topic"},
-		{"m.room.name", "", `{}`, "invalid_name"},
-		{"m.room.tombstone", "", `{"replacement_room":"` + room + `"}`, "invalid_tombstone"},
-		{"m.room.tombstone", "", `{}`, "invalid_tombstone"},
-		{"m.room.retention", "", `{"min_lifetime":10,"max_lifetime":5}`, "invalid_retention"},
-		{"m.room.aliases", "example.org", `{"aliases":["#` + strings.Repeat("a", 300) + `:example.org"]}`, "alias_too_long"},
+		{"m.room.power_levels", "", `{"users":{"@u:example.org":"100"}}`, "refused:invalid_power_levels"},
+		{"m.room.server_acl", "", `{"allow":["*"],"deny":["example.org"]}`, "refused:acl_denies_us"},
+		{"m.room.create", "", `{}`, "refused:type_create"},
+		{"m.room.topic", "", `{"topic":1}`, "refused:invalid_topic"},
+		{"m.room.name", "", `{}`, "refused:invalid_name"},
+		{"m.room.tombstone", "", `{"replacement_room":"` + room + `"}`, "refused:invalid_tombstone"},
+		{"m.room.tombstone", "", `{}`, "refused:invalid_tombstone"},
+		{"m.room.retention", "", `{"min_lifetime":10,"max_lifetime":5}`, "refused:invalid_retention"},
+		{"m.room.aliases", "example.org", `{"aliases":["#` + strings.Repeat("a", 300) + `:example.org"]}`, "refused:alias_too_long"},
 	} {
 		h := newHarness(t)
 		_, out := h.put(t, stateReq(tc.typ, tc.key), "/state/"+tc.typ+"/"+tc.key, tc.body)
-		if out.Fallback != tc.want {
-			t.Errorf("%s: fallback %q, want %q", tc.typ, out.Fallback, tc.want)
+		if stopped(out) != tc.want {
+			t.Errorf("%s: stopped %q, want %q", tc.typ, stopped(out), tc.want)
 		}
 		if len(h.w.calls) != 0 {
 			t.Errorf("%s: wrote %v", tc.typ, h.w.calls)
@@ -652,9 +756,8 @@ func TestNativeRedaction(t *testing.T) {
 func TestRedactionFallbacks(t *testing.T) {
 	h := newHarness(t)
 	for name, tc := range map[string]struct{ target, body, want string }{
-		"create event":    {h.f.create, `{}`, "redact_create"},
-		"unknown target":  {"$nope", `{}`, "redaction_target_unknown"},
-		"redacts differs": {h.f.topic, `{"redacts":"$other"}`, "redacts_mismatch"},
+		"create event":    {h.f.create, `{}`, "refused:redact_create"},
+		"redacts differs": {h.f.topic, `{"redacts":"$other"}`, "refused:redacts_mismatch"},
 		"with relations":  {h.f.topic, `{"org.matrix.msc3912.with_relations":["m.thread"]}`, "with_relations"},
 	} {
 		h := newHarness(t)
@@ -666,8 +769,8 @@ func TestRedactionFallbacks(t *testing.T) {
 			target = h.f.topic
 		}
 		_, out := h.put(t, redactReq(target, "r"), "/redact/x/r", tc.body)
-		if out.Fallback != tc.want {
-			t.Errorf("%s: fallback %q, want %q", name, out.Fallback, tc.want)
+		if stopped(out) != tc.want {
+			t.Errorf("%s: stopped %q, want %q", name, stopped(out), tc.want)
 		}
 		if len(h.w.calls) != 0 {
 			t.Errorf("%s: wrote %v", name, h.w.calls)
@@ -675,40 +778,28 @@ func TestRedactionFallbacks(t *testing.T) {
 	}
 }
 
-func TestContentValidators(t *testing.T) {
-	big := strconv.FormatInt(1<<53, 10)
-	for _, tc := range []struct {
-		name, reason string
-		got          string
-	}{
-		{"pl ok", "", validatePowerLevels(gjson.Parse(`{"ban":50,"users":{"@a:b":100},"events":{"m.room.name":50},"notifications":{"room":50},"x":"anything"}`))},
-		{"pl negative ok", "", validatePowerLevels(gjson.Parse(`{"users_default":-10}`))},
-		{"pl string", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"ban":"50"}`))},
-		{"pl bool", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"kick":true}`))},
-		{"pl null", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"redact":null}`))},
-		{"pl too big", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"ban":` + big + `}`))},
-		{"pl users not object", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"users":[]}`))},
-		{"pl user string", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"users":{"@a:b":"1"}}`))},
-		{"acl ok", "", validateServerACL([]byte(`{"allow":["*"],"deny":["evil.example"]}`), "example.org")},
-		{"acl allows nobody", "acl_denies_us", validateServerACL([]byte(`{"allow":[]}`), "example.org")},
-		{"acl no allow key", "acl_denies_us", validateServerACL([]byte(`{}`), "example.org")},
-		{"acl glob deny", "acl_denies_us", validateServerACL([]byte(`{"allow":["*"],"deny":["*.org"]}`), "example.org")},
-		{"aliases ok", "", validateAliases(gjson.Parse(`{"aliases":["#a:b"]}`))},
-		{"aliases absent", "", validateAliases(gjson.Parse(`{}`))},
-		{"aliases string", "invalid_aliases", validateAliases(gjson.Parse(`{"aliases":"#a:b"}`))},
-		{"aliases null", "invalid_aliases", validateAliases(gjson.Parse(`{"aliases":null}`))},
-		{"aliases 255 runes", "", validateAliases(gjson.Parse(`{"aliases":["` + strings.Repeat("é", 255) + `"]}`))},
-		{"aliases 256 runes", "alias_too_long", validateAliases(gjson.Parse(`{"aliases":["` + strings.Repeat("é", 256) + `"]}`))},
-		{"retention ok", "", validateRetention(true, gjson.Parse(`{"min_lifetime":1,"max_lifetime":5}`))},
-		{"retention empty", "", validateRetention(true, gjson.Parse(`{}`))},
-		{"retention null", "", validateRetention(true, gjson.Parse(`{"max_lifetime":null}`))},
-		{"retention not state", "retention_not_state", validateRetention(false, gjson.Parse(`{}`))},
-		{"retention bool", "invalid_retention", validateRetention(true, gjson.Parse(`{"min_lifetime":true}`))},
-		{"retention string", "invalid_retention", validateRetention(true, gjson.Parse(`{"max_lifetime":"5"}`))},
-		{"tombstone ok", "", validateTombstone(gjson.Parse(`{"replacement_room":"!new:example.org"}`), room)},
+func TestServerACLValidator(t *testing.T) {
+	for acl, refused := range map[string]bool{
+		`{"allow":["*"],"deny":["evil.example"]}`: false,
+		`{"allow":[]}`:                     true,
+		`{"allow":["*"],"deny":["*.org"]}`: true,
 	} {
-		if tc.got != tc.reason {
-			t.Errorf("%s: %q, want %q", tc.name, tc.got, tc.reason)
+		st := validateServerACL([]byte(acl), "example.org")
+		if (st != nil && st.ref != nil) != refused {
+			t.Errorf("%s: %+v", acl, st)
 		}
+	}
+}
+
+// A redaction of an event we do not hold is sent: the writer checks nothing
+// either, and applies it when the event arrives.
+func TestRedactionOfUnknownEvent(t *testing.T) {
+	h := newHarness(t)
+	rec, out := h.put(t, redactReq("$unknown", "r1"), "/redact/x/r1", `{}`)
+	if out.Result != "created" || rec.Code != 200 {
+		t.Fatalf("%+v %d %s", out, rec.Code, rec.Body)
+	}
+	if got := gjson.GetBytes(h.p.entries[0], "event.content.redacts").Str; got != "$unknown" {
+		t.Errorf("redacts %q", got)
 	}
 }
