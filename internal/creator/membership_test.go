@@ -3,11 +3,13 @@ package creator
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
 
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
 )
 
@@ -152,10 +154,7 @@ func TestMembershipFallbacks(t *testing.T) {
 		"user_id number":        {nil, memberReq("ban", ""), `{"user_id":1}`, "refused:bad_user_id"},
 		"3pid invite":           {nil, memberReq("invite", ""), `{"medium":"email","address":"a@b"}`, "refused:3pid_invite"},
 		"3pid invite, complete": {nil, memberReq("invite", ""), `{"medium":"email","address":"a@b","id_server":"x","id_access_token":"y"}`, "3pid_invite"},
-		"per-room name":         {nil, route.Request{Endpoint: route.Join, Room: room}, `{"displayname":"x"}`, "per_room_profile"},
-		"membership in body": {nil, route.Request{Endpoint: route.Join, Room: room}, `{"membership":"join"}`,
-			"membership_in_body"},
-		"third party signed": {nil, memberReq("join", ""), `{"third_party_signed":{}}`, "third_party_signed"},
+		"third party signed":    {nil, memberReq("join", ""), `{"third_party_signed":{}}`, "third_party_signed"},
 		"invite config": {func(h *harness) { h.f.accountData = map[string]bool{other + " " + invitePermissionConfig: true} },
 			memberReq("invite", ""), `{"user_id":"` + other + `"}`, "invite_config"},
 		"blocked room":  {func(h *harness) { h.f.blocked = true }, memberReq("join", ""), ``, "refused:room_blocked"},
@@ -229,5 +228,119 @@ func TestRepeatedKeyIsTheLast(t *testing.T) {
 	e := gjson.ParseBytes(h.p.entries[0])
 	if e.Get("event.state_key").Str != other || e.Get("event.content").Raw != `{"membership":"leave","reason":"b"}` {
 		t.Errorf("%s %s", e.Get("event.state_key").Raw, e.Get("event.content").Raw)
+	}
+}
+
+// A shadow-banned invite is pretended; other membership goes through.
+func TestShadowBannedMembership(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.ShadowBan = true
+	rec, out := h.member(t, memberReq("invite", ""), `{"user_id":"`+other+`"}`)
+	if out.Result != "shadow_banned" || rec.Body.String() != "{}" || len(h.p.entries) != 0 {
+		t.Fatalf("%+v %s", out, rec.Body)
+	}
+	h.f.addState(t, "m.room.member", other, `{"membership":"join"}`)
+	if _, out := h.member(t, memberReq("kick", ""), `{"user_id":"`+other+`"}`); out.Result != "created" {
+		t.Errorf("kick: %+v", out)
+	}
+	// The requester says so.
+	if gjson.GetBytes(h.p.entries[0], "requester.shadow_banned").Raw != "true" {
+		t.Errorf("requester %s", gjson.GetBytes(h.p.entries[0], "requester").Raw)
+	}
+}
+
+// A guest joins only where guest_access is can_join.
+func TestGuestJoin(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.Guest, h.f.token.UserID = true, "@g:example.org"
+	rec, out := h.member(t, memberReq("join", ""), ``)
+	if out.Refused != "guest" || rec.Code != 403 {
+		t.Fatalf("%+v %s", out, rec.Body)
+	}
+}
+
+func stateMemberReq(target string) route.Request {
+	return route.Request{Endpoint: route.State, Write: true, Room: room, Action: "m.room.member", StateKey: target}
+}
+
+func (h *harness) stateMember(t *testing.T, target, body string) (*httptest.ResponseRecorder, Outcome) {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+"/state/m.room.member/"+target, strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer tok")
+	rec := httptest.NewRecorder()
+	return rec, h.c.Serve(rec, r, stateMemberReq(target))
+}
+
+// A per-room nickname through the state servlet: the body is the content,
+// the global avatar fills in what it leaves out, and the answer is the
+// event ID.
+func TestStateMemberPerRoomName(t *testing.T) {
+	h := newHarness(t)
+	h.f.profiles = map[string][2]*string{user: {str("Global"), str("mxc://example.org/a")}}
+	rec, out := h.stateMember(t, user, `{"membership":"join","displayname":"Room nick"}`)
+	if out.Result != "created" {
+		t.Fatalf("%+v %s", out, rec.Body)
+	}
+	e := gjson.ParseBytes(h.p.entries[0])
+	if got := e.Get("event.content").Raw; got != `{"avatar_url":"mxc://example.org/a","displayname":"Room nick","membership":"join"}` {
+		t.Errorf("content %s", got)
+	}
+	if gjson.Get(rec.Body.String(), "event_id").Str != e.Get("event.event_id").Str && gjson.Get(rec.Body.String(), "event_id").Str == "" {
+		t.Errorf("answer %s", rec.Body)
+	}
+}
+
+// update_membership_locked's own no-op: the same sender, membership and
+// content, compared as Python compares (true == 1).
+func TestStateMemberNoop(t *testing.T) {
+	h := newHarness(t)
+	h.f.addState(t, "m.room.member", user, `{"membership":"join","displayname":"n","x":1}`)
+	old := h.f.state[pdu.StateKey{Type: "m.room.member", StateKey: user}]
+	rec, out := h.stateMember(t, user, `{"membership":"join","displayname":"n","x":true}`)
+	if out.Result != "membership_noop" || gjson.Get(rec.Body.String(), "event_id").Str != old {
+		t.Fatalf("%+v %s", out, rec.Body)
+	}
+	if len(h.p.entries) != 0 {
+		t.Error("a no-op wrote")
+	}
+}
+
+func TestStateMemberRefusals(t *testing.T) {
+	long := strings.Repeat("a", 257)
+	for body, want := range map[string]string{
+		`{}`:                     `400 {"errcode":"M_UNKNOWN","error":"Invalid membership (must be a string)"}`,
+		`{"membership":1}`:       `400 {"errcode":"M_UNKNOWN","error":"Invalid membership (must be a string)"}`,
+		`{"membership":"dance"}`: `400 {"errcode":"M_UNKNOWN","error":"Invalid membership key"}`,
+		`{"membership":"join","displayname":"` + long + `"}`: `400 {"errcode":"M_BAD_JSON","error":"Displayname is too long (max 256)"}`,
+		`{"membership":"join","displayname":5}`:              `500 {"errcode":"M_UNKNOWN","error":"Internal server error"}`,
+		`{"membership":"join","displayname":0}`:              ``,
+		``:                                                   `400 {"errcode":"M_NOT_JSON","error":"Content not JSON."}`,
+	} {
+		h := newHarness(t)
+		rec, out := h.stateMember(t, user, body)
+		got := ""
+		if out.Refused != "" {
+			got = strconv.Itoa(rec.Code) + " " + rec.Body.String()
+		}
+		if got != want {
+			t.Errorf("%.60s: %+v %q, want %q", body, out, got, want)
+		}
+	}
+	h := newHarness(t)
+	rec, out := h.stateMember(t, "nobody", `{"membership":"join"}`)
+	if out.Refused != "bad_user_id" || !strings.Contains(rec.Body.String(), "Expected UserID string to start with '@'") {
+		t.Errorf("%+v %s", out, rec.Body)
+	}
+}
+
+// A per-room name on /join is served too.
+func TestJoinWithPerRoomName(t *testing.T) {
+	h := newHarness(t)
+	rec, out := h.member(t, route.Request{Endpoint: route.Join, Write: true, Room: room}, `{"displayname":"x"}`)
+	if out.Result != "created" {
+		t.Fatalf("%+v %s", out, rec.Body)
+	}
+	if got := gjson.GetBytes(h.p.entries[0], "event.content").Raw; got != `{"displayname":"x","membership":"join"}` {
+		t.Errorf("content %s", got)
 	}
 }

@@ -8,6 +8,8 @@
   "refuse invalid JSON": "400 {\"errcode\":\"M_NOT_JSON\",\"error\":\"Content not JSON.\"}",
   "refuse invite of banned user": "403 {\"errcode\":\"M_BAD_STATE\",\"error\":\"Cannot invite user who was banned\"}",
   "refuse kick of absent user": "403 {\"errcode\":\"M_FORBIDDEN\",\"error\":\"The target user is not in the room\"}",
+  "refuse member state with a bad membership": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"Invalid membership key\"}",
+  "refuse member state without membership": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"Invalid membership (must be a string)\"}",
   "refuse message without body": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"'body' not in content\"}",
   "refuse no token": "401 {\"errcode\":\"M_MISSING_TOKEN\",\"error\":\"Missing access token\"}",
   "refuse non-object": "400 {\"errcode\":\"M_BAD_JSON\",\"error\":\"Content must be a JSON object.\"}",

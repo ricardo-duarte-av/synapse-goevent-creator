@@ -221,6 +221,26 @@ Each native event is verified against what was persisted
   integers past 4300 digits fall back. `internal/creator/testdata/oracle_validator.py`
   runs Synapse's own validator in its container (read-only) and its output is
   the test vectors; regenerate it rather than guessing.
+- **Every kind of requester whose token is in the database is served**:
+  shadow-banned (a non-member event or an invite is pretended, after
+  Synapse's 1-10 s pause, with `generate_fake_event_id`'s `$` and 43
+  letters, remembered for a retried transaction as `HttpTransactionCache`
+  would; other membership goes through, per-room profiles dropped),
+  suspended (MSC3823's `M_USER_SUSPENDED` refusals: only leaving, and
+  redacting one's own events), guests (no redactions, only join and leave,
+  joins where `guest_access` is `can_join`), puppet tokens (the puppet's
+  owner is `authenticated_entity`) and tokens without a device (no txn
+  lookup, no `device_id` in the metadata).
+- **`PUT /state/m.room.member/{user}` is membership** (the state servlet
+  calls `update_membership` with the body as content and its membership as
+  the action): Element's per-room nicknames. Per-room `displayname` and
+  `avatar_url` are served (`len(v or "")` checks, a TypeError being a 500;
+  with `max_avatar_size` or `allowed_avatar_mimetypes` set the avatar is
+  the media repository's to judge, and main's), and the global profile fills
+  in only what the content leaves out. `update_membership_locked`'s own
+  no-op (same sender, membership, and content compared as Python dicts, so
+  `true == 1`) answers with the old event (`membership_noop`); for the
+  membership servlet it never matches, the content having no membership.
 - **Writer-side refusals** (`persist_and_notify_client_events`): redacting
   the create event (403), an event of another room (400) or a server ACL
   (403) is refused here, never sent. The writer ratelimits (`rc_message`)
@@ -268,7 +288,8 @@ aliases and retention among them; with M5's membership steps 69/69 on
 Synapse, then 69/69 twice with membership and join native too, 31 native
 events, 205 verify checks matched; with M6 70/70 fully native, the 24
 refusal bodies equal to Synapse's, and the only fallback left the create
-event's redaction, since answered natively too). It never sends a valid tombstone: that
+event's redaction, since answered natively too; then 75/75 on Synapse and
+76/76 fully native with the fork and per-room name steps, 26 refusal bodies). It never sends a valid tombstone: that
 would mark the room as replaced in every client. Membership steps use
 `@goevent-e2e-probe` (no account, no profile) as the target, and the test
 account only joins: **it must never leave TEST7TESTE, which is

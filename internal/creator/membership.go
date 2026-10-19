@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 
@@ -46,8 +47,14 @@ type memberInput struct {
 	// membership is the effective membership: kick and unban are leave.
 	membership string
 	target     string
-	// join answers {"room_id"}; the other actions {}.
-	join bool
+	// join answers {"room_id"}; the other actions {}; fromState, the
+	// state servlet, {"event_id"}.
+	join      bool
+	fromState bool
+	// content is the content being built, and compare the content
+	// update_membership_locked compares with the old member event's.
+	content map[string]json.RawMessage
+	compare []byte
 	// leftFrom is the target's membership before a leave, once known.
 	leftFrom string
 }
@@ -73,8 +80,11 @@ func (c *Creator) limiters() *membershipLimiters {
 // serveMembership serves the membership servlets.
 func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	q := r.URL.Query()
-	if q.Has("user_id") || q.Has("device_id") {
+	if q.Has("user_id") || q.Has("device_id") || (req.Endpoint == route.State && q.Has("ts")) {
 		return fallback("appservice")
+	}
+	if req.Endpoint == route.State && q.Has(DelayParam) {
+		return fallback("delayed")
 	}
 	if reason := c.configFallback(); reason != "" {
 		// user_may_invite, user_may_join_room, check_event_allowed.
@@ -103,24 +113,39 @@ func (c *Creator) serveMembership(w http.ResponseWriter, r *http.Request, req ro
 	// it did, before anything else is looked at.
 	var txnKey string
 	if req.TxnID != "" {
-		txnKey = r.URL.EscapedPath() + "\x00" + rq.UserID + "\x00" + rq.DeviceID
+		txnKey = rq.txnKey(r)
 		if c.txns.seenAt(txnKey, c.o.Now()) {
 			writeMembershipAnswer(w, req)
 			return Outcome{Result: "txn_cached"}
 		}
 	}
+	if rq.Guest && req.Endpoint == route.Membership && req.Action != "join" && req.Action != "leave" {
+		return c.refuse(w, forbidden("guest", "Guest access not allowed"))
+	}
 
-	body, st := parseJSONObject(body, true)
+	// The state servlet takes no empty body.
+	body, st := parseJSONObject(body, req.Endpoint != route.State)
 	if st != nil {
 		return c.end(w, st)
 	}
-	in, st := c.parseMembership(ctx, req, rq, body)
+	in, st := c.parseMembership(req, rq, body)
 	if st != nil {
 		return c.end(w, st)
 	}
 
 	if out, limited := c.ratelimitMembership(ctx, w, req, rq, in.member); limited {
 		return out
+	}
+	if rq.ShadowBanned && in.member.action == "invite" {
+		// update_membership: ShadowBanError, and the servlet pretends.
+		c.shadowPause(ctx)
+		if in.member.fromState {
+			writeEventID(w, fakeEventID())
+		} else {
+			writeMembershipAnswer(w, req)
+		}
+		c.txns.add(txnKey, c.o.Now())
+		return Outcome{Result: "shadow_banned"}
 	}
 	if st := c.checkMembershipRequest(ctx, req, rq, in); st != nil {
 		return c.end(w, st)
@@ -199,26 +224,39 @@ func targetUserID(v gjson.Result) (string, *stop) {
 	return "", internalError("bad_user_id").stop()
 }
 
-// parseMembership is the servlet and the content update_membership_locked
-// builds, or why the request is Synapse's.
-func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *requester, body []byte) (*input, *stop) {
+// parseMembership is the servlets: RoomMembershipRestServlet's action and
+// body, JoinRoomAliasServlet's body as the content, or
+// RoomStateEventRestServlet's for m.room.member, whose body is the content
+// and its membership the action.
+func (c *Creator) parseMembership(req route.Request, rq *requester, body []byte) (*input, *stop) {
 	b := gjson.ParseBytes(body)
-	m := &memberInput{action: req.Action, target: rq.UserID}
-	content := map[string]json.RawMessage{}
-
-	if req.Endpoint == route.Join {
-		// JoinRoomAliasServlet: the body is the content.
-		m.action, m.join = "join", true
+	m := &memberInput{action: req.Action, target: rq.UserID, content: map[string]json.RawMessage{}}
+	whole := func() {
 		b.ForEach(func(k, v gjson.Result) bool {
-			content[k.Str] = json.RawMessage(v.Raw)
+			m.content[k.Str] = json.RawMessage(v.Raw)
 			return true
 		})
-		if _, ok := content["membership"]; ok {
-			// Compared with == against the old content before membership is
-			// set: a dict comparison, 1 == True and all.
-			return nil, fb("membership_in_body")
+	}
+
+	switch req.Endpoint {
+	case route.Join:
+		m.action, m.join = "join", true
+		whole()
+	case route.State:
+		// `content.get("membership", None)`, then
+		// UserID.from_string(state_key).
+		v := pdu.Get(b, "membership")
+		if v.Type != gjson.String {
+			return nil, badRequest("invalid_membership", "Invalid membership (must be a string)").stop()
 		}
-	} else {
+		key, _ := json.Marshal(req.StateKey)
+		target, st := targetUserID(gjson.ParseBytes(key))
+		if st != nil {
+			return nil, st
+		}
+		m.action, m.target, m.fromState = v.Str, target, true
+		whole()
+	default:
 		if m.action == "invite" {
 			_, medium := pdu.Field(b, "medium")
 			_, address := pdu.Field(b, "address")
@@ -249,62 +287,139 @@ func (c *Creator) parseMembership(ctx context.Context, req route.Request, rq *re
 		}
 		m.join = m.action == "join"
 		if v, ok := pdu.Field(b, "reason"); ok {
-			content["reason"] = json.RawMessage(v.Raw)
+			m.content["reason"] = json.RawMessage(v.Raw)
 		}
 		if c.o.MSC4293 {
 			if v, ok := pdu.Field(b, msc4293RedactEvents); ok {
-				content[msc4293RedactEvents] = json.RawMessage(v.Raw)
+				m.content[msc4293RedactEvents] = json.RawMessage(v.Raw)
 			}
 		}
 	}
-	if v := pdu.Get(b, "third_party_signed"); v.Exists() && v.Type != gjson.Null {
-		return nil, fb("third_party_signed")
+	if req.Endpoint != route.State {
+		if v := pdu.Get(b, "third_party_signed"); v.Exists() && v.Type != gjson.Null {
+			return nil, fb("third_party_signed")
+		}
 	}
 
 	m.membership = m.action
 	if m.action == "kick" || m.action == "unban" {
 		m.membership = "leave"
 	}
+	sk := m.target
+	return &input{typ: "m.room.member", stateKey: &sk, txn: req.TxnID, room: req.Room, member: m}, nil
+}
 
-	// update_membership_locked: per-room profiles are kept unless the
-	// server says otherwise, then checked for length and, for an avatar,
-	// against the media repository. Only /join's body can carry them.
-	_, dn := content["displayname"]
-	_, av := content["avatar_url"]
-	if dn || av {
-		return nil, fb("per_room_profile")
+// membershipList is Membership.LIST.
+var membershipList = map[string]bool{"invite": true, "join": true, "knock": true, "leave": true, "ban": true}
+
+// memberContent is the content update_membership_locked builds: per-room
+// profiles kept unless the server says otherwise (or the requester is
+// shadow-banned), checked for length and, with media limits configured, by
+// the media repository; the authorising user dropped; the target's global
+// profile for joins and, when configured, invites, where the content does
+// not set it.
+func (c *Creator) memberContent(ctx context.Context, rq *requester, in *input) *stop {
+	m := in.member
+	content := m.content
+	sn := c.o.Membership.ServerNoticesMXID
+	if (!c.o.Membership.AllowPerRoomProfiles && (sn == "" || rq.UserID != sn)) || rq.ShadowBanned {
+		delete(content, "displayname")
+		delete(content, "avatar_url")
+	}
+	// `len(content.get(k) or "")`.
+	for _, f := range []struct {
+		key, msg string
+		max      int
+	}{{"displayname", "Displayname is too long (max 256)", 256}, {"avatar_url", "Avatar URL is too long (max 1000)", 1000}} {
+		v, ok := content[f.key]
+		if !ok {
+			continue
+		}
+		n, st := pyLenOrEmpty(gjson.ParseBytes(v))
+		if st != nil {
+			return st
+		}
+		if n > f.max {
+			return badRequest("profile_too_long", f.msg, "M_BAD_JSON").stop()
+		}
+	}
+	if v, ok := content["avatar_url"]; ok && gjson.ParseBytes(v).Type != gjson.Null && c.o.Membership.AvatarLimits {
+		// check_avatar_size_and_mime_type reads the media repository.
+		if gjson.ParseBytes(v).Str != "" || gjson.ParseBytes(v).Type != gjson.String {
+			return fb("avatar_check")
+		}
 	}
 	delete(content, authorisingUser)
+	if !membershipList[m.membership] {
+		return badRequest("invalid_membership", "Invalid membership key").stop()
+	}
+	if m.membership == "knock" {
+		return fb("knock")
+	}
 
-	// Profile data for joins and knocks, and invites when configured.
 	if m.membership == "join" || (m.membership == "invite" && c.o.Membership.IncludeProfileDataOnInvite) {
-		if !c.isMine(m.target) {
-			// A federation profile query, whose failure is swallowed.
-			return nil, fb("remote_profile")
-		}
-		dn, av, ok, err := c.o.Store.Profile(ctx, m.target)
-		if err != nil {
-			return nil, fb("db_error")
-		}
-		// get_displayname raises for a missing profile, and the try around
-		// both lookups leaves both out.
-		if ok {
-			if dn != nil {
-				content["displayname"], _ = json.Marshal(*dn)
+		_, hasDN := content["displayname"]
+		_, hasAV := content["avatar_url"]
+		if !hasDN || !hasAV {
+			if !c.isMine(m.target) {
+				// A federation profile query, whose failure is swallowed.
+				return fb("remote_profile")
 			}
-			if av != nil {
-				content["avatar_url"], _ = json.Marshal(*av)
+			dn, av, ok, err := c.o.Store.Profile(ctx, m.target)
+			if err != nil {
+				return fb("db_error")
+			}
+			// get_displayname and get_avatar_url raise for a missing
+			// profile; the try around both leaves the rest out.
+			if ok {
+				if !hasDN && dn != nil {
+					content["displayname"], _ = json.Marshal(*dn)
+				}
+				if !hasAV && av != nil {
+					content["avatar_url"], _ = json.Marshal(*av)
+				}
 			}
 		}
 	}
-	content["membership"], _ = json.Marshal(m.membership)
-	raw, err := json.Marshal(content)
+	// The content as update_membership_locked compares it, then as
+	// _local_membership_update sends it.
+	cmp, err := json.Marshal(content)
 	if err != nil {
-		return nil, fb("not_object")
+		return fb("not_object")
 	}
+	m.compare = cmp
+	final := make(map[string]json.RawMessage, len(content)+1)
+	for k, v := range content {
+		final[k] = v
+	}
+	final["membership"], _ = json.Marshal(m.membership)
+	if in.content, err = json.Marshal(final); err != nil {
+		return fb("not_object")
+	}
+	return nil
+}
 
-	sk := m.target
-	return &input{typ: "m.room.member", stateKey: &sk, content: raw, txn: req.TxnID, room: req.Room, member: m}, nil
+// pyLenOrEmpty is len(v or ""): 0 for anything falsy, a string's
+// characters, a list's or a dict's entries, and len()'s TypeError for the
+// rest.
+func pyLenOrEmpty(v gjson.Result) (int, *stop) {
+	if !pyTruthy(v) {
+		return 0, nil
+	}
+	switch {
+	case v.Type == gjson.String:
+		if surrogateEscape.MatchString(v.Raw) {
+			return 0, fb("surrogate_escape")
+		}
+		return utf8.RuneCountInString(v.Str), nil
+	case v.IsArray():
+		return len(v.Array()), nil
+	case v.IsObject():
+		n := 0
+		v.ForEach(func(_, _ gjson.Result) bool { n++; return true })
+		return n, nil
+	}
+	return 0, internalError("profile_type").stop()
 }
 
 // ratelimitMembership is update_membership's ratelimiting: joins by a user
@@ -401,6 +516,16 @@ func (c *Creator) limitExceeded(ctx context.Context, w http.ResponseWriter, limi
 // room state.
 func (c *Creator) checkMembershipRequest(ctx context.Context, req route.Request, rq *requester, in *input) *stop {
 	m := in.member
+	// Suspension (MSC3823). A join's target is the requester.
+	if rq.Suspended && m.action == "invite" {
+		return userSuspended("Sending invites while account is suspended is not allowed.").stop()
+	}
+	if rq.Suspended && m.action == "join" {
+		return userSuspended("Joining rooms while account is suspended is not allowed.").stop()
+	}
+	if st := c.memberContent(ctx, rq, in); st != nil {
+		return st
+	}
 	sn := c.o.Membership.ServerNoticesMXID
 	if sn != "" && rq.UserID == sn {
 		return fb("server_notices")
@@ -518,11 +643,32 @@ func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *re
 	case old == "ban" && m.action != "ban" && m.action != "unban" && m.action != "leave":
 		return "", (&refusal{reason: "target_banned", status: http.StatusForbidden, errcode: "M_BAD_STATE",
 			msg: "Cannot " + m.action + " user who was banned"}).stop()
-	case (old == "ban" || old == "leave") && m.action == "kick":
+	}
+	if hasOld {
+		// The same sender, membership and content (compared as Python
+		// dicts): nothing to do, the old event is the answer.
+		oldID := before[pdu.StateKey{Type: "m.room.member", StateKey: m.target}]
+		if se := evs[oldID]; se != nil && se.Sender == rq.UserID && old == m.membership &&
+			pyEqual(gjson.ParseBytes(m.compare), se.Content) {
+			in.dedupKind = "membership_noop"
+			return oldID, nil
+		}
+	}
+	if (old == "ban" || old == "leave") && m.action == "kick" {
 		return "", notInRoom
 	}
 	m.leftFrom = old
 
+	if m.membership == "join" && rq.Guest {
+		// _can_guest_join.
+		ok, err := c.guestCanJoin(ctx, before)
+		if err != nil {
+			return "", fb("db_error")
+		}
+		if !ok {
+			return "", forbidden("guest", "Guest access not allowed").stop()
+		}
+	}
 	if m.membership == "join" {
 		// _should_perform_remote_join: restricted rooms need an authorising
 		// user unless the user is already joined or invited.
@@ -532,7 +678,7 @@ func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *re
 	}
 
 	// _local_membership_update: get_event_id_from_transaction.
-	if in.txn != "" {
+	if in.txn != "" && rq.DeviceID != "" {
 		id, err := c.o.Store.TxnEvent(ctx, req.Room, rq.UserID, rq.DeviceID, in.txn)
 		switch {
 		case err == nil:
@@ -543,6 +689,24 @@ func (c *Creator) checkMembership(ctx context.Context, req route.Request, rq *re
 		}
 	}
 	return "", nil
+}
+
+// guestCanJoin is _can_guest_join: the room's guest_access is can_join.
+func (c *Creator) guestCanJoin(ctx context.Context, before pdu.StateMap) (bool, error) {
+	id, ok := before[pdu.StateKey{Type: "m.room.guest_access"}]
+	if !ok {
+		return false, nil
+	}
+	evs, _, err := c.o.Store.GetStoredEvents(ctx, []string{id})
+	if err != nil {
+		return false, err
+	}
+	ev := evs[id]
+	if ev == nil {
+		return false, nil
+	}
+	v := pdu.Get(ev.Content, "guest_access")
+	return v.Type == gjson.String && v.Str == "can_join", nil
 }
 
 // restrictedJoinRules is has_restricted_join_rules, on the events loaded.
@@ -583,7 +747,7 @@ func validUserID(s string) bool {
 
 // respond answers a request with its event.
 func (c *Creator) respond(w http.ResponseWriter, in *input, eventID string) {
-	if in.member == nil {
+	if in.member == nil || in.member.fromState {
 		writeEventID(w, eventID)
 		return
 	}

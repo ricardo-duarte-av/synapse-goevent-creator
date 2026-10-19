@@ -254,6 +254,32 @@ func (s *suite) membership(me, probe, tag string) {
 	}
 	s.membershipStep("join with reason", http.MethodPost, path("join"), map[string]any{"reason": tag}, room, me, withReason)
 	s.membershipStep("join without reason", http.MethodPost, "/_matrix/client/v3/join/"+esc(s.room), map[string]any{}, room, me, profile)
+
+	// A per-room name, as clients set it: the member event through the
+	// state servlet, the content as sent. Then the plain join back, and the
+	// same again, which update_membership finds already there.
+	statePath := s.roomPath("/state/m.room.member/" + esc(me))
+	nick := map[string]any{}
+	for k, v := range profile {
+		nick[k] = v
+	}
+	nick["displayname"] = "goevent-e2e " + s.run
+	if r := c.do(http.MethodPut, statePath, nick, true); r.status != 200 || r.body.Get("event_id").Str == "" {
+		s.record("state member per-room name", false, "%d %s", r.status, r.raw)
+	} else {
+		want, _ := json.Marshal(nick)
+		ev := s.memberEvent(me, func(e gjson.Result) bool { return jsonEqual(want, []byte(e.Get("content").Raw)) })
+		s.record("state member per-room name", ev.Get("event_id").Str == r.body.Get("event_id").Str, "%s %s", ev.Get("event_id").Str, ev.Get("content").Raw)
+	}
+	restored := c.do(http.MethodPut, statePath, profile, true)
+	id := restored.body.Get("event_id").Str
+	want, _ := json.Marshal(profile)
+	ev := s.memberEvent(me, func(e gjson.Result) bool { return jsonEqual(want, []byte(e.Get("content").Raw)) })
+	s.record("state member restore", restored.status == 200 && id != "" && ev.Get("event_id").Str == id, "%d %s; member event %s", restored.status, restored.raw, ev.Get("event_id").Str)
+	again := c.do(http.MethodPut, statePath, profile, true)
+	s.record("state member again is a no-op", again.status == 200 && again.body.Get("event_id").Str == id, "%d %s (want %s)", again.status, again.raw, id)
+	s.expectError("refuse member state without membership", c.do(http.MethodPut, statePath, map[string]any{"displayname": "x"}, true), 400, "M_UNKNOWN")
+	s.expectError("refuse member state with a bad membership", c.do(http.MethodPut, statePath, map[string]any{"membership": "dance"}, true), 400, "M_UNKNOWN")
 }
 
 // expectError checks a refusal: status and errcode.

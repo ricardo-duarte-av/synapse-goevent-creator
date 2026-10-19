@@ -2,6 +2,7 @@ package creator
 
 import (
 	"fmt"
+	"math/big"
 	"regexp"
 	"strconv"
 	"strings"
@@ -275,4 +276,75 @@ func mentionsErrors(m gjson.Result) ([]schemaError, bool) {
 		errs = append(errs, e)
 	}
 	return errs, true
+}
+
+// pyEqual is == between two values json.loads decoded: bools are the ints
+// 1 and 0, ints and floats compare by value, dicts by their items, lists
+// by their elements.
+func pyEqual(a, b gjson.Result) bool {
+	an, aNum := pyNumber(a)
+	bn, bNum := pyNumber(b)
+	switch {
+	case aNum || bNum:
+		return aNum && bNum && an.Cmp(bn) == 0
+	case a.Type == gjson.String || b.Type == gjson.String:
+		return a.Type == b.Type && a.Str == b.Str
+	case a.Type == gjson.Null || b.Type == gjson.Null:
+		return a.Type == b.Type
+	case a.IsArray() || b.IsArray():
+		if !a.IsArray() || !b.IsArray() {
+			return false
+		}
+		x, y := a.Array(), b.Array()
+		if len(x) != len(y) {
+			return false
+		}
+		for i := range x {
+			if !pyEqual(x[i], y[i]) {
+				return false
+			}
+		}
+		return true
+	case a.IsObject() && b.IsObject():
+		x, y := a.Map(), b.Map()
+		if len(x) != len(y) {
+			return false
+		}
+		for k, v := range x {
+			w, ok := y[k]
+			if !ok || !pyEqual(v, w) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// pyNumber is a number, or a bool as its int, exactly.
+func pyNumber(v gjson.Result) (*big.Rat, bool) {
+	switch v.Type {
+	case gjson.True:
+		return big.NewRat(1, 1), true
+	case gjson.False:
+		return new(big.Rat), true
+	case gjson.Number:
+		r, ok := new(big.Rat).SetString(v.Raw)
+		if !ok {
+			return nil, false
+		}
+		if !jsonInt.MatchString(v.Raw) {
+			// A float: what float(text) is, exactly.
+			f, err := strconv.ParseFloat(v.Raw, 64)
+			if err != nil {
+				return nil, false
+			}
+			if r = new(big.Rat); r.SetFloat64(f) == nil {
+				// inf: equal to nothing a canonical event holds.
+				return nil, false
+			}
+		}
+		return r, true
+	}
+	return nil, false
 }

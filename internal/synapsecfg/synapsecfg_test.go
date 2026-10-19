@@ -353,11 +353,11 @@ allow_per_room_profiles: false
 		t.Errorf("got %+v\nwant %+v", m, want)
 	}
 
-	m, err = membership([]byte("modules:\n  - module: x\nuser_consent:\n  block_events_error: no\nhs_disabled: true\n"), "example.org")
+	m, err = membership([]byte("modules:\n  - module: x\nuser_consent:\n  block_events_error: no\nhs_disabled: true\nmax_avatar_size: 10M\n"), "example.org")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !m.Modules || !m.ConsentRequired || !m.AuthBlocking || !m.AllowPerRoomProfiles || m.ServerNoticesMXID != "" {
+	if !m.Modules || !m.ConsentRequired || !m.AuthBlocking || !m.AllowPerRoomProfiles || m.ServerNoticesMXID != "" || !m.AvatarLimits {
 		t.Errorf("got %+v", m)
 	}
 }

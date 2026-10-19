@@ -300,7 +300,8 @@ func newHarness(t *testing.T) *harness {
 		Membership: synapsecfg.Membership{AllowPerRoomProfiles: true, IncludeProfileDataOnInvite: true,
 			JoinsLocal: lim, JoinsPerRoom: lim, InvitesPerRoom: lim, InvitesPerUser: lim, InvitesPerIssuer: lim},
 		MSC4155: true, MSC4293: true, Main: h.main,
-		Log: zerolog.Nop(), Now: func() time.Time { return time.UnixMilli(1700000000000) }})
+		ShadowPause: func(time.Duration) time.Duration { return 0 },
+		Log:         zerolog.Nop(), Now: func() time.Time { return time.UnixMilli(1700000000000) }})
 	h.c.verify = func(pending) {}
 	return h
 }
@@ -434,10 +435,6 @@ func TestFallbacksWriteNothing(t *testing.T) {
 			h.f.token = &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", Used: true}
 			delete(h.f.state, pdu.StateKey{Type: "m.room.member", StateKey: user})
 			return `{"msgtype":"m.text","body":"hi"}`, "refused:not_in_room"
-		},
-		"shadow banned": func(h *harness) (string, string) {
-			h.f.token = &pdustore.TokenInfo{ID: 1, UserID: user, DeviceID: "DEV", Used: true, ShadowBan: true}
-			return `{"msgtype":"m.text","body":"hi"}`, "shadow_banned"
 		},
 		"partial state": func(h *harness) (string, string) {
 			h.f.partial = true
@@ -745,7 +742,7 @@ func TestStateFallbacks(t *testing.T) {
 	for _, tc := range []struct {
 		typ, key, body, want string
 	}{
-		{"m.room.member", "@x:example.org", `{"membership":"join"}`, "type_member"},
+		{"m.room.member", "@x:example.org", `{"membership":"join"}`, "refused:auth_rules"},
 		{"m.room.power_levels", "", `{"users":{"@u:example.org":"100"}}`, "refused:invalid_power_levels"},
 		{"m.room.server_acl", "", `{"allow":["*"],"deny":["example.org"]}`, "refused:acl_denies_us"},
 		{"m.room.create", "", `{}`, "refused:type_create"},
@@ -870,4 +867,109 @@ func (f *fakeRoom) fork(t *testing.T, a, b [3]string) (string, string) {
 	f.groups = map[int64]pdu.StateMap{8: stateA, 9: stateB}
 	f.prevs = []string{ida, idb}
 	return ida, idb
+}
+
+// A shadow-banned requester is answered with a fake event ID, the same one
+// for a retried transaction, and nothing is written.
+func TestShadowBannedSend(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.ShadowBan = true
+	rec, out := h.send(t, http.MethodPut, "s1", `{"msgtype":"m.text","body":"hi"}`)
+	id := gjson.Get(rec.Body.String(), "event_id").Str
+	if out.Result != "shadow_banned" || rec.Code != 200 || len(id) != 44 || id[0] != '$' {
+		t.Fatalf("%+v %d %s", out, rec.Code, rec.Body)
+	}
+	rec, _ = h.send(t, http.MethodPut, "s1", `{"msgtype":"m.text","body":"hi"}`)
+	if again := gjson.Get(rec.Body.String(), "event_id").Str; again != id {
+		t.Errorf("retry answered %s, first %s", again, id)
+	}
+	if len(h.w.calls) != 0 || len(h.p.entries) != 0 {
+		t.Errorf("a shadow-banned send wrote: %v", h.w.calls)
+	}
+	// A refusal still comes first.
+	rec, out = h.send(t, http.MethodPut, "s2", `[]`)
+	if out.Refused != "not_object" {
+		t.Errorf("%+v %s", out, rec.Body)
+	}
+}
+
+func TestSuspended(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.Suspended = true
+	rec, out := h.send(t, http.MethodPut, "s1", `{"msgtype":"m.text","body":"hi"}`)
+	if out.Refused != "suspended" || rec.Code != 403 ||
+		rec.Body.String() != `{"errcode":"M_USER_SUSPENDED","error":"Sending messages while account is suspended is not allowed."}` {
+		t.Fatalf("%+v %d %s", out, rec.Code, rec.Body)
+	}
+	// Its own events it may redact.
+	if _, out := h.put(t, redactReq(h.f.topic, "r1"), "/redact/x/r1", `{}`); out.Result != "created" {
+		t.Errorf("own redaction: %+v", out)
+	}
+	h.f.events[h.f.topic].Sender = other
+	rec, out = h.put(t, redactReq(h.f.topic, "r2"), "/redact/x/r2", `{}`)
+	if out.Refused != "suspended" || !strings.Contains(rec.Body.String(), "You can only redact your own events") {
+		t.Errorf("%+v %s", out, rec.Body)
+	}
+	// Inviting is not; banning is not either, later; leaving is allowed.
+	rec, out = h.member(t, memberReq("invite", ""), `{"user_id":"`+other+`"}`)
+	if !strings.Contains(rec.Body.String(), "Sending invites while account is suspended") {
+		t.Errorf("invite: %+v %s", out, rec.Body)
+	}
+	rec, out = h.member(t, memberReq("ban", ""), `{"user_id":"`+other+`"}`)
+	if !strings.Contains(rec.Body.String(), "Changing membership while account is suspended") {
+		t.Errorf("ban: %+v %s", out, rec.Body)
+	}
+	if rec, out := h.member(t, memberReq("leave", ""), ``); out.Result != "created" {
+		t.Errorf("leave: %+v %s", out, rec.Body)
+	}
+}
+
+// A token without a device: no transaction lookup, and no device in the
+// event's metadata or the requester.
+func TestTokenWithoutDevice(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.DeviceID = ""
+	h.f.txn = "$old"
+	_, out := h.send(t, http.MethodPut, "seen", `{"msgtype":"m.text","body":"hi"}`)
+	if out.Result != "created" {
+		t.Fatalf("%+v", out)
+	}
+	e := gjson.ParseBytes(h.p.entries[0])
+	if e.Get("internal_metadata.device_id").Exists() || e.Get("requester.device_id").Raw != "null" ||
+		e.Get("internal_metadata.txn_id").Str != "seen" {
+		t.Errorf("%s %s", e.Get("internal_metadata").Raw, e.Get("requester").Raw)
+	}
+}
+
+// A puppet token acts as the puppeted user, its owner the authenticated
+// entity.
+func TestPuppetToken(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.Puppet, h.f.token.Owner = true, "@admin:example.org"
+	if _, out := h.send(t, http.MethodPut, "p1", `{"msgtype":"m.text","body":"hi"}`); out.Result != "created" {
+		t.Fatalf("%+v", out)
+	}
+	e := gjson.ParseBytes(h.p.entries[0])
+	if e.Get("event.sender").Str != user || e.Get("requester.authenticated_entity").Str != "@admin:example.org" {
+		t.Errorf("%s %s", e.Get("event.sender").Raw, e.Get("requester").Raw)
+	}
+}
+
+func TestGuest(t *testing.T) {
+	h := newHarness(t)
+	h.f.token.Guest = true
+	rec, out := h.put(t, redactReq(h.f.topic, "r1"), "/redact/x/r1", `{}`)
+	if out.Refused != "guest" || rec.Body.String() != `{"errcode":"M_GUEST_ACCESS_FORBIDDEN","error":"Guest access not allowed"}` {
+		t.Errorf("redact: %+v %s", out, rec.Body)
+	}
+	rec, out = h.member(t, memberReq("invite", ""), `{"user_id":"`+other+`"}`)
+	if out.Refused != "guest" || rec.Body.String() != `{"errcode":"M_FORBIDDEN","error":"Guest access not allowed"}` {
+		t.Errorf("invite: %+v %s", out, rec.Body)
+	}
+	if _, out := h.send(t, http.MethodPut, "g1", `{"msgtype":"m.text","body":"hi"}`); out.Result != "created" {
+		t.Errorf("send: %+v", out)
+	}
+	if gjson.GetBytes(h.p.entries[0], "requester.is_guest").Raw != "true" {
+		t.Errorf("requester %s", gjson.GetBytes(h.p.entries[0], "requester").Raw)
+	}
 }

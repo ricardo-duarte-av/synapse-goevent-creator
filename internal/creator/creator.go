@@ -158,6 +158,9 @@ type Options struct {
 	MSC4293, MSC4155 bool
 	// Main is told when a local user leaves a room they were joined to.
 	Main MembershipNotifier
+	// ShadowPause, in tests, replaces the pause before a shadow-banned
+	// answer.
+	ShadowPause func(time.Duration) time.Duration
 	// Timeout bounds one request's work, the persister's included.
 	Timeout time.Duration
 	Log     zerolog.Logger
@@ -169,6 +172,9 @@ type Creator struct {
 	o     Options
 	locks roomLocks
 	txns  txnCache
+	// fakes are the event IDs shadow-banned transactions were answered
+	// with.
+	fakes fakeCache
 
 	limitersOnce sync.Once
 	lim          *membershipLimiters
@@ -217,7 +223,9 @@ func Serves(ep route.Endpoint) bool {
 func (c *Creator) Serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
 	start := c.o.Now()
 	var out Outcome
-	if req.Endpoint == route.Membership || req.Endpoint == route.Join {
+	if req.Endpoint == route.Membership || req.Endpoint == route.Join ||
+		(req.Endpoint == route.State && req.Action == "m.room.member" && r.Method == http.MethodPut) {
+		// RoomStateEventRestServlet hands m.room.member to update_membership.
 		out = c.serveMembership(w, r, req)
 	} else {
 		out = c.serve(w, r, req)
@@ -287,23 +295,47 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		return c.refuse(w, ref)
 	case reason != "":
 		return fallback(reason)
+	case rq.Guest && req.Endpoint == route.Redact:
+		// get_user_by_req(allow_guest=False).
+		return c.refuse(w, &refusal{reason: "guest", status: http.StatusForbidden, errcode: "M_GUEST_ACCESS_FORBIDDEN",
+			msg: "Guest access not allowed"})
+	}
+	// fetch_or_execute_request: what this process answered a shadow-banned
+	// transaction with. (A real event is found again by the txn lookup.)
+	var fakeKey string
+	if req.TxnID != "" && rq.ShadowBanned {
+		fakeKey = rq.txnKey(r)
+		if id, ok := c.fakes.get(fakeKey, c.o.Now()); ok {
+			writeEventID(w, id)
+			return Outcome{Result: "shadow_banned"}
+		}
 	}
 	body, st := parseJSONObject(body, false)
 	if st != nil {
 		return c.end(w, st)
 	}
-	in, st := c.parse(ctx, req, body, q)
+	in, st := c.parse(ctx, req, rq, body, q)
 	if st != nil {
 		return c.end(w, st)
 	}
 	content := gjson.ParseBytes(in.content)
+	if rq.ShadowBanned && in.redacts == nil {
+		// create_and_send_nonmember_event, before its transaction lookup.
+		return c.shadowBanned(ctx, w, fakeKey)
+	}
 
 	unlock := c.locks.lock(req.Room)
-	defer unlock()
+	locked := true
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 
 	// get_event_from_transaction: a transaction already used answers with
-	// its event. /state has no transaction.
-	if in.txn != "" {
+	// its event. /state has no transaction, and nor has a requester without
+	// a device.
+	if in.txn != "" && rq.DeviceID != "" {
 		id, err := c.o.Store.TxnEvent(ctx, req.Room, rq.UserID, rq.DeviceID, in.txn)
 		switch {
 		case err == nil:
@@ -312,6 +344,13 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		case !errors.Is(err, pdustore.ErrNotFound):
 			return fallback("db_error")
 		}
+	}
+	if rq.ShadowBanned {
+		// A redaction: the servlet looked the transaction up first. The
+		// pause is not the room's.
+		locked = false
+		unlock()
+		return c.shadowBanned(ctx, w, fakeKey)
 	}
 
 	p, dup, st := c.prepare(ctx, req, rq, in, content)
@@ -346,7 +385,7 @@ func (c *Creator) configFallback() string {
 
 // parse is the servlet: what the request asks for, or why it is refused or
 // Synapse's.
-func (c *Creator) parse(ctx context.Context, req route.Request, body []byte, q map[string][]string) (*input, *stop) {
+func (c *Creator) parse(ctx context.Context, req route.Request, rq *requester, body []byte, q map[string][]string) (*input, *stop) {
 	in := &input{typ: req.Action, content: body, txn: req.TxnID, room: req.Room}
 	switch req.Endpoint {
 	case route.Send:
@@ -380,6 +419,11 @@ func (c *Creator) parse(ctx context.Context, req route.Request, body []byte, q m
 		rv, ok := pdu.LookupRoomVersion(rvID)
 		if !ok {
 			return nil, fb("room_version")
+		}
+		if rq.Suspended {
+			if st := c.suspendedRedaction(ctx, rq, req.Action); st != nil {
+				return nil, st
+			}
 		}
 		// MSC2174: "redacts" in content and content["redacts"] != event_id.
 		if r, ok := pdu.Field(content, "redacts"); rv.UpdatedRedactionRules && ok && !(r.Type == gjson.String && r.Str == req.Action) {
@@ -446,43 +490,60 @@ func (c *Creator) requester(ctx context.Context, r *http.Request) (*requester, s
 	case c.o.AccountValidity:
 		// is_user_expired.
 		return nil, "account_validity", nil
-	case t.Puppet:
-		return nil, "puppet", nil
-	case t.ShadowBan:
-		return nil, "shadow_banned", nil
-	case t.Suspended:
-		return nil, "suspended", nil
-	case t.Guest, t.AppService:
-		return nil, "guest", nil
-	case t.Deactivated:
-		return nil, "deactivated", nil
-	case t.DeviceID == "":
-		return nil, "no_device", nil
 	}
-	return &requester{UserID: t.UserID, DeviceID: t.DeviceID, TokenID: t.ID, Admin: t.Admin}, "", nil
+	return &requester{UserID: t.UserID, DeviceID: t.DeviceID, TokenID: t.ID, Admin: t.Admin, Entity: t.Owner,
+		Guest: t.Guest, ShadowBanned: t.ShadowBan, Suspended: t.Suspended}, "", nil
 }
 
-// requester is Requester.serialize (rust/src/types/mod.rs) for a user's own
-// access token: never a guest, an appservice or a puppet here.
+// requester is Requester.serialize (rust/src/types/mod.rs) for an access
+// token in the database: never an appservice's.
 type requester struct {
-	UserID   string
+	UserID string
+	// DeviceID is "" for a token without one (the admin API mints them).
 	DeviceID string
 	TokenID  int64
-	// Admin is is_server_admin; not serialized.
-	Admin bool
+	// Entity is the token's own user: UserID's puppeteer for a puppet
+	// token.
+	Entity       string
+	Guest        bool
+	ShadowBanned bool
+	// Admin is is_server_admin and Suspended get_user_suspended_status;
+	// neither is serialized.
+	Admin     bool
+	Suspended bool
 }
 
 func (rq *requester) MarshalJSON() ([]byte, error) {
+	var device any
+	if rq.DeviceID != "" {
+		device = rq.DeviceID
+	}
+	entity := rq.Entity
+	if entity == "" {
+		entity = rq.UserID
+	}
 	return json.Marshal(map[string]any{
 		"user_id":              rq.UserID,
 		"access_token_id":      rq.TokenID,
-		"is_guest":             false,
+		"is_guest":             rq.Guest,
 		"scope":                []string{},
-		"shadow_banned":        false,
-		"device_id":            rq.DeviceID,
+		"shadow_banned":        rq.ShadowBanned,
+		"device_id":            device,
 		"app_server_id":        nil,
-		"authenticated_entity": rq.UserID,
+		"authenticated_entity": entity,
 	})
+}
+
+// txnKey is HttpTransactionCache's key: the path, and the user and device,
+// or the guest, or the token for a requester without a device.
+func (rq *requester) txnKey(r *http.Request) string {
+	switch {
+	case rq.Guest:
+		return r.URL.EscapedPath() + "\x00guest\x00" + rq.UserID
+	case rq.DeviceID != "":
+		return r.URL.EscapedPath() + "\x00user\x00" + rq.UserID + "\x00" + rq.DeviceID
+	}
+	return r.URL.EscapedPath() + "\x00user_admin\x00" + strconv.FormatInt(rq.TokenID, 10)
 }
 
 // prepared is an event ready to persist.
@@ -532,6 +593,19 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		}
 		if ms != "join" {
 			return nil, "", forbidden("not_in_room", fmt.Sprintf("User %s not in room %s", rq.UserID, req.Room)).stop()
+		}
+		// create_event.
+		if rq.Suspended {
+			if in.redacts == nil {
+				return nil, "", userSuspended("Sending messages while account is suspended is not allowed.").stop()
+			}
+			if !rv.UpdatedRedactionRules {
+				// event_dict["content"]["redacts"]: a KeyError.
+				return nil, "", internalError("suspended").stop()
+			}
+			if st := c.suspendedRedaction(ctx, rq, *in.redacts); st != nil {
+				return nil, "", st
+			}
 		}
 		if st := validateBuilder(in, content, req.Room); st != nil {
 			return nil, "", st
@@ -589,6 +663,10 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		}
 		if id != "" {
 			return nil, id, nil
+		}
+		// create_event.
+		if rq.Suspended && in.member.membership != "leave" {
+			return nil, "", userSuspended("Changing membership while account is suspended is not allowed.").stop()
 		}
 	}
 
@@ -897,7 +975,10 @@ func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
 	if err != nil {
 		return nil, err
 	}
-	meta := map[string]any{"device_id": p.rq.DeviceID}
+	meta := map[string]any{}
+	if p.rq.DeviceID != "" {
+		meta["device_id"] = p.rq.DeviceID
+	}
 	if p.in.txn != "" {
 		meta["txn_id"] = p.in.txn
 	}

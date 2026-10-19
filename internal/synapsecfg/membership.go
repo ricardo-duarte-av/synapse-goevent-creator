@@ -26,6 +26,9 @@ type Membership struct {
 	// ConsentRequired is user_consent.block_events_error being set: events
 	// are refused until the privacy policy is accepted.
 	ConsentRequired bool
+	// AvatarLimits is max_avatar_size or allowed_avatar_mimetypes being set:
+	// a per-room avatar is then checked against the media repository.
+	AvatarLimits bool
 	// Modules is any module or legacy spam checker being configured: their
 	// callbacks (user_may_invite, user_may_join_room, check_event_allowed,
 	// ratelimit overrides) are Python.
@@ -56,6 +59,8 @@ type membershipRaw struct {
 	RcJoins                    yaml.Node `yaml:"rc_joins"`
 	RcJoinsPerRoom             yaml.Node `yaml:"rc_joins_per_room"`
 	RcInvites                  yaml.Node `yaml:"rc_invites"`
+	MaxAvatarSize              yaml.Node `yaml:"max_avatar_size"`
+	AllowedAvatarMimetypes     yaml.Node `yaml:"allowed_avatar_mimetypes"`
 }
 
 func membership(b []byte, serverName string) (Membership, error) {
@@ -81,6 +86,8 @@ func membership(b []byte, serverName string) (Membership, error) {
 		m.ConsentRequired = true
 	}
 	m.Modules = nonEmpty(&r.Modules) || nonEmpty(&r.SpamChecker)
+	// ContentRepositoryConfig: a size of 0 or none, and no list, check nothing.
+	m.AvatarLimits = truthyScalar(&r.MaxAvatarSize) || nonEmpty(&r.AllowedAvatarMimetypes)
 
 	joins := lastWins(&r.RcJoins)
 	invites := lastWins(&r.RcInvites)
@@ -151,6 +158,18 @@ func nonEmpty(n *yaml.Node) bool {
 		return n.Tag != "!!null"
 	}
 	return false
+}
+
+// truthyScalar is a scalar Python would read as true: not null, 0 or "".
+func truthyScalar(n *yaml.Node) bool {
+	if n.Kind != yaml.ScalarNode || n.Tag == "!!null" {
+		return false
+	}
+	switch n.Value {
+	case "", "0", "false", "False":
+		return false
+	}
+	return true
 }
 
 func deref(b *bool, def bool) bool {

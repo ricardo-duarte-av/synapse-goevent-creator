@@ -100,7 +100,7 @@ func (c *Creator) check(v pending) {
 		})
 	}
 
-	if p.in.txn != "" {
+	if p.in.txn != "" && p.rq.DeviceID != "" {
 		id, err := c.o.Store.TxnEvent(ctx, p.req.Room, p.rq.UserID, p.rq.DeviceID, p.in.txn)
 		record("txn_mapping", err == nil && id == p.ev.ID, func(e *zerolog.Event) { e.AnErr("err", err).Str("stored", id) })
 	}
