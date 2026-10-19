@@ -979,3 +979,37 @@ func TestGuest(t *testing.T) {
 		t.Errorf("requester %s", gjson.GetBytes(h.p.entries[0], "requester").Raw)
 	}
 }
+
+type fakeIPs struct{ got []string }
+
+func (f *fakeIPs) Record(user, token, ip, ua string, device *string) {
+	d := "<nil>"
+	if device != nil {
+		d = *device
+	}
+	f.got = append(f.got, strings.Join([]string{user, token, ip, ua, d}, " "))
+}
+
+// _record_request: the first X-Forwarded-For address, the last User-Agent,
+// the token's own user; nothing for an appservice unless tracked.
+func TestRecordRequest(t *testing.T) {
+	h := newHarness(t)
+	ips := &fakeIPs{}
+	h.c.o.UserIPs = ips
+	r := httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/"+room+"/send/m.room.message/ip1", strings.NewReader(`{"msgtype":"m.text","body":"hi"}`))
+	r.Header.Set("Authorization", "Bearer tok")
+	r.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
+	r.Header.Add("User-Agent", "first")
+	r.Header.Add("User-Agent", "Element/1.0")
+	h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "ip1"})
+	if len(ips.got) != 1 || ips.got[0] != user+" tok 203.0.113.7 Element/1.0 DEV" {
+		t.Errorf("%q", ips.got)
+	}
+	// A refused token is not recorded.
+	ips.got = nil
+	r.Header.Set("Authorization", "Bearer nope")
+	h.c.Serve(httptest.NewRecorder(), r, route.Request{Endpoint: route.Send, Room: room, Action: "m.room.message", TxnID: "ip1"})
+	if len(ips.got) != 0 {
+		t.Errorf("%q", ips.got)
+	}
+}

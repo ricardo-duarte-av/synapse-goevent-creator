@@ -15,11 +15,16 @@ type Auth struct {
 	// AccountValidity is account_validity.enabled: requests from an expired
 	// account are refused.
 	AccountValidity bool
+	// TrackAppserviceUserIPs and TrackPuppetedUserIPs are
+	// track_appservice_user_ips and track_puppeted_user_ips.
+	TrackAppserviceUserIPs, TrackPuppetedUserIPs bool
 }
 
 type authRaw struct {
-	MAS             yaml.Node `yaml:"matrix_authentication_service"`
-	AccountValidity yaml.Node `yaml:"account_validity"`
+	MAS                    yaml.Node `yaml:"matrix_authentication_service"`
+	AccountValidity        yaml.Node `yaml:"account_validity"`
+	TrackAppserviceUserIPs *bool     `yaml:"track_appservice_user_ips"`
+	TrackPuppetedUserIPs   *bool     `yaml:"track_puppeted_user_ips"`
 }
 
 func authSettings(b []byte, experimental map[string]any) (Auth, error) {
@@ -27,7 +32,7 @@ func authSettings(b []byte, experimental map[string]any) (Auth, error) {
 	if err := yaml.Unmarshal(b, &r); err != nil {
 		return Auth{}, fmt.Errorf("synapsecfg: auth settings: %w", err)
 	}
-	a := Auth{}
+	a := Auth{TrackAppserviceUserIPs: deref(r.TrackAppserviceUserIPs, false), TrackPuppetedUserIPs: deref(r.TrackPuppetedUserIPs, false)}
 	if v, _ := nodeMap(&r.MAS)["enabled"].(bool); v {
 		a.Delegated = true
 	}

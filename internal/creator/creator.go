@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -125,6 +126,11 @@ type Writer interface {
 	StoreFullStateGroup(ctx context.Context, eventID, roomID string, rows []writer.StateRow) (int64, error)
 }
 
+// UserIPs is insert_client_ip.
+type UserIPs interface {
+	Record(userID, token, ip, userAgent string, deviceID *string)
+}
+
 // RemoteProfiles is the federation profile query.
 type RemoteProfiles interface {
 	ProfileField(ctx context.Context, userID, field string) (gjson.Result, bool)
@@ -166,6 +172,11 @@ type Options struct {
 	MSC4293, MSC4155 bool
 	// Main is told when a local user leaves a room they were joined to.
 	Main MembershipNotifier
+	// UserIPs is told of each authenticated request (_record_request);
+	// nil tells no one.
+	UserIPs UserIPs
+	// TrackAppserviceUserIPs and TrackPuppetedUserIPs are homeserver.yaml's.
+	TrackAppserviceUserIPs, TrackPuppetedUserIPs bool
 	// RemoteProfiles queries remote servers for profiles; nil leaves
 	// remote targets' membership to Synapse.
 	RemoteProfiles RemoteProfiles
@@ -488,6 +499,56 @@ func (c *Creator) parse(ctx context.Context, req route.Request, rq *requester, b
 // (api/auth/internal.py), from the database: a refusal is Synapse's answer,
 // a reason means the request is Synapse's.
 func (c *Creator) requester(ctx context.Context, r *http.Request) (*requester, string, *refusal) {
+	rq, reason, ref := c.authenticate(ctx, r)
+	if rq != nil {
+		c.recordRequest(r, rq)
+	}
+	return rq, reason, ref
+}
+
+// recordRequest is _record_request: who asked, from where, for user_ips and
+// MAU. The address is the first of X-Forwarded-For's, as Synapse's
+// listeners read it (x_forwarded: true).
+func (c *Creator) recordRequest(r *http.Request, rq *requester) {
+	if c.o.UserIPs == nil {
+		return
+	}
+	xff := r.Header.Get("X-Forwarded-For")
+	ip := strings.TrimSpace(strings.SplitN(xff, ",", 2)[0])
+	if ip == "" || (rq.AppService != nil && !c.o.TrackAppserviceUserIPs) {
+		return
+	}
+	token, _, _ := accessToken(r)
+	// get_request_user_agent: the last User-Agent header.
+	ua := ""
+	if v := r.Header.Values("User-Agent"); len(v) > 0 {
+		ua = v[len(v)-1]
+	}
+	var device *string
+	if rq.DeviceID != "" {
+		d := rq.DeviceID
+		device = &d
+	} else if rq.AppService != nil {
+		d := "dummy-device"
+		device = &d
+	}
+	entity := rq.Entity
+	if entity == "" {
+		entity = rq.UserID
+	}
+	c.o.UserIPs.Record(entity, token, ip, ua, device)
+	if rq.UserID != entity && c.o.TrackPuppetedUserIPs {
+		var own *string
+		if rq.DeviceID != "" {
+			d := rq.DeviceID
+			own = &d
+		}
+		c.o.UserIPs.Record(rq.UserID, token, ip, ua, own)
+	}
+}
+
+// authenticate is get_user_by_req up to _record_request.
+func (c *Creator) authenticate(ctx context.Context, r *http.Request) (*requester, string, *refusal) {
 	if c.o.DelegatedAuth {
 		// Tokens are the OAuth server's.
 		return nil, "delegated_auth", nil

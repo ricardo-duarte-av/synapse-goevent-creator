@@ -36,6 +36,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/server"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/shadow"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/synapsecfg"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/userips"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/writer"
 )
 
@@ -352,6 +353,14 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 	if err != nil {
 		return nil, err
 	}
+	var ips creator.UserIPs
+	if hs.Redis.Enabled {
+		bus := userips.NewBus(hs.Redis)
+		d.closers = append(d.closers, func() { _ = bus.Close() })
+		ips = userips.New(bus, hs.ServerName, log, nil)
+	} else {
+		log.Warn().Msg("No Redis replication bus: native requests are not recorded in user_ips")
+	}
 	repl := replication.NewClient(hs)
 	return creator.New(creator.Options{
 		Store:          d.db,
@@ -359,6 +368,7 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		Persister:      repl,
 		Main:           repl,
 		RemoteProfiles: fed,
+		UserIPs:        ips,
 		Key:            d.key,
 		Push:           d.push,
 		ServerName:     hs.ServerName,
@@ -367,6 +377,8 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		Log:            log,
 
 		AppServices:            appservices,
+		TrackAppserviceUserIPs: hs.Auth.TrackAppserviceUserIPs,
+		TrackPuppetedUserIPs:   hs.Auth.TrackPuppetedUserIPs,
 		DelegatedAuth:          hs.Auth.Delegated,
 		AccountValidity:        hs.Auth.AccountValidity,
 		RedactionAllowedPeriod: hs.RedactionAllowedPeriod,
