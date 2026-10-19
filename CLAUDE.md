@@ -120,8 +120,21 @@ Each native event is verified against what was persisted
   event on the group before (`writer.StoreStateGroup`, goinbound's port, full
   group past 100 hops); the context's `state_group_deltas` is `(before,
   after, [event])` then the group before's own edge. `unsigned.replaces_state`
-  is set. Membership, create, power levels, ACL, aliases, retention, policy
-  and tombstone fall back (their content validation is not ported).
+  is set. Power levels (`POWER_LEVELS_SCHEMA`), server ACL (must not deny us),
+  aliases (255 characters), retention and tombstone are validated as
+  `validate_new`/`validate_builder` do (`creator/validate.go`): served only when
+  the content certainly passes, otherwise Synapse's. Membership, create and
+  policy fall back.
+- **Presence, not `.get`**: jsonschema and `key in content` treat a present
+  `null` as present and invalid; Python's `.get` (`pdu.Get`) reads it as
+  absent. Use `pdu.Field` for the former (`m.mentions: null` is Synapse's
+  400).
+- **Read-your-writes holds only on the creating process.** Synapse's creator
+  waits for the writer's streams before answering (`replication/http/_base.py`);
+  other processes, main included, catch up over replication. A `GET /event`
+  on main right after a native redaction can still show the old content for
+  a few milliseconds. The e2e suite polls; that is Synapse's model whenever
+  creator and reader differ (av-client-events-1 vs the request workers here).
 - **Redactions**: in v11 `redacts` goes into the content (the servlet does
   it); a body naming another `redacts` is Synapse's 400. `recheck_redaction`
   goes in internal metadata when the auth rules set it. Targets that are the
@@ -143,8 +156,10 @@ GOEVENT_E2E_PASSWORD=... GOEXPERIMENT=jsonv2 go run ./cmd/goevent-e2e \
 ```
 
 Run it against shadow mode first: that is Synapse's own behaviour, and the
-expectations are calibrated on it (46/46 on 2026-10-16, then 46/46 with send,
-state and redact native, 21 native events all verified).
+expectations are calibrated on it (57/57 on 2026-10-19, then 57/57 with send,
+state and redact native, 25 native events all verified, power levels, ACL,
+aliases and retention among them). It never sends a valid tombstone: that
+would mark the room as replaced in every client.
 
 ## Shadow mode (M2)
 

@@ -154,3 +154,8 @@ func PyInt(v gjson.Result) (int64, error) { return pyInt(v) }
 
 // IsPyInt is type(v) is int.
 func IsPyInt(v gjson.Result) bool { return isPyInt(v) }
+
+// Field is `key in obj` and obj[key]: present even when null, the last of
+// duplicate keys winning. Use it where Synapse tests presence (`if k in
+// content`, jsonschema properties); Get is obj.get(key), where null is None.
+func Field(obj gjson.Result, key string) (gjson.Result, bool) { return field(obj, key) }

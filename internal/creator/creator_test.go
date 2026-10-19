@@ -6,6 +6,7 @@ import (
 	"encoding/json/jsontext"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -430,12 +431,14 @@ func TestValidateSend(t *testing.T) {
 		{"m.reaction", `{}`, ""},
 		{"m.room.member", `{}`, "type_member"},
 		{"m.room.topic", `{"topic":"x"}`, "type_state_only"},
-		{"m.room.power_levels", `{}`, "type_validated"},
 		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{"user_ids":["@a:b"],"room":true}}`, ""},
 		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{"user_ids":[1]}}`, "invalid_mentions"},
 		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":[]}`, "invalid_mentions"},
+		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":null}`, "invalid_mentions"},
+		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{"user_ids":null}}`, "invalid_mentions"},
+		{"m.room.message", `{"msgtype":"m.text","body":"x","m.mentions":{}}`, ""},
 	} {
-		if got := validate(&input{typ: tc.typ}, gjson.Parse(tc.content)); got != tc.want {
+		if got := (&Creator{o: Options{ServerName: "example.org"}}).validate(&input{typ: tc.typ}, gjson.Parse(tc.content), room); got != tc.want {
 			t.Errorf("%s %s: %q, want %q", tc.typ, tc.content, got, tc.want)
 		}
 	}
@@ -527,12 +530,15 @@ func TestStateFallbacks(t *testing.T) {
 		typ, key, body, want string
 	}{
 		{"m.room.member", "@x:example.org", `{"membership":"join"}`, "type_member"},
-		{"m.room.power_levels", "", `{}`, "type_validated"},
-		{"m.room.server_acl", "", `{}`, "type_validated"},
+		{"m.room.power_levels", "", `{"users":{"@u:example.org":"100"}}`, "invalid_power_levels"},
+		{"m.room.server_acl", "", `{"allow":["*"],"deny":["example.org"]}`, "acl_denies_us"},
 		{"m.room.create", "", `{}`, "type_create"},
 		{"m.room.topic", "", `{"topic":1}`, "invalid_topic"},
 		{"m.room.name", "", `{}`, "invalid_name"},
-		{"m.room.tombstone", "", `{"replacement_room":"!x:y"}`, "type_tombstone"},
+		{"m.room.tombstone", "", `{"replacement_room":"` + room + `"}`, "invalid_tombstone"},
+		{"m.room.tombstone", "", `{}`, "invalid_tombstone"},
+		{"m.room.retention", "", `{"min_lifetime":10,"max_lifetime":5}`, "invalid_retention"},
+		{"m.room.aliases", "example.org", `{"aliases":["#` + strings.Repeat("a", 300) + `:example.org"]}`, "alias_too_long"},
 	} {
 		h := newHarness(t)
 		_, out := h.put(t, stateReq(tc.typ, tc.key), "/state/"+tc.typ+"/"+tc.key, tc.body)
@@ -601,6 +607,44 @@ func TestRedactionFallbacks(t *testing.T) {
 		}
 		if len(h.w.calls) != 0 {
 			t.Errorf("%s: wrote %v", name, h.w.calls)
+		}
+	}
+}
+
+func TestContentValidators(t *testing.T) {
+	big := strconv.FormatInt(1<<53, 10)
+	for _, tc := range []struct {
+		name, reason string
+		got          string
+	}{
+		{"pl ok", "", validatePowerLevels(gjson.Parse(`{"ban":50,"users":{"@a:b":100},"events":{"m.room.name":50},"notifications":{"room":50},"x":"anything"}`))},
+		{"pl negative ok", "", validatePowerLevels(gjson.Parse(`{"users_default":-10}`))},
+		{"pl string", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"ban":"50"}`))},
+		{"pl bool", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"kick":true}`))},
+		{"pl null", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"redact":null}`))},
+		{"pl too big", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"ban":` + big + `}`))},
+		{"pl users not object", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"users":[]}`))},
+		{"pl user string", "invalid_power_levels", validatePowerLevels(gjson.Parse(`{"users":{"@a:b":"1"}}`))},
+		{"acl ok", "", validateServerACL([]byte(`{"allow":["*"],"deny":["evil.example"]}`), "example.org")},
+		{"acl allows nobody", "acl_denies_us", validateServerACL([]byte(`{"allow":[]}`), "example.org")},
+		{"acl no allow key", "acl_denies_us", validateServerACL([]byte(`{}`), "example.org")},
+		{"acl glob deny", "acl_denies_us", validateServerACL([]byte(`{"allow":["*"],"deny":["*.org"]}`), "example.org")},
+		{"aliases ok", "", validateAliases(gjson.Parse(`{"aliases":["#a:b"]}`))},
+		{"aliases absent", "", validateAliases(gjson.Parse(`{}`))},
+		{"aliases string", "invalid_aliases", validateAliases(gjson.Parse(`{"aliases":"#a:b"}`))},
+		{"aliases null", "invalid_aliases", validateAliases(gjson.Parse(`{"aliases":null}`))},
+		{"aliases 255 runes", "", validateAliases(gjson.Parse(`{"aliases":["` + strings.Repeat("é", 255) + `"]}`))},
+		{"aliases 256 runes", "alias_too_long", validateAliases(gjson.Parse(`{"aliases":["` + strings.Repeat("é", 256) + `"]}`))},
+		{"retention ok", "", validateRetention(true, gjson.Parse(`{"min_lifetime":1,"max_lifetime":5}`))},
+		{"retention empty", "", validateRetention(true, gjson.Parse(`{}`))},
+		{"retention null", "", validateRetention(true, gjson.Parse(`{"max_lifetime":null}`))},
+		{"retention not state", "retention_not_state", validateRetention(false, gjson.Parse(`{}`))},
+		{"retention bool", "invalid_retention", validateRetention(true, gjson.Parse(`{"min_lifetime":true}`))},
+		{"retention string", "invalid_retention", validateRetention(true, gjson.Parse(`{"max_lifetime":"5"}`))},
+		{"tombstone ok", "", validateTombstone(gjson.Parse(`{"replacement_room":"!new:example.org"}`), room)},
+	} {
+		if tc.got != tc.reason {
+			t.Errorf("%s: %q, want %q", tc.name, tc.got, tc.reason)
 		}
 	}
 }

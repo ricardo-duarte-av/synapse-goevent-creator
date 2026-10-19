@@ -231,7 +231,7 @@ func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Reques
 		return fallback(reason)
 	}
 	content := gjson.ParseBytes(in.content)
-	if reason := validate(in, content); reason != "" {
+	if reason := c.validate(in, content, req.Room); reason != "" {
 		return fallback(reason)
 	}
 
@@ -864,8 +864,9 @@ func (c *Creator) checkAuth(ctx context.Context, ev *pdu.Event) error {
 }
 
 // validate is validate_builder and validate_new for the event, plus the
-// types the non-member path refuses. A reason means Synapse's.
-func validate(in *input, content gjson.Result) string {
+// types the non-member path refuses. A reason means Synapse's. Synapse runs
+// these before deduplicating a state event, and so do we.
+func (c *Creator) validate(in *input, content gjson.Result, room string) string {
 	state := in.stateKey != nil
 	switch in.typ {
 	case "m.room.member":
@@ -874,9 +875,22 @@ func validate(in *input, content gjson.Result) string {
 		return "type_member"
 	case "m.room.create":
 		return "type_create"
-	case "m.room.aliases", "m.room.retention", "m.room.server_acl", "m.room.power_levels":
-		// validate_new checks their content.
-		return "type_validated"
+	case "m.room.power_levels":
+		if reason := validatePowerLevels(content); reason != "" {
+			return reason
+		}
+	case "m.room.server_acl":
+		if reason := validateServerACL(in.content, c.o.ServerName); reason != "" {
+			return reason
+		}
+	case "m.room.aliases":
+		if reason := validateAliases(content); reason != "" {
+			return reason
+		}
+	case "m.room.retention":
+		if reason := validateRetention(state, content); reason != "" {
+			return reason
+		}
 	case "m.room.policy", "org.matrix.msc4284.policy":
 		return "policy_server"
 	case "m.room.topic", "m.room.name", "m.room.tombstone":
@@ -894,8 +908,9 @@ func validate(in *input, content gjson.Result) string {
 				return "invalid_name"
 			}
 		case "m.room.tombstone":
-			// replacement_room present, and not this room.
-			return "type_tombstone"
+			if reason := validateTombstone(content, room); reason != "" {
+				return reason
+			}
 		}
 	case "m.room.message":
 		for _, k := range []string{"body", "msgtype"} {
@@ -904,11 +919,13 @@ func validate(in *input, content gjson.Result) string {
 			}
 		}
 	}
-	if m := pdu.Get(content, "m.mentions"); m.Exists() {
+	// `if "m.mentions" in event.content`, then MENTIONS_SCHEMA: presence,
+	// null included, is what both test.
+	if m, ok := pdu.Field(content, "m.mentions"); ok {
 		if !m.IsObject() {
 			return "invalid_mentions"
 		}
-		if u := pdu.Get(m, "user_ids"); u.Exists() {
+		if u, ok := pdu.Field(m, "user_ids"); ok {
 			if !u.IsArray() {
 				return "invalid_mentions"
 			}
@@ -918,7 +935,7 @@ func validate(in *input, content gjson.Result) string {
 				}
 			}
 		}
-		if r := pdu.Get(m, "room"); r.Exists() && r.Type != gjson.True && r.Type != gjson.False {
+		if r, ok := pdu.Field(m, "room"); ok && r.Type != gjson.True && r.Type != gjson.False {
 			return "invalid_mentions"
 		}
 	}

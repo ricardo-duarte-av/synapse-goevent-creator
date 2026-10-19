@@ -143,6 +143,24 @@ func (s *suite) checkEvent(name, id, typ string, content map[string]any, txn str
 	s.record(name, len(problems) == 0, "%s %s", id, strings.Join(problems, "; "))
 }
 
+// redacted reads an event until it comes back redacted, for up to 5s.
+//
+// Read-your-writes holds only on the process that created the redaction
+// (replication/http/_base.py waits for the writer's streams there). Another
+// process -- main, serving /event here -- catches up over replication, which
+// can take a few milliseconds; that is Synapse's model too, whenever the
+// creator and the reader are different workers.
+func (s *suite) redacted(id string) resp {
+	var ev resp
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		ev = s.c.do(http.MethodGet, s.roomPath("/event/"+esc(id)), nil, true)
+		if ev.body.Get("content").Raw == "{}" || time.Now().After(deadline) {
+			return ev
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // expectError checks a refusal: status and errcode.
 func (s *suite) expectError(name string, r resp, status int, errcodes ...string) {
 	ok := r.status == status && slices.Contains(errcodes, r.body.Get("errcode").Str)
@@ -360,17 +378,58 @@ func run() int {
 	} else {
 		s.skip("state name, unchanged", fmt.Sprintf("no name to keep: %d", name.status))
 	}
+	// Types whose content Synapse validates (validate_new, validate_builder):
+	// each valid one harmless (unchanged, or a policy this server ignores),
+	// each invalid one refused. A valid tombstone is never sent: it would mark
+	// the room as replaced in every client.
+	// The valid ones carry this run in a key the type gives no meaning to,
+	// so each run makes a new event rather than a duplicate.
+	marked := func(raw string) string {
+		var m map[string]any
+		_ = json.Unmarshal([]byte(raw), &m)
+		m["pt.aguiarvieira.goevent.e2e"] = s.run
+		b, _ := json.Marshal(m)
+		return string(b)
+	}
 	pl := c.do(http.MethodGet, s.roomPath("/state/m.room.power_levels/"), nil, true)
 	if pl.status == 200 {
-		r = c.do(http.MethodPut, s.roomPath("/state/m.room.power_levels/"), pl.raw, true)
-		s.record("state power levels, unchanged (Synapse's)", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
+		r = c.do(http.MethodPut, s.roomPath("/state/m.room.power_levels/"), marked(pl.raw), true)
+		s.record("state power levels", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
 	}
+	s.expectError("refuse power level as a string", c.do(http.MethodPut, s.roomPath("/state/m.room.power_levels/"),
+		map[string]any{"ban": "50"}, true), 400, "M_BAD_JSON")
+	s.expectError("refuse power level null", c.do(http.MethodPut, s.roomPath("/state/m.room.power_levels/"),
+		`{"users":{"@a:example.org":null}}`, true), 400, "M_BAD_JSON")
+	acl := c.do(http.MethodGet, s.roomPath("/state/m.room.server_acl/"), nil, true)
+	if acl.status == 200 {
+		r = c.do(http.MethodPut, s.roomPath("/state/m.room.server_acl/"), marked(acl.raw), true)
+		s.record("state server ACL, same lists", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
+	} else {
+		s.skip("state server ACL, same lists", fmt.Sprintf("no ACL: %d", acl.status))
+	}
+	server := strings.SplitN(me, ":", 2)[1]
+	s.expectError("refuse ACL denying this server", c.do(http.MethodPut, s.roomPath("/state/m.room.server_acl/"),
+		map[string]any{"allow": []string{"*"}, "deny": []string{server}}, true), 400, "M_UNKNOWN")
+	r = c.do(http.MethodPut, s.roomPath("/state/m.room.aliases/goevent-e2e"), marked(`{"aliases":[]}`), true)
+	s.record("state aliases", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
+	s.expectError("refuse alias too long", c.do(http.MethodPut, s.roomPath("/state/m.room.aliases/goevent-e2e"),
+		map[string]any{"aliases": []string{"#" + strings.Repeat("a", 300) + ":" + server}}, true), 400, "M_INVALID_PARAM")
+	r = c.do(http.MethodPut, s.roomPath("/state/m.room.retention/"), marked(`{"max_lifetime":31536000000}`), true)
+	s.record("state retention", r.status == 200 && r.body.Get("event_id").Str != "", "%d %s", r.status, r.raw)
+	s.expectError("refuse retention min over max", c.do(http.MethodPut, s.roomPath("/state/m.room.retention/"),
+		map[string]any{"min_lifetime": 10, "max_lifetime": 5}, true), 400, "M_BAD_JSON")
+	s.expectError("refuse retention as a message", c.do(http.MethodPut, s.roomPath("/send/m.room.retention/"+esc(s.txn("retention"))),
+		map[string]any{"max_lifetime": 5}, true), 400, "M_UNKNOWN")
+	s.expectError("refuse tombstone to this room", c.do(http.MethodPut, s.roomPath("/state/m.room.tombstone/"),
+		map[string]any{"replacement_room": s.room}, true), 400, "M_UNKNOWN")
+	s.expectError("refuse tombstone without a room", c.do(http.MethodPut, s.roomPath("/state/m.room.tombstone/"),
+		map[string]any{"body": "x"}, true), 400, "M_UNKNOWN")
 
 	// /redact
 	victim := s.send("send to redact", "m.room.message", map[string]any{"msgtype": "m.notice", "body": tag + ": to be redacted"}, "")
 	if victim != "" {
 		r := c.do(http.MethodPut, s.roomPath("/redact/"+esc(victim)+"/"+esc(s.txn("redact"))), map[string]any{"reason": tag}, true)
-		ev := c.do(http.MethodGet, s.roomPath("/event/"+esc(victim)), nil, true)
+		ev := s.redacted(victim)
 		s.record("redact", r.status == 200 && r.body.Get("event_id").Str != "" && ev.body.Get("content").Raw == "{}",
 			"%d %s; redacted content %s", r.status, r.body.Get("event_id").Str, ev.body.Get("content").Raw)
 		if id := r.body.Get("event_id").Str; id != "" {
@@ -384,7 +443,7 @@ func run() int {
 	}
 	if v := s.send("send to redact by POST", "m.room.message", map[string]any{"msgtype": "m.notice", "body": tag + ": redacted by POST"}, ""); v != "" {
 		r := c.do(http.MethodPost, s.roomPath("/redact/"+esc(v)), map[string]any{}, true)
-		ev := c.do(http.MethodGet, s.roomPath("/event/"+esc(v)), nil, true)
+		ev := s.redacted(v)
 		s.record("redact by POST", r.status == 200 && ev.body.Get("content").Raw == "{}", "%d %s", r.status, r.raw)
 		s.expectError("refuse redacts that differs", c.do(http.MethodPut, s.roomPath("/redact/"+esc(v)+"/"+esc(s.txn("mismatch"))),
 			map[string]any{"redacts": "$someotherevent"}, true), 400, "M_INVALID_PARAM")
