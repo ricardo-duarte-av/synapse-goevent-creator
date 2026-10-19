@@ -1,6 +1,11 @@
 {
   "refuse ACL denying this server": "400 {\"errcode\":\"M_UNKNOWN\",\"error\":\"Can't create an ACL event that denies the local server\"}",
   "refuse alias too long": "400 {\"errcode\":\"M_INVALID_PARAM\",\"error\":\"Can't create aliases longer than 255 characters\"}",
+  "refuse appservice bad ts": "400 {\"errcode\":\"M_INVALID_PARAM\",\"error\":\"Query parameter ts must be a positive integer.\"}",
+  "refuse appservice outside its namespace": "403 {\"errcode\":\"M_FORBIDDEN\",\"error\":\"Application service cannot masquerade as this user (@nobody:elsewhere.example).\"}",
+  "refuse appservice sender not in room": "403 {\"errcode\":\"M_FORBIDDEN\",\"error\":\"User @goevent-e2e-as:aguiarvieira.pt not in room !nmZrvcKkeQiFGRlJtE:aguiarvieira.pt\"}",
+  "refuse appservice unknown device": "400 {\"errcode\":\"M_UNKNOWN_DEVICE\",\"error\":\"Application service trying to use a device that doesn't exist ('NOSUCHDEVICE' for @ME)\"}",
+  "refuse appservice unregistered user": "403 {\"errcode\":\"M_FORBIDDEN\",\"error\":\"Application service has not registered this user (@goevent-e2e-ghost-unregistered:aguiarvieira.pt)\"}",
   "refuse bad token": "401 {\"errcode\":\"M_UNKNOWN_TOKEN\",\"error\":\"Invalid access token passed.\",\"soft_logout\":false}",
   "refuse ban of a bad user_id": "400 {\"errcode\":\"M_INVALID_PARAM\",\"error\":\"Expected UserID string to start with '@'\"}",
   "refuse ban without user_id": "400 {\"errcode\":\"M_MISSING_PARAM\",\"error\":\"Missing params: ['user_id']\"}",

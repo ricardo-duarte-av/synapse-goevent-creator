@@ -82,6 +82,7 @@ type step struct {
 type suite struct {
 	c      *client
 	me     string
+	device string
 	room   string
 	run    string
 	steps  []step
@@ -300,7 +301,7 @@ func (s *suite) fork(metricsURL, tag string) {
 		s.skip("send on a fork", "needs -metrics")
 		return
 	}
-	for attempt := 1; attempt <= 5; attempt++ {
+	for attempt := 1; attempt <= 10; attempt++ {
 		before, err := scrape(metricsURL)
 		if err != nil {
 			s.record("send on a fork", false, "%v", err)
@@ -309,7 +310,7 @@ func (s *suite) fork(metricsURL, tag string) {
 		run := fmt.Sprintf("%s-%d", s.run, attempt)
 		// The delayed event first: main sends it a moment after answering,
 		// while the worker is building its own on the same extremity.
-		main := s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/main")+"?org.matrix.msc4140.delay="+strconv.Itoa(attempt*20),
+		main := s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/main")+"?org.matrix.msc4140.delay="+strconv.Itoa(attempt%5*25),
 			map[string]any{"run": run}, true)
 		native := s.c.do(http.MethodPut, s.roomPath("/state/"+typ+"/native"), map[string]any{"run": run}, true)
 		time.Sleep(time.Second)
@@ -336,7 +337,7 @@ func (s *suite) fork(metricsURL, tag string) {
 			return
 		}
 	}
-	s.skip("send on a fork", "no fork in 5 attempts (Synapse serialises, or the timing missed)")
+	s.skip("send on a fork", "no fork in 10 attempts (Synapse serialises, or the timing missed)")
 }
 
 func (s *suite) expectError(name string, r resp, status int, errcodes ...string) {
@@ -508,7 +509,7 @@ func run() int {
 		return 2
 	}
 	me := login.body.Get("user_id").Str
-	s.me = me
+	s.me, s.device = me, login.body.Get("device_id").Str
 	defer func() {
 		r := c.do(http.MethodPost, "/_matrix/client/v3/logout", map[string]any{}, true)
 		if r.status != 200 {
@@ -701,6 +702,7 @@ func run() int {
 	}
 
 	s.fork(*metricsURL, tag)
+	s.appservice(os.Getenv("GOEVENT_E2E_AS_TOKEN"), tag)
 
 	// Membership: a user that does not exist, so nobody is disturbed, and
 	// joins by the test account that is already joined. The account never

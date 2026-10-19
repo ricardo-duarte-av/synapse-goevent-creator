@@ -176,7 +176,21 @@ Each native event is verified against what was persisted
   them ten). The e2e step "send on a fork" races a native state event with
   a delayed one main sends (`?org.matrix.msc4140.delay=`, main's for good:
   it schedules and sends delayed events) and checks the resolved group
-  (`state_before`). It usually forks on the second attempt.
+  (`state_before`). It usually forks within a few attempts (up to 10, the
+  delay cycling 0-100 ms); a skip is timing, not a failure.
+- **The suite's appservice** (`goevent-e2e`, operator, 2026-10-19):
+  `goevent-e2e-appservice.yaml` beside homeserver.yaml, `url: null`,
+  exclusive ghosts `@goevent-e2e-ghost*`, and `@test` non-exclusively to
+  double-puppet. Its `as_token` is in `.claude/deployment-notes.md` only;
+  the suite reads `GOEVENT_E2E_AS_TOKEN` and skips the steps without it.
+  Steps: double puppeting with `ts` and its txn retry (the transaction
+  cache), device masquerading, the one fixed ghost's join, message and
+  leave, and five refusals. Calibrated on Synapse with a local shadow
+  worker (`-record`), 89/90 there, the fork skipped as shadow cannot
+  verify it; then 91/91 fully native locally and 90/91 deployed
+  (`f1944de`, the fork skipped on timing). Synapse answers an appservice's
+  txn retry from `HttpTransactionCache`, which shadow cannot see: no
+  longer a `new_event` mismatch.
 - **Synapse is not asked who the requester is** (M6, operator: "we must not
   depend on synapse"). `requester` is `get_user_by_req` on the database:
   Synapse's token rules (`Mixing Authorization headers...`, `Too many

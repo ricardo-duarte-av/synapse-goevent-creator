@@ -345,6 +345,12 @@ func (c *Checker) check(ctx context.Context, p *Pending, resp []byte) {
 			return
 		}
 	}
+	if p.req.TxnID != "" && p.device == "" && existed {
+		// No device, so no transaction mapping (an appservice): Synapse
+		// answered from HttpTransactionCache, which is in its memory.
+		r.record("txn_dedup", Skipped, func(e *zerolog.Event) { e.Str("reason", "transaction cache") })
+		return
+	}
 	if p.req.Endpoint == route.State {
 		predicted, prevID := c.predictStateDedup(ctx, p)
 		r.compare("state_dedup", predicted == existed && (!predicted || prevID == eventID), func(e *zerolog.Event) {
