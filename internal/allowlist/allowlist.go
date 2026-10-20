@@ -20,6 +20,9 @@ var Permitted = []string{
 	// The policy server room (MSC4284), its policy server the e2e fake
 	// (cmd/goevent-policy, policy.aguiarvieira.pt), v11. Operator, 2026-10-20.
 	"!FRudVQysKkIHAjrSzd:aguiarvieira.pt",
+	// The v12 test room (MSC4291 room ID: the create event's hash).
+	// Operator, 2026-10-20.
+	"!goBCqT-LJRiRgPetKo34PrUe4GqYZ_R74c6SBGLwTo4",
 }
 
 // List is the configured subset of Permitted.
