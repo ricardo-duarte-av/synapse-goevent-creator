@@ -136,7 +136,9 @@ Each native event is verified against what was persisted
   ACL and fork skipped), then 100/101 fully native, every non-member event
   stored with the policy signature. Every server in that room asks the fake:
   keep it running. Since 2026-10-20 the room's `m.room.policy` is `{}` (no
-  policy server; the fake stays up to be put back).
+  policy server) and the bot was kicked, to retire the fake: putting a
+  policy server back means inviting and joining the bot again
+  (control `/join`) before restoring `m.room.policy`.
 - **The v12 room** (`!goBCqT-LJRiRgPetKo34PrUe4GqYZ_R74c6SBGLwTo4`,
   operator, 2026-10-20): MSC4291 room ID, the creator's unlimited power,
   state resolution v2.1. `TestLiveRebuildsSynapseEvents` covers its events;
