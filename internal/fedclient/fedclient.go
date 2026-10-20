@@ -19,6 +19,7 @@ import (
 
 	"github.com/tidwall/gjson"
 	"go.mau.fi/util/exhttp"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/federation"
 
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pyjson"
@@ -42,8 +43,9 @@ func New(serverName, keyLine string, allow func(string) bool, ranges synapsecfg.
 		return nil, fmt.Errorf("fedclient: signing key: %w", err)
 	}
 	s := exhttp.SensibleClientSettings
-	s.GlobalTimeout = queryTimeout
-	s.ResponseHeaderTimeout = queryTimeout
+	// The longest request's: each request bounds itself with its context.
+	s.GlobalTimeout = policyTimeout
+	s.ResponseHeaderTimeout = policyTimeout
 	c := federation.NewClient(serverName, key, federation.NewInMemoryCache(), s)
 	// mautrix sets no Content-Type; Synapse sends application/json.
 	c.HTTP.Transport = &jsonContentType{Next: c.HTTP.Transport}
@@ -81,6 +83,53 @@ func (c *Client) ProfileField(ctx context.Context, userID, field string) (v gjso
 		return gjson.Result{}, false
 	}
 	return r.Get(gjson.Escape(field)), true
+}
+
+// policyTimeout is ask_policy_server_to_sign_event's timeout=30000.
+const policyTimeout = 30 * time.Second
+
+// PolicySign is FederationClient.ask_policy_server_to_sign_event: the event
+// (as get_pdu_json gives it) POSTed to the policy server's sign endpoint,
+// and to the unstable one when the stable one is unknown. It returns the
+// answer's status and body; err is a request that got no answer at all.
+func (c *Client) PolicySign(ctx context.Context, server string, event []byte) (status int, body []byte, err error) {
+	ctx, cancel := context.WithTimeout(ctx, policyTimeout)
+	defer cancel()
+	status, body, err = c.post(ctx, server, mautrix.BaseURLPath{"_matrix", "policy", "v1", "sign"}, event)
+	if err == nil && unknownEndpoint(status, body) {
+		status, body, err = c.post(ctx, server, mautrix.BaseURLPath{"_matrix", "policy", "unstable", "org.matrix.msc4284", "sign"}, event)
+	}
+	return status, body, err
+}
+
+func (c *Client) post(ctx context.Context, server string, path mautrix.BaseURLPath, event []byte) (int, []byte, error) {
+	body, resp, err := c.fed.MakeFullRequest(ctx, federation.RequestParams{
+		ServerName:   server,
+		Method:       http.MethodPost,
+		Path:         path,
+		Authenticate: true,
+		RequestJSON:  json.RawMessage(event),
+	})
+	switch {
+	case resp != nil && resp.StatusCode >= 300:
+		// mautrix reports a non-2xx answer as an error; it is an answer.
+		return resp.StatusCode, body, nil
+	case err != nil:
+		return 0, nil, err
+	}
+	return resp.StatusCode, body, nil
+}
+
+// unknownEndpoint is is_unknown_endpoint (http/client.py).
+func unknownEndpoint(status int, body []byte) bool {
+	errcode := gjson.GetBytes(body, "errcode").Str
+	switch status {
+	case 404, 405:
+		return len(body) == 0 || body[0] != '{' || errcode == "M_UNRECOGNIZED"
+	case 400:
+		return errcode == "M_UNRECOGNIZED"
+	}
+	return false
 }
 
 type jsonContentType struct{ Next http.RoundTripper }

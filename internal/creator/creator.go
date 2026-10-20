@@ -182,6 +182,9 @@ type Options struct {
 	TrackAppserviceUserIPs, TrackPuppetedUserIPs bool
 	// Delayed is delayed events' settings.
 	Delayed synapsecfg.Delayed
+	// Policy asks rooms' policy servers to sign events (MSC4284); nil
+	// leaves rooms with one to Synapse.
+	Policy PolicySigner
 	// RemoteProfiles queries remote servers for profiles; nil leaves
 	// remote targets' membership to Synapse.
 	RemoteProfiles RemoteProfiles
@@ -856,16 +859,6 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		return nil, "", st
 	}
 	before := sb.state
-	// MSC4284: Synapse asks the room's policy server to sign every local
-	// event it sends through the non-member path, and refuses what it calls
-	// spam.
-	if in.member == nil {
-		for _, t := range []string{"m.room.policy", "org.matrix.msc4284.policy"} {
-			if _, ok := before[pdu.StateKey{Type: t}]; ok {
-				return nil, "", fb("policy_server")
-			}
-		}
-	}
 	if in.member != nil {
 		id, st := c.checkMembership(ctx, req, rq, in, rv, before)
 		if st != nil {
@@ -893,21 +886,6 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 			return nil, "", fb("db_error")
 		} else if public {
 			return nil, "", forbidden("call_invite_public", "Call invites are not allowed in public rooms.").stop()
-		}
-	}
-
-	// handle_new_client_event: dedup, then the auth rules.
-	if in.stateKey != nil {
-		if id, err := c.duplicate(ctx, before, in, rq); err != nil {
-			return nil, "", fb("db_error")
-		} else if id != "" {
-			in.dedupKind = "state_dedup"
-			return nil, id, nil
-		}
-	}
-	if in.redacts != nil {
-		if st := c.checkRedaction(ctx, req, *in.redacts); st != nil {
-			return nil, "", st
 		}
 	}
 
@@ -963,6 +941,29 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	if err := pdu.CheckPDUJSON(withUnsigned, rv); err != nil {
 		return nil, "", fb("invalid_json")
 	}
+	// MSC4284: the room's policy server signs every event the non-member
+	// path sends, before it is handled.
+	if in.member == nil {
+		if st := c.policyCheck(ctx, built, withUnsigned, rv, before, in); st != nil {
+			return nil, "", st
+		}
+	}
+
+	// handle_new_client_event: dedup, then the auth rules.
+	if in.stateKey != nil {
+		if id, err := c.duplicate(ctx, before, in, rq); err != nil {
+			return nil, "", fb("db_error")
+		} else if id != "" {
+			in.dedupKind = "state_dedup"
+			return nil, id, nil
+		}
+	}
+	if in.redacts != nil {
+		if st := c.checkRedaction(ctx, req, *in.redacts); st != nil {
+			return nil, "", st
+		}
+	}
+
 	// validate_event_for_room_version: _check_size_limits.
 	if se := pdu.CheckPDUSize(withUnsigned); se != nil {
 		return nil, "", tooLarge(se).stop()

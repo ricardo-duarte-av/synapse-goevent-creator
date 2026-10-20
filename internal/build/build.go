@@ -20,6 +20,7 @@ import (
 	"slices"
 
 	"go.mau.fi/util/jsontime"
+	"maunium.net/go/mautrix/crypto/canonicaljson"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/federation"
 	"maunium.net/go/mautrix/federation/pdu"
@@ -168,4 +169,26 @@ func toEventIDs(ss []string) []id.EventID {
 		out[i] = id.EventID(s)
 	}
 	return out
+}
+
+// SigningBytes is what a signature on the event covers: the event as
+// Synapse redacts it (msc4354_sticky dropped), without signatures and
+// unsigned, in canonical JSON.
+func SigningBytes(ev *pdu.PDU, rv id.RoomVersion) ([]byte, error) {
+	c := ev.Clone()
+	c.Sticky = nil
+	return canonicaljson.Marshal(c.RedactForSignature(rv))
+}
+
+// AddSignature adds another server's signature to the event, as
+// add_signature does, and re-renders its JSON. The event ID does not cover
+// signatures.
+func (e *Event) AddSignature(server string, keyID id.KeyID, sig string) error {
+	e.PDU.AddSignature(server, keyID, sig)
+	raw, err := jsonMarshal(e.PDU)
+	if err != nil {
+		return fmt.Errorf("build: marshal: %w", err)
+	}
+	e.JSON = raw
+	return nil
 }

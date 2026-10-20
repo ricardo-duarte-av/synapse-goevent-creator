@@ -17,6 +17,9 @@ import (
 var Permitted = []string{
 	"!decSfHzLLhrNKJaZid:aguiarvieira.pt", // TEST6TEST, v11
 	"!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt", // TEST7TESTE, v11
+	// The policy server room (MSC4284), its policy server the e2e fake
+	// (cmd/goevent-policy, policy.aguiarvieira.pt), v11. Operator, 2026-10-20.
+	"!FRudVQysKkIHAjrSzd:aguiarvieira.pt",
 }
 
 // List is the configured subset of Permitted.

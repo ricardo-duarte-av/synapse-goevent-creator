@@ -52,6 +52,25 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  # The e2e suite's fake MSC4284 policy server, policy.aguiarvieira.pt: its
+  # own minimal homeserver (keys, one bot, /send, /_matrix/policy/v1/sign).
+  # The reverse proxy forwards policy.aguiarvieira.pt:443 to the host's
+  # 28448; the control listener (mode, join) is the host's localhost only.
+  #
+  #   mkdir -p ./policy && chown 991:991 ./policy   # keys are kept here
+  goevent-policy:
+    image: ghcr.io/ricardo-duarte-av/synapse-goevent-creator:latest
+    container_name: goevent-policy
+    restart: unless-stopped
+    user: "991:991"
+    entrypoint: ["/goevent-policy"]
+    command: ["-server", "policy.aguiarvieira.pt", "-listen", ":28448", "-control", ":28449", "-data", "/data"]
+    volumes:
+      - ./policy:/data
+    ports:
+      - "28448:28448"
+      - "127.0.0.1:28449:28449"
+
 networks:
   npm-nw6:
     external: true

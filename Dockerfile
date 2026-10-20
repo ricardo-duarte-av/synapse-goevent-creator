@@ -20,9 +20,14 @@ RUN CGO_ENABLED=0 GOEXPERIMENT=jsonv2 go build -trimpath \
         -X main.tag=${TAG} \
         -X main.commit=${COMMIT} \
         -X main.buildTime=${BUILD_TIME}" \
-      -o /out/goevent-creator ./cmd/goevent-creator
+      -o /out/goevent-creator ./cmd/goevent-creator && \
+    CGO_ENABLED=0 GOEXPERIMENT=jsonv2 go build -trimpath -ldflags="-s -w" \
+      -o /out/goevent-policy ./cmd/goevent-policy
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/goevent-creator /goevent-creator
+# The e2e suite's fake policy server (cmd/goevent-policy), run as its own
+# service with --entrypoint /goevent-policy.
+COPY --from=build /out/goevent-policy /goevent-policy
 ENTRYPOINT ["/goevent-creator"]
 CMD ["-config", "/data/goevent-creator.yaml"]

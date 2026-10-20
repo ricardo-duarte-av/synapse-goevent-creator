@@ -25,8 +25,9 @@ The plan, with what Synapse does on the creator vs. the persister, is in
 
 ## Decisions that are easy to undo by accident
 
-- **Writes only to TEST6TEST (`!decSfHzLLhrNKJaZid`) and TEST7TESTE
-  (`!nmZrvcKkeQiFGRlJtE`)** (operator, 2026-10-16). Compiled into
+- **Writes only to TEST6TEST (`!decSfHzLLhrNKJaZid`), TEST7TESTE
+  (`!nmZrvcKkeQiFGRlJtE`)** (operator, 2026-10-16) **and the policy room
+  (`!FRudVQysKkIHAjrSzd`)** (operator, 2026-10-20). Compiled into
   `internal/allowlist.Permitted`; the config can narrow it, never widen it.
   Every write path asks `allowlist.Check`, and only it. Both rooms have
   remote members, so what we write federates.
@@ -110,10 +111,30 @@ Each native event is verified against what was persisted
   `events`: the role needs SELECT on it (found by `TestWritesAsTheRole`).
 - The write role is created or repaired at startup over PostgreSQL's socket with
   homeserver.yaml's credentials (`dbrole.Ensure`); its password is derived.
-- **Policy servers (MSC4284)**: Synapse asks a room's policy server to sign
-  every local event and refuses what it calls spam
-  (`_create_and_send_nonmember_event_locked`). Neither test room has one; a
-  room with `m.room.policy` (or the unstable type) in its state falls back.
+- **Policy servers (MSC4284) are served** (`creator/policy.go`), as
+  `_create_and_send_nonmember_event_locked` uses `RoomPolicyHandler`: after
+  the event is built and before dedup and the auth rules, a non-member event
+  (not the policy event itself) is POSTed to the room's policy server
+  (`/_matrix/policy/v1/sign`, the unstable path when that is unknown, 30 s),
+  its signatures added; then the `ed25519:policy_server` signature must
+  verify against `m.room.policy`'s key, or it is asked once more and the event
+  refused ("This message has been rejected as probable spam"). A 4xx is
+  relayed as `to_synapse_error` writes it, a 5xx, 429 or no answer is a 500,
+  an empty answer the policy server's spam refusal. The policy server counts
+  only when it is a valid server name, not ours, and has a member joined.
+  Membership is never asked. A signature does not change the event ID.
+- **The policy room** (`!FRudVQysKkIHAjrSzd`, v11, operator, 2026-10-20) has
+  the fake policy server `policy.aguiarvieira.pt` (`cmd/goevent-policy`, the
+  `goevent-policy` compose service: its own keys, one bot that joined over
+  federation, `/send`, `/sign`, and a localhost control listener on 28449 to
+  switch it between sign, refuse, empty and error). It signs everything but
+  bodies with `goevent-spam`. Run the suite there with `-room` and
+  `-policy-control http://127.0.0.1:28449` and
+  `-golden cmd/goevent-e2e/refusals.policy.golden.json` (room IDs in some
+  refusals make the room's own recording). Calibrated on Synapse (99/101,
+  ACL and fork skipped), then 100/101 fully native, every non-member event
+  stored with the policy signature. Every server in that room asks the fake:
+  keep it running.
 - **State events**: dedup (`deduplicate_state_event`) is checked before auth,
   as Synapse does; Synapse stores the new state group *before* dedup and leaves
   it orphaned, we do not store it. The new group is a delta of exactly the

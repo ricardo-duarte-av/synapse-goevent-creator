@@ -494,6 +494,7 @@ func run() int {
 	room := flag.String("room", "!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt", "an allowlisted room the account may write to")
 	metricsURL := flag.String("metrics", "", "the worker's /metrics, to check its counters (optional)")
 	goldenPath := flag.String("golden", "cmd/goevent-e2e/refusals.golden.json", "Synapse's refusal bodies, recorded")
+	policyControl := flag.String("policy-control", "", "the fake policy server's control listener, for the policy room's steps")
 	record := flag.Bool("record", false, "record the refusal bodies to -golden instead of comparing (run against Synapse)")
 	flag.Parse()
 
@@ -732,6 +733,7 @@ func run() int {
 	}
 
 	s.delayed()
+	s.policy(*policyControl, tag)
 	s.fork(*metricsURL, tag)
 	s.appservice(os.Getenv("GOEVENT_E2E_AS_TOKEN"), tag)
 
