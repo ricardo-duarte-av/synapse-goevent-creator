@@ -549,9 +549,11 @@ func (c *Creator) perRoomJoins(ctx context.Context, room string) (bool, int64, e
 // limitExceeded is LimitExceededError as the client sees it, after the half
 // second Synapse pauses before answering.
 func (c *Creator) limitExceeded(ctx context.Context, w http.ResponseWriter, limiter string, retryMS int64) Outcome {
-	select {
-	case <-time.After(500 * time.Millisecond):
-	case <-ctx.Done():
+	if !c.dry {
+		select {
+		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+		}
 	}
 	b, _ := json.Marshal(map[string]any{"errcode": "M_LIMIT_EXCEEDED", "error": "Too Many Requests", "retry_after_ms": retryMS})
 	w.Header().Set("Content-Type", "application/json")

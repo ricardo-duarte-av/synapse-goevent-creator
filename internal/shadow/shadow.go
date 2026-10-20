@@ -104,7 +104,10 @@ type Options struct {
 	// in a room outside the allowlist (PrepareOther). Zero uses 250ms and 8.
 	PrepareBudget      time.Duration
 	PrepareConcurrency int
-	Log                zerolog.Logger
+	// Predictor answers a request as the native path would, without
+	// effect; nil skips comparing refusals.
+	Predictor Predictor
+	Log       zerolog.Logger
 }
 
 // Checker runs shadow checks.
@@ -157,6 +160,11 @@ type Pending struct {
 	// private is a room outside the allowlist: real users' events, whose
 	// content is not logged.
 	private bool
+	// method, uri, header and raw are the request as it came, for
+	// predicting a refusal.
+	method, uri string
+	header      http.Header
+	raw         []byte
 }
 
 // Prepare reads the room before the request is proxied. r.Body is replaced
@@ -188,7 +196,7 @@ func (c *Checker) PrepareOther(ctx context.Context, r *http.Request, req route.R
 }
 
 func (c *Checker) prepare(ctx context.Context, r *http.Request, req route.Request, budget time.Duration) *Pending {
-	p := &Pending{req: req, query: r.URL.Query()}
+	p := &Pending{req: req, query: r.URL.Query(), method: r.Method, uri: r.URL.RequestURI(), header: r.Header.Clone()}
 
 	if r.Body != nil {
 		head, err := io.ReadAll(io.LimitReader(r.Body, MaxBody+1))
@@ -199,7 +207,7 @@ func (c *Checker) prepare(ctx context.Context, r *http.Request, req route.Reques
 			p.tooLarge = true
 		}
 		r.Body = readCloser{io.MultiReader(bytes.NewReader(head), r.Body), r.Body}
-		p.body = head
+		p.body, p.raw = head, head
 		// As json.loads holds it: a repeated key's last value.
 		if d, err := pyjson.Dedupe(head); err == nil {
 			p.body = d
@@ -286,9 +294,11 @@ type readCloser struct {
 func (c *Checker) Check(p *Pending, status int, body []byte) {
 	ep := string(p.req.Endpoint)
 	if status != http.StatusOK {
-		// A refusal is Synapse's decision too; checking that we would refuse
-		// needs the native path's validation, which comes with it.
 		checks.WithLabelValues(ep, "request", "status_"+strconv.Itoa(status)).Inc()
+		// A refusal: what would the native path have answered?
+		if c.o.Predictor != nil && !p.tooLarge {
+			c.async(ep, func(ctx context.Context) { c.checkRefusal(ctx, p, status, body) })
+		}
 		return
 	}
 	select {

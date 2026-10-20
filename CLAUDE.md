@@ -405,6 +405,18 @@ cap (`prepare_concurrency`, 8), past which the request is simply forwarded
 identifies requesters from the database too: whoami is gone entirely.
 The read-only pool defaults to 16 connections with it.
 
+**Refusals are compared too** (check `refusal`): when Synapse answers a
+shadowed request with anything but 200, the native path runs dry on the
+same request after it (`creator.NewPredictor`: no writer, no events writer,
+no main, no policy server, no remote server, no USER_IP; it stops before
+persisting and before a delayed event's insert). Nothing was written for a
+refusal, so the room is as it was. Results: `match` (same status and
+canonical body), `mismatch`, `accepted` (we would have served what Synapse
+refused: the one to look at first), `skip_fallback` (the native path would
+leave it to Synapse) and `skip_ratelimit` (Synapse's 429, or ours: each
+process has its own counters). Outside the allowlist the log has status and
+errcode only, as messages can quote content.
+
 Proxies everything, and for each write in an allowlisted room re-derives
 Synapse's decisions and compares (`internal/shadow`): `txn_dedup`,
 `state_dedup`, `membership_noop`, `sender`, `prev_events`, `depth`,

@@ -210,6 +210,8 @@ type Creator struct {
 	lim          *membershipLimiters
 	msgOnce      sync.Once
 	msgLimiter   *ratelimit.Limiter
+	// dry is a predictor's (NewPredictor): it never persists.
+	dry bool
 	// verify is replaced in tests.
 	verify func(v pending)
 }
@@ -1077,6 +1079,11 @@ func (c *Creator) checkRedaction(ctx context.Context, req route.Request, target 
 // persist writes what the creator writes, then sends the event to its
 // writer: _persist_events.
 func (c *Creator) persist(ctx context.Context, w http.ResponseWriter, p *prepared) Outcome {
+	if c.dry {
+		// A predictor: everything Synapse could refuse has passed.
+		c.respond(w, p.in, p.ev.ID)
+		return Outcome{Result: "would_create"}
+	}
 	room := p.req.Room
 	// check_state_groups_and_bump_deletion on what the state relies on: a
 	// resolution's inputs, or the one group.

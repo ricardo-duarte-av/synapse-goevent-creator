@@ -123,12 +123,15 @@ func run(cfg *config.Config, log zerolog.Logger) error {
 			return err
 		}
 		defer d.close()
-		checker = d.checker(cfg, hs, log)
+		var predictor shadow.Predictor
 		if cfg.AnyNative() {
 			if native, err = d.creator(ctx, hs, log); err != nil {
 				return err
 			}
+			// The native path run dry, for comparing Synapse's refusals.
+			predictor = native.Predictor()
 		}
+		checker = d.checker(cfg, hs, log, predictor)
 	}
 
 	up, err := proxy.New(cfg.Upstream, log)
@@ -302,7 +305,7 @@ func connect(ctx context.Context, cfg *config.Config, hs *synapsecfg.Config, log
 	return d, nil
 }
 
-func (d *deps) checker(cfg *config.Config, hs *synapsecfg.Config, log zerolog.Logger) *shadow.Checker {
+func (d *deps) checker(cfg *config.Config, hs *synapsecfg.Config, log zerolog.Logger, predictor shadow.Predictor) *shadow.Checker {
 	// The checker identifies requesters from the database, as the native
 	// path does: no whoami on main for every request it reads.
 	services, err := appservice.Load(hs.AppServiceFiles, hs.ServerName)
@@ -318,6 +321,7 @@ func (d *deps) checker(cfg *config.Config, hs *synapsecfg.Config, log zerolog.Lo
 		Sticky:             hs.Flag("msc4354_enabled", false),
 		Concurrency:        cfg.Shadow.Concurrency,
 		Timeout:            time.Duration(cfg.Shadow.TimeoutSeconds) * time.Second,
+		Predictor:          predictor,
 		PrepareBudget:      time.Duration(cfg.Shadow.PrepareMS) * time.Millisecond,
 		PrepareConcurrency: cfg.Shadow.PrepareConcurrency,
 		Log:                log,

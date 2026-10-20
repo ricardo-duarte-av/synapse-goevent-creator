@@ -61,6 +61,11 @@ func (c *Creator) addDelayed(ctx context.Context, w http.ResponseWriter, rq *req
 		dev := rq.DeviceID
 		row.DeviceID = &dev
 	}
+	if c.dry {
+		body, _ := json.Marshal(map[string]string{"delay_id": row.DelayID})
+		writeJSON(w, body)
+		return Outcome{Result: "delayed"}
+	}
 	next, err := c.o.Writer.AddDelayedEvent(ctx, row, d.PerUser)
 	var le *writer.DelayedLimitError
 	switch {
