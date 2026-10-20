@@ -55,11 +55,17 @@ database:
   host: /var/sockets
   max_conns: 4
 
-auth:
-  # Synapse's whoami, to know who sent a request. Empty: the first upstream.
-  whoami_socket: ""
-  cache_seconds: 60
+# (auth: whoami_socket/cache_seconds are no longer used: requesters are
+# identified from Synapse's database.)
 
 shadow:
   concurrency: 8
   timeout_seconds: 30
+  # Check writes in every room, not only the allowlisted ones. Read-only:
+  # writes stay limited to the allowlist. Each such request is read before it
+  # is forwarded, within prepare_ms, at most prepare_concurrency at a time;
+  # beyond either it is just forwarded (goevent_shadow_checks_total
+  # {check="request",result="skip_slow"|"skip_busy"}).
+  all_rooms: false
+  prepare_ms: 250
+  prepare_concurrency: 8

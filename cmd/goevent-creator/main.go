@@ -190,11 +190,37 @@ func run(cfg *config.Config, log zerolog.Logger) error {
 	return srv.Shutdown(shutdownCtx)
 }
 
+// dbAuth identifies a shadowed request's sender from access_tokens, or an
+// appservice's registration and the user it says it acts as. A token the
+// database does not know is invalid to it: Synapse's answer is then not a
+// 200, which is not checked anyway.
+type dbAuth struct {
+	store    *pdustore.Store
+	services map[string]*appservice.Service
+}
+
+func (a *dbAuth) AuthenticateAs(ctx context.Context, creds auth.Credentials) (auth.Verdict, error) {
+	if s := a.services[creds.Token]; s != nil {
+		user := s.Sender
+		if creds.UserID != "" {
+			user = creds.UserID
+		}
+		return auth.Verdict{Valid: true, UserID: user, DeviceID: creds.DeviceID}, nil
+	}
+	t, err := a.store.Token(ctx, creds.Token)
+	if errors.Is(err, pdustore.ErrNotFound) {
+		return auth.Verdict{}, nil
+	}
+	if err != nil {
+		return auth.Verdict{}, err
+	}
+	return auth.Verdict{Valid: true, UserID: t.UserID, DeviceID: t.DeviceID, IsGuest: t.Guest}, nil
+}
+
 // deps are what shadow and native mode share.
 type deps struct {
 	db      *pdustore.Store
 	key     *build.Key
-	authn   *auth.Authenticator
 	push    *pushcalc.Calculator
 	closers []func()
 }
@@ -221,7 +247,7 @@ func direct(cfg *config.Config, hs *synapsecfg.Config) (synapsecfg.Database, err
 }
 
 // connect opens what shadow mode reads: the database, read-only, the signing
-// key, whoami and the push rules.
+// key and the push rules.
 func connect(ctx context.Context, cfg *config.Config, hs *synapsecfg.Config, log zerolog.Logger) (*deps, error) {
 	d := &deps{}
 	dsn := cfg.Database.DSN
@@ -238,6 +264,10 @@ func connect(ctx context.Context, cfg *config.Config, hs *synapsecfg.Config, log
 	maxConns := int32(cfg.Database.MaxConns)
 	if maxConns == 0 {
 		maxConns = 4
+		if cfg.Shadow.AllRooms {
+			// Every room's writes are read before they are forwarded.
+			maxConns = 16
+		}
 	}
 	db, err := pdustore.Open(ctx, dsn, maxConns)
 	if err != nil {
@@ -263,25 +293,6 @@ func connect(ctx context.Context, cfg *config.Config, hs *synapsecfg.Config, log
 	}
 	log.Info().Str("key_id", string(d.key.ID)).Msg("Loaded the signing key")
 
-	whoami := cfg.Auth.WhoamiSocket
-	if whoami == "" {
-		whoami = cfg.Upstream.Sockets[0]
-	}
-	ttl := time.Duration(cfg.Auth.CacheSeconds) * time.Second
-	if ttl == 0 {
-		ttl = time.Minute
-	}
-	if d.authn, err = auth.New(auth.Config{
-		WhoamiSocket: whoami,
-		PositiveTTL:  ttl,
-		NegativeTTL:  10 * time.Second,
-		MaxEntries:   1024,
-		Timeout:      10 * time.Second,
-	}); err != nil {
-		d.close()
-		return nil, err
-	}
-
 	pushCfg, err := pushcalc.ConfigFor(hs)
 	if err != nil {
 		d.close()
@@ -292,16 +303,24 @@ func connect(ctx context.Context, cfg *config.Config, hs *synapsecfg.Config, log
 }
 
 func (d *deps) checker(cfg *config.Config, hs *synapsecfg.Config, log zerolog.Logger) *shadow.Checker {
+	// The checker identifies requesters from the database, as the native
+	// path does: no whoami on main for every request it reads.
+	services, err := appservice.Load(hs.AppServiceFiles, hs.ServerName)
+	if err != nil {
+		log.Warn().Err(err).Msg("Appservice registrations unreadable: their requests are not shadow-checked")
+	}
 	return shadow.New(shadow.Options{
-		Store:       d.db,
-		Auth:        d.authn,
-		Key:         d.key,
-		Push:        d.push,
-		ServerName:  hs.ServerName,
-		Sticky:      hs.Flag("msc4354_enabled", false),
-		Concurrency: cfg.Shadow.Concurrency,
-		Timeout:     time.Duration(cfg.Shadow.TimeoutSeconds) * time.Second,
-		Log:         log,
+		Store:              d.db,
+		Auth:               &dbAuth{store: d.db, services: services},
+		Key:                d.key,
+		Push:               d.push,
+		ServerName:         hs.ServerName,
+		Sticky:             hs.Flag("msc4354_enabled", false),
+		Concurrency:        cfg.Shadow.Concurrency,
+		Timeout:            time.Duration(cfg.Shadow.TimeoutSeconds) * time.Second,
+		PrepareBudget:      time.Duration(cfg.Shadow.PrepareMS) * time.Millisecond,
+		PrepareConcurrency: cfg.Shadow.PrepareConcurrency,
+		Log:                log,
 	})
 }
 

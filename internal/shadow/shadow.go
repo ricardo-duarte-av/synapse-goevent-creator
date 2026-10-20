@@ -100,13 +100,18 @@ type Options struct {
 	// Concurrency bounds checks in flight; more are dropped and counted.
 	Concurrency int
 	Timeout     time.Duration
-	Log         zerolog.Logger
+	// PrepareBudget and PrepareConcurrency bound the read before a request
+	// in a room outside the allowlist (PrepareOther). Zero uses 250ms and 8.
+	PrepareBudget      time.Duration
+	PrepareConcurrency int
+	Log                zerolog.Logger
 }
 
 // Checker runs shadow checks.
 type Checker struct {
-	o   Options
-	sem chan struct{}
+	o       Options
+	sem     chan struct{}
+	prepSem chan struct{}
 }
 
 // New builds a Checker.
@@ -117,7 +122,13 @@ func New(o Options) *Checker {
 	if o.Timeout <= 0 {
 		o.Timeout = 30 * time.Second
 	}
-	return &Checker{o: o, sem: make(chan struct{}, o.Concurrency)}
+	if o.PrepareBudget <= 0 {
+		o.PrepareBudget = 250 * time.Millisecond
+	}
+	if o.PrepareConcurrency <= 0 {
+		o.PrepareConcurrency = 8
+	}
+	return &Checker{o: o, sem: make(chan struct{}, o.Concurrency), prepSem: make(chan struct{}, o.PrepareConcurrency)}
 }
 
 // Pending is what was read before the request was proxied.
@@ -143,12 +154,40 @@ type Pending struct {
 	// skip, when set, is why nothing will be checked.
 	skip string
 	err  error
+	// private is a room outside the allowlist: real users' events, whose
+	// content is not logged.
+	private bool
 }
 
 // Prepare reads the room before the request is proxied. r.Body is replaced
 // by an equivalent reader, so the request can be forwarded unchanged.
 // Prepare never fails the request: problems are recorded in the result.
 func (c *Checker) Prepare(ctx context.Context, r *http.Request, req route.Request) *Pending {
+	return c.prepare(ctx, r, req, c.o.Timeout)
+}
+
+// PrepareOther is Prepare for a room outside the allowlist, a real user's:
+// the read gets PrepareBudget, and at most PrepareConcurrency run, so a
+// request is never held up for long. A request it cannot read in time is
+// not checked (nil). Its mismatches are logged without content.
+func (c *Checker) PrepareOther(ctx context.Context, r *http.Request, req route.Request) *Pending {
+	select {
+	case c.prepSem <- struct{}{}:
+	default:
+		checks.WithLabelValues(string(req.Endpoint), "request", "skip_busy").Inc()
+		return nil
+	}
+	defer func() { <-c.prepSem }()
+	p := c.prepare(ctx, r, req, c.o.PrepareBudget)
+	if p.err != nil && errors.Is(p.err, context.DeadlineExceeded) {
+		checks.WithLabelValues(string(req.Endpoint), "request", "skip_slow").Inc()
+		return nil
+	}
+	p.private = true
+	return p
+}
+
+func (c *Checker) prepare(ctx context.Context, r *http.Request, req route.Request, budget time.Duration) *Pending {
 	p := &Pending{req: req, query: r.URL.Query()}
 
 	if r.Body != nil {
@@ -178,7 +217,7 @@ func (c *Checker) Prepare(ctx context.Context, r *http.Request, req route.Reques
 		return p
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, c.o.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	v, err := c.o.Auth.AuthenticateAs(ctx, auth.ExtractCredentials(r))
@@ -272,14 +311,18 @@ type run struct {
 	eventID string
 	log     zerolog.Logger
 	results map[string]string
+	private bool
 }
+
+// contentChecks log event content on a mismatch.
+var contentChecks = map[string]bool{"content": true, "rebuild": true, "find_event": true}
 
 func (r *run) record(check, result string, detail func(*zerolog.Event)) {
 	r.results[check] = result
 	checks.WithLabelValues(r.ep, check, result).Inc()
 	if result == Mismatch || result == Error {
 		e := r.log.Warn().Str("check", check).Str("result", result).Str("event_id", r.eventID)
-		if detail != nil {
+		if detail != nil && !(r.private && contentChecks[check]) {
 			detail(e)
 		}
 		e.Msg("Shadow check disagrees with Synapse")
@@ -296,12 +339,16 @@ func (r *run) compare(check string, ok bool, detail func(*zerolog.Event)) {
 
 func (c *Checker) check(ctx context.Context, p *Pending, resp []byte) {
 	r := &run{ep: string(p.req.Endpoint), log: c.o.Log.With().Str("endpoint", string(p.req.Endpoint)).
-		Str("room_id", p.req.Room).Logger(), results: map[string]string{}}
+		Str("room_id", p.req.Room).Logger(), results: map[string]string{}, private: p.private}
 	defer func() {
 		if r.eventID == "" {
 			return
 		}
-		r.log.Info().Str("event_id", r.eventID).Interface("results", r.results).Msg("Shadow check")
+		l := r.log.Info()
+		if r.private {
+			l = r.log.Debug()
+		}
+		l.Str("event_id", r.eventID).Interface("results", r.results).Msg("Shadow check")
 	}()
 
 	switch {

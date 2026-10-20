@@ -85,13 +85,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		served = "fallback"
 	}
 
-	// Proxied, and in an allowlisted room also checked.
+	// Proxied, and in an allowlisted room also checked; with
+	// shadow.all_rooms, in every other room too, read-only and on a budget.
 	var pending *shadow.Pending
-	if ours && h.checker != nil && (mode == config.ModeShadow || mode == config.ModeNative) {
+	shadowed := h.checker != nil && (mode == config.ModeShadow || mode == config.ModeNative)
+	switch {
+	case ours && shadowed:
 		pending = h.checker.Prepare(r.Context(), r, req)
-		if served == "proxy" {
-			served = "shadow"
-		}
+	case req.Write && !ours && shadowed && h.cfg.Shadow.AllRooms && req.Room != "" && req.Room[0] == '!' &&
+		req.Endpoint != route.Knock:
+		pending = h.checker.PrepareOther(r.Context(), r, req)
+	}
+	if pending != nil && served == "proxy" {
+		served = "shadow"
 	}
 
 	capture := int64(0)

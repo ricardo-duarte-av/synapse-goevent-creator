@@ -394,6 +394,15 @@ invite-only**.
 
 ## Shadow mode (M2)
 
+**`shadow.all_rooms`** (2026-10-20, for real traffic): writes in every room
+are checked, not only the allowlisted ones; it only reads. Outside the
+allowlist the read before forwarding has a budget (`prepare_ms`, 250) and a
+cap (`prepare_concurrency`, 8), past which the request is simply forwarded
+(`skip_slow`, `skip_busy`); mismatches there are logged without content
+(no event JSON, no bodies), and the per-event summary is at debug. Shadow
+identifies requesters from the database too: whoami is gone entirely.
+The read-only pool defaults to 16 connections with it.
+
 Proxies everything, and for each write in an allowlisted room re-derives
 Synapse's decisions and compares (`internal/shadow`): `txn_dedup`,
 `state_dedup`, `membership_noop`, `sender`, `prev_events`, `depth`,

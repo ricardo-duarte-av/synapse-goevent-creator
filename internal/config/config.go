@@ -86,13 +86,12 @@ type Database struct {
 	MaxConns int `yaml:"max_conns"`
 }
 
-// Auth is how requesters are identified: Synapse's whoami.
+// Auth is no longer used: requesters are identified from the database, not
+// by Synapse's whoami. Its keys are still accepted, so an older config
+// starts.
 type Auth struct {
-	// WhoamiSocket is a Synapse client listener. Empty uses the first
-	// upstream socket.
 	WhoamiSocket string `yaml:"whoami_socket"`
-	// CacheSeconds is how long a verdict is kept. Zero uses 60.
-	CacheSeconds int `yaml:"cache_seconds"`
+	CacheSeconds int    `yaml:"cache_seconds"`
 }
 
 // Shadow tunes shadow mode.
@@ -101,6 +100,15 @@ type Shadow struct {
 	Concurrency int `yaml:"concurrency"`
 	// TimeoutSeconds bounds one check. Zero uses 30.
 	TimeoutSeconds int `yaml:"timeout_seconds"`
+	// AllRooms checks writes in every room, not only the allowlisted ones.
+	// It only reads: writes stay limited to the allowlist.
+	AllRooms bool `yaml:"all_rooms"`
+	// PrepareMS bounds the read made before a request outside the allowlist
+	// is forwarded; past it that request is not checked. Zero uses 250.
+	PrepareMS int `yaml:"prepare_ms"`
+	// PrepareConcurrency bounds those reads in flight; more are not
+	// checked. Zero uses 8.
+	PrepareConcurrency int `yaml:"prepare_concurrency"`
 }
 
 // Listen is where nginx reaches us.
@@ -192,10 +200,6 @@ func (c *Config) validate() error {
 	}
 	if c.HomeserverYAML == "" {
 		return fmt.Errorf("homeserver_yaml must be set")
-	}
-
-	if c.AnyShadow() && c.Auth.WhoamiSocket == "" && len(c.Upstream.Sockets) == 0 {
-		return fmt.Errorf("auth.whoami_socket must be set when the upstream is not a socket")
 	}
 
 	for ep := range c.Modes {
