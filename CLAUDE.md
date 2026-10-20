@@ -26,8 +26,9 @@ The plan, with what Synapse does on the creator vs. the persister, is in
 ## Decisions that are easy to undo by accident
 
 - **Writes only to TEST6TEST (`!decSfHzLLhrNKJaZid`), TEST7TESTE
-  (`!nmZrvcKkeQiFGRlJtE`)** (operator, 2026-10-16) **and the policy room
-  (`!FRudVQysKkIHAjrSzd`)** (operator, 2026-10-20). Compiled into
+  (`!nmZrvcKkeQiFGRlJtE`)** (operator, 2026-10-16) **the policy room
+  (`!FRudVQysKkIHAjrSzd`) and the v12 room (`!goBCqT-...`)** (operator,
+  2026-10-20). Compiled into
   `internal/allowlist.Permitted`; the config can narrow it, never widen it.
   Every write path asks `allowlist.Check`, and only it. Both rooms have
   remote members, so what we write federates.
@@ -134,7 +135,14 @@ Each native event is verified against what was persisted
   refusals make the room's own recording). Calibrated on Synapse (99/101,
   ACL and fork skipped), then 100/101 fully native, every non-member event
   stored with the policy signature. Every server in that room asks the fake:
-  keep it running.
+  keep it running. Since 2026-10-20 the room's `m.room.policy` is `{}` (no
+  policy server; the fake stays up to be put back).
+- **The v12 room** (`!goBCqT-LJRiRgPetKo34PrUe4GqYZ_R74c6SBGLwTo4`,
+  operator, 2026-10-20): MSC4291 room ID, the creator's unlimited power,
+  state resolution v2.1. `TestLiveRebuildsSynapseEvents` covers its events;
+  the suite there (`-golden cmd/goevent-e2e/refusals.v12.golden.json`)
+  passed 94 on Synapse and 95/97 fully native (ACL and policy skipped), the
+  fork included.
 - **State events**: dedup (`deduplicate_state_event`) is checked before auth,
   as Synapse does; Synapse stores the new state group *before* dedup and leaves
   it orphaned, we do not store it. The new group is a delta of exactly the
