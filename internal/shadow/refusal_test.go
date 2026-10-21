@@ -17,8 +17,8 @@ type fixedPredictor struct {
 	kind   string
 }
 
-func (f fixedPredictor) Predict(*http.Request, route.Request) (int, []byte, string) {
-	return f.status, []byte(f.body), f.kind
+func (f fixedPredictor) Predict(*http.Request, route.Request) (int, []byte, string, string) {
+	return f.status, []byte(f.body), f.kind, "reason"
 }
 
 func TestCheckRefusal(t *testing.T) {

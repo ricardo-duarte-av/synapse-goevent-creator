@@ -134,3 +134,8 @@ type quickAuth struct{}
 func (quickAuth) AuthenticateAs(context.Context, auth.Credentials) (auth.Verdict, error) {
 	return auth.Verdict{Valid: true, UserID: "@u:example.org", DeviceID: "D"}, nil
 }
+
+func (quickStore) GetEvents(context.Context, []string) (map[string]*pdu.Event, error) {
+	return nil, nil
+}
+func (quickStore) AuthEdges(context.Context, []string) (map[string][]string, error) { return nil, nil }

@@ -5,6 +5,8 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog"
 	"github.com/tidwall/gjson"
 	"maunium.net/go/mautrix/crypto/canonicaljson"
@@ -14,8 +16,15 @@ import (
 
 // Predictor is the native path run dry (creator.NewPredictor).
 type Predictor interface {
-	Predict(r *http.Request, req route.Request) (status int, body []byte, kind string)
+	Predict(r *http.Request, req route.Request) (status int, body []byte, kind, reason string)
 }
+
+// refusalFallbacks are the refused requests the native path would have
+// left to Synapse, by why.
+var refusalFallbacks = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "goevent_shadow_refusal_fallbacks_total",
+	Help: "Requests Synapse refused that the native path would have left to Synapse, by endpoint and fallback reason.",
+}, []string{"endpoint", "reason"})
 
 // The predictor's kinds (creator.Predict*).
 const (
@@ -71,10 +80,13 @@ func (c *Checker) checkRefusal(ctx context.Context, p *Pending, status int, body
 		return
 	}
 	r.Header = p.header.Clone()
-	ourStatus, ourBody, kind := c.o.Predictor.Predict(r, p.req)
+	ourStatus, ourBody, kind, reason := c.o.Predictor.Predict(r, p.req)
 	switch kind {
 	case predFallback:
 		record("skip_fallback", nil)
+		refusalFallbacks.WithLabelValues(ep, reason).Inc()
+		log.Info().Str("reason", reason).Int("synapse_status", status).Str("synapse_errcode", gjson.GetBytes(body, "errcode").Str).
+			Msg("Refusal not compared: the native path would leave it to Synapse")
 		return
 	case predRatelimited:
 		record("skip_ratelimit", nil)

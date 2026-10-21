@@ -17,7 +17,7 @@ func TestPredictorWritesNothing(t *testing.T) {
 	predict := func(method, path, body string, req route.Request) (int, string, string) {
 		r := httptest.NewRequest(method, "/_matrix/client/v3/rooms/"+room+path, strings.NewReader(body))
 		r.Header.Set("Authorization", "Bearer tok")
-		status, b, kind := p.Predict(r, req)
+		status, b, kind, _ := p.Predict(r, req)
 		return status, string(b), kind
 	}
 	send := route.Request{Endpoint: route.Send, Write: true, Room: room, Action: "m.room.message", TxnID: "p1"}

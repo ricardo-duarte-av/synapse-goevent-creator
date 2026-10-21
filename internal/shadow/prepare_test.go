@@ -108,3 +108,6 @@ func TestPrepareOtherBusy(t *testing.T) {
 	}
 	<-done
 }
+
+func (slowStore) GetEvents(context.Context, []string) (map[string]*pdu.Event, error) { return nil, nil }
+func (slowStore) AuthEdges(context.Context, []string) (map[string][]string, error)   { return nil, nil }

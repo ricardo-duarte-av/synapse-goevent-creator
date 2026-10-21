@@ -1221,6 +1221,52 @@
           "sort": "desc"
         }
       }
+    },
+    {
+      "id": 25,
+      "title": "Refusals not compared, by why",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Requests Synapse refused that the native path would have left to Synapse (so there is nothing to compare), by fallback reason.",
+      "gridPos": {
+        "x": 0,
+        "y": 57,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "refId": "A",
+          "expr": "sum by (endpoint, reason) (increase(goevent_shadow_refusal_fallbacks_total{job=~\"$job\"}[$__range])) > 0",
+          "instant": true,
+          "format": "table",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            }
+          }
+        }
+      ]
     }
   ],
   "annotations": {

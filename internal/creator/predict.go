@@ -46,8 +46,9 @@ func NewPredictor(o Options) *Creator {
 func (c *Creator) Predictor() *Creator { return NewPredictor(c.o) }
 
 // Predict answers r as the native path would, without effect: the status
-// and body it would write, and what kind of answer that is.
-func (c *Creator) Predict(r *http.Request, req route.Request) (status int, body []byte, kind string) {
+// and body it would write, what kind of answer that is, and for a fallback
+// its reason.
+func (c *Creator) Predict(r *http.Request, req route.Request) (status int, body []byte, kind, reason string) {
 	rec := httptest.NewRecorder()
 	var out Outcome
 	if req.Endpoint == route.Membership || req.Endpoint == route.Join || req.Endpoint == route.Knock ||
@@ -58,13 +59,13 @@ func (c *Creator) Predict(r *http.Request, req route.Request) (status int, body 
 	}
 	switch {
 	case out.Fallback != "":
-		return 0, nil, PredictFallback
+		return 0, nil, PredictFallback, out.Fallback
 	case out.Result == "ratelimited":
-		return rec.Code, rec.Body.Bytes(), PredictRatelimited
+		return rec.Code, rec.Body.Bytes(), PredictRatelimited, ""
 	case out.Refused != "":
-		return rec.Code, rec.Body.Bytes(), PredictRefused
+		return rec.Code, rec.Body.Bytes(), PredictRefused, out.Refused
 	}
-	return rec.Code, rec.Body.Bytes(), PredictAccepted
+	return rec.Code, rec.Body.Bytes(), PredictAccepted, out.Result
 }
 
 var errDry = errors.New("creator: a predictor does not write")

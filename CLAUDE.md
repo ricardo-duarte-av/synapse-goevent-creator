@@ -432,10 +432,13 @@ with both sides, every check summarised at info.
   (`default_transaction_read_only=on`); the worker refuses to start
   otherwise, and `TestEveryQueryIsASelect` (pdustore) keeps the code honest.
   It connects as homeserver.yaml's user straight to `/var/sockets`, not pgcat.
-- Not compared yet: membership content (profile, M5), refusals (we would need
-  the native path's validation), push actions (`event_push_actions`; goinbound's
-  push check is the model), events with several prev events (`state_before`
-  skipped; Synapse resolves state). A `prev_events` difference where a stored
+- Not compared yet: membership content (profile, M5). Events with several
+  prev events have their state before resolved in the background check
+  (`resolveBefore`, the native path's state resolution; the groups do not
+  change), so `state_before` is compared on forks too. A refusal not
+  compared because the native path would leave it to Synapse is counted by
+  reason (`goevent_shadow_refusal_fallbacks_total`) and logged without
+  content. A `prev_events` difference where a stored
   prev event was persisted after the room was read is a race: recorded as
   skipped, and nothing past it is compared.
 

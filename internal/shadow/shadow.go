@@ -42,6 +42,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pushcalc"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pyjson"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/stateres"
 )
 
 // Result values.
@@ -79,6 +80,8 @@ type Store interface {
 	StateForGroup(ctx context.Context, group int64) (pdu.StateMap, error)
 	StateDelta(ctx context.Context, group int64) (prev int64, hasPrev bool, delta pdu.StateMap, err error)
 	NewMembership(ctx context.Context, roomID string, after int64, membership, target, server string) (string, error)
+	// State resolution, for the state before an event on a fork.
+	stateres.Store
 }
 
 // Authenticator says who a request is from.
@@ -453,6 +456,15 @@ func (c *Checker) check(ctx context.Context, p *Pending, resp []byte) {
 	ourBefore := p.before
 	if !sameSet(ev.PrevEvents, p.prevs) {
 		ourBefore = nil
+	} else if ourBefore == nil && len(p.prevs) > 1 {
+		// A fork: resolved now, as the native path resolves it. The prev
+		// events' groups do not change.
+		resolved, err := c.resolveBefore(ctx, p)
+		if err != nil {
+			r.record("state_before", Error, func(e *zerolog.Event) { e.Err(err) })
+			return
+		}
+		ourBefore = resolved
 	}
 	synBefore, synAfter, shape, err := c.synapseState(ctx, ev)
 	if err != nil {
@@ -683,6 +695,31 @@ func (c *Checker) checkAuthRules(ctx context.Context, ev *pdu.Event) error {
 		return fmt.Errorf("state dependent: %w", err)
 	}
 	return nil
+}
+
+// resolveBefore is resolve_state_groups_for_events over the prev events.
+func (c *Checker) resolveBefore(ctx context.Context, p *Pending) (pdu.StateMap, error) {
+	seen := map[int64]bool{}
+	var sets []pdu.StateMap
+	for _, id := range p.prevs {
+		g, err := c.o.Store.StateGroupForEvent(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if seen[g] {
+			continue
+		}
+		seen[g] = true
+		s, err := c.o.Store.StateForGroup(ctx, g)
+		if err != nil {
+			return nil, err
+		}
+		sets = append(sets, s)
+	}
+	if len(sets) == 1 {
+		return sets[0], nil
+	}
+	return stateres.Resolve(ctx, p.req.Room, p.rv, sets, c.o.Store)
 }
 
 // raced reports a prev event persisted after the room was read.
