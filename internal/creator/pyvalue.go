@@ -3,7 +3,6 @@ package creator
 import (
 	"fmt"
 	"math/big"
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -19,9 +18,42 @@ import (
 // those messages; ok is false where it cannot be sure, and the request is
 // then Synapse's.
 
-// surrogateEscape is a \u escape of a UTF-16 surrogate. Python keeps a lone
-// one in the string, where Go has U+FFFD, and Synapse cannot encode it.
-var surrogateEscape = regexp.MustCompile(`\\u[dD][89a-fA-F][0-9a-fA-F]{2}`)
+// loneSurrogate reports whether raw JSON escapes a lone UTF-16 surrogate.
+// Python keeps one in the string, where Go has U+FFFD, and Synapse cannot
+// encode it. A high surrogate escape followed at once by a low one is a
+// pair, one character to both (py_scanstring).
+func loneSurrogate[T string | []byte](raw T) bool {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		u, ok := unicodeEscape(raw, i)
+		if !ok {
+			i++ // \\, \" and the like
+			continue
+		}
+		switch {
+		case u >= 0xdc00 && u <= 0xdfff:
+			return true
+		case u >= 0xd800 && u <= 0xdbff:
+			if lo, ok := unicodeEscape(raw, i+6); !ok || lo < 0xdc00 || lo > 0xdfff {
+				return true
+			}
+			i += 6
+		}
+		i += 5
+	}
+	return false
+}
+
+// unicodeEscape is the \uXXXX escape at raw[i:], if there is one.
+func unicodeEscape[T string | []byte](raw T, i int) (rune, bool) {
+	if i+6 > len(raw) || raw[i] != '\\' || raw[i+1] != 'u' {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(string(raw[i+2:i+6]), 16, 16)
+	return rune(n), err == nil
+}
 
 // pyRepr is repr(json.loads(v.Raw)).
 func pyRepr(v gjson.Result) (string, bool) {
@@ -53,7 +85,7 @@ func writeRepr(b *strings.Builder, v gjson.Result) bool {
 			b.WriteString(v.Raw)
 		}
 	case gjson.String:
-		if surrogateEscape.MatchString(v.Raw) {
+		if loneSurrogate(v.Raw) {
 			return false
 		}
 		s, ok := reprString(v.Str)

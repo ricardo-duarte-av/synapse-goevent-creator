@@ -204,7 +204,7 @@ func validateAliases(content gjson.Result) *stop {
 			}
 			return s == nil
 		})
-		if s != nil && surrogateEscape.MatchString(v.Raw) {
+		if s != nil && loneSurrogate(v.Raw) {
 			return fb("invalid_aliases")
 		}
 		return s
@@ -213,7 +213,7 @@ func validateAliases(content gjson.Result) *stop {
 			n := 0
 			switch {
 			case a.Type == gjson.String:
-				if surrogateEscape.MatchString(a.Raw) {
+				if loneSurrogate(a.Raw) {
 					return fb("invalid_aliases")
 				}
 				n = utf8.RuneCountInString(a.Str)

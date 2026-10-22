@@ -81,7 +81,7 @@ func parseJSONObject(body []byte, allowEmpty bool) ([]byte, *stop) {
 	if err != nil {
 		return nil, notJSON.stop()
 	}
-	if surrogateEscape.Match(body) {
+	if loneSurrogate(body) {
 		return nil, fb("surrogate_escape")
 	}
 	return body, nil

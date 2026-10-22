@@ -220,7 +220,7 @@ func targetUserID(v gjson.Result) (string, *stop) {
 	start := badRequest("bad_user_id", "Expected UserID string to start with '@'", "M_INVALID_PARAM").stop()
 	switch {
 	case v.Type == gjson.String:
-		if surrogateEscape.MatchString(v.Raw) {
+		if loneSurrogate(v.Raw) {
 			return "", fb("surrogate_escape")
 		}
 		if !strings.HasPrefix(v.Str, "@") {
@@ -449,7 +449,7 @@ func pyLenOrEmpty(v gjson.Result) (int, *stop) {
 	}
 	switch {
 	case v.Type == gjson.String:
-		if surrogateEscape.MatchString(v.Raw) {
+		if loneSurrogate(v.Raw) {
 			return 0, fb("surrogate_escape")
 		}
 		return utf8.RuneCountInString(v.Str), nil

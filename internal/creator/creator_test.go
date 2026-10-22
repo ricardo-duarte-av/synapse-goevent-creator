@@ -52,6 +52,7 @@ type fakeRoom struct {
 	blocked     bool
 	accountData map[string]bool
 	exempt      bool
+	annotated   map[string]bool // aggregation keys the user has sent
 }
 
 func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
@@ -220,8 +221,8 @@ func (f *fakeRoom) EventRoom(_ context.Context, ev string) (string, error) {
 }
 func (f *fakeRoom) IsRelationTarget(context.Context, string) (bool, error) { return false, nil }
 func (f *fakeRoom) HasRelation(context.Context, string) (bool, error)      { return false, nil }
-func (f *fakeRoom) HasAnnotated(context.Context, string, string, string, string) (bool, error) {
-	return false, nil
+func (f *fakeRoom) HasAnnotated(_ context.Context, _, _, _, key string) (bool, error) {
+	return f.annotated[key], nil
 }
 
 type fakeWriter struct {
@@ -494,6 +495,20 @@ func TestFallbacksWriteNothing(t *testing.T) {
 				t.Errorf("a fallback answered the client: %d %s", rec.Code, rec.Body)
 			}
 		})
+	}
+}
+
+// An escaped surrogate pair is one character, to Python as to gjson: a
+// reaction whose key is an escaped emoji is served (Synapse's
+// M_DUPLICATE_ANNOTATION here), not left to Synapse.
+func TestEscapedEmojiReaction(t *testing.T) {
+	h := newHarness(t)
+	h.f.annotated = map[string]bool{"\U0001F600": true}
+	body := `{"m.relates_to":{"rel_type":"m.annotation","event_id":"` + h.f.prevs[0] + `","key":"\ud83d\ude00"}}`
+	req := route.Request{Endpoint: route.Send, Write: true, Room: room, Action: "m.reaction", TxnID: "t1"}
+	rec, out := h.put(t, req, "/send/m.reaction/t1", body)
+	if stopped(out) != "refused:duplicate_annotation" || rec.Code != 400 {
+		t.Fatalf("stopped %q: %d %s", stopped(out), rec.Code, rec.Body)
 	}
 }
 

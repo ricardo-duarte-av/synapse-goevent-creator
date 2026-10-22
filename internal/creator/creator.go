@@ -1277,7 +1277,7 @@ func (c *Creator) checkRelation(ctx context.Context, req route.Request, rq *requ
 	if relType.Type != gjson.String || parent.Type != gjson.String {
 		return nil
 	}
-	if surrogateEscape.MatchString(rel.Raw) {
+	if loneSurrogate(rel.Raw) {
 		return fb("surrogate_escape")
 	}
 	room, err := c.o.Store.EventRoom(ctx, parent.Str)
