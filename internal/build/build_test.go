@@ -121,6 +121,15 @@ func TestRedactsPlacement(t *testing.T) {
 	if gjson.GetBytes(v10.JSON, "redacts").Str != target {
 		t.Error("v10 redaction lacks the top-level redacts")
 	}
+	// Synapse's redaction drops it, so the signature and the event ID do not
+	// cover it (mautrix's keeps it).
+	b, err := SigningBytes(v10.PDU, id.RoomV10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(b, "redacts").Exists() {
+		t.Errorf("v10 signing bytes keep the top-level redacts: %s", b)
+	}
 }
 
 func TestUnsupportedVersions(t *testing.T) {

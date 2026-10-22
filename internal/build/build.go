@@ -137,17 +137,18 @@ func Build(p Proto, key *Key) (*Event, error) {
 		ev.Sticky = &event.Sticky{Duration: jsontime.MSInt(*p.StickyDurationMS)}
 	}
 
-	// The content hash covers msc4354_sticky; the signature and the event
-	// ID, which are over the redacted event, do not: Synapse's redaction
-	// keeps only its allowlist of top-level keys (rust/src/events/utils.rs,
-	// redact), and sticky is not on it. mautrix's Redact keeps the typed
-	// Sticky field (v0.30.0), so it is taken off for signing and the ID,
+	// The content hash covers msc4354_sticky and a top-level redacts; the
+	// signature and the event ID, which are over the redacted event, do not:
+	// Synapse's redaction keeps only its allowlist of top-level keys
+	// (rust/src/events/utils.rs, redact), and neither is on it. mautrix's
+	// Redact keeps the typed Sticky field (v0.30.0), and Redacts for a
+	// redaction before v11, so both are taken off for signing and the ID,
 	// after the hash is filled, and put back.
 	if err := ev.FillContentHash(); err != nil {
 		return nil, fmt.Errorf("build: content hash: %w", err)
 	}
-	sticky := ev.Sticky
-	ev.Sticky = nil
+	sticky, redacts := ev.Sticky, ev.Redacts
+	ev.Sticky, ev.Redacts = nil, nil
 	if err := ev.Sign(p.RoomVersion, key.ServerName, key.ID, key.Priv); err != nil {
 		return nil, fmt.Errorf("build: sign: %w", err)
 	}
@@ -155,7 +156,7 @@ func Build(p Proto, key *Key) (*Event, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build: event id: %w", err)
 	}
-	ev.Sticky = sticky
+	ev.Sticky, ev.Redacts = sticky, redacts
 	raw, err := jsonMarshal(ev)
 	if err != nil {
 		return nil, fmt.Errorf("build: marshal: %w", err)
@@ -172,11 +173,11 @@ func toEventIDs(ss []string) []id.EventID {
 }
 
 // SigningBytes is what a signature on the event covers: the event as
-// Synapse redacts it (msc4354_sticky dropped), without signatures and
-// unsigned, in canonical JSON.
+// Synapse redacts it (msc4354_sticky and a top-level redacts dropped),
+// without signatures and unsigned, in canonical JSON.
 func SigningBytes(ev *pdu.PDU, rv id.RoomVersion) ([]byte, error) {
 	c := ev.Clone()
-	c.Sticky = nil
+	c.Sticky, c.Redacts = nil, nil
 	return canonicaljson.Marshal(c.RedactForSignature(rv))
 }
 

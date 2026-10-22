@@ -43,13 +43,21 @@ func TestLiveRebuildsSynapseEvents(t *testing.T) {
 	}
 	defer conn.Close(ctx)
 
-	rows, err := conn.Query(ctx, `SELECT e.event_id, r.room_version, j.json
+	// The test rooms' newest events, and local redactions in any room: the
+	// test rooms are v11 and later, and before v11 redacts is top-level.
+	rows, err := conn.Query(ctx, `(SELECT e.event_id, r.room_version, j.json
 		FROM events e JOIN event_json j USING (event_id) JOIN rooms r ON r.room_id = e.room_id
 		WHERE e.room_id IN ('!decSfHzLLhrNKJaZid:aguiarvieira.pt', '!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt',
 			'!FRudVQysKkIHAjrSzd:aguiarvieira.pt', '!goBCqT-LJRiRgPetKo34PrUe4GqYZ_R74c6SBGLwTo4')
 		  AND e.sender LIKE '%:aguiarvieira.pt' AND NOT e.outlier
 		  AND NOT EXISTS (SELECT 1 FROM redactions x WHERE x.redacts = e.event_id)
-		ORDER BY e.stream_ordering DESC LIMIT 200`)
+		ORDER BY e.stream_ordering DESC LIMIT 200)
+		UNION ALL
+		(SELECT e.event_id, r.room_version, j.json
+		FROM events e JOIN event_json j USING (event_id) JOIN rooms r ON r.room_id = e.room_id
+		WHERE e.type = 'm.room.redaction' AND e.sender LIKE '%:aguiarvieira.pt' AND NOT e.outlier
+		  AND NOT EXISTS (SELECT 1 FROM redactions x WHERE x.redacts = e.event_id)
+		ORDER BY e.stream_ordering DESC LIMIT 100)`)
 	if err != nil {
 		t.Fatal(err)
 	}
