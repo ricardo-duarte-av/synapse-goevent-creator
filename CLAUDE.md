@@ -72,6 +72,11 @@ in gopro.
   hash but not in the signature or the event ID, so `build.Build` takes it off
   for those two. Without this every sticky event (most MatrixRTC traffic here)
   gets a wrong ID. Worth reporting upstream.
+- **The same for a top-level `redacts`** (rooms before v11): Synapse's
+  redaction drops it, mautrix's keeps it, so every v3–v10 redaction got a
+  wrong signature and ID until 2026-10-22 (shadow caught one in a v9 room;
+  the test rooms are all v11+). `TestLiveRebuildsSynapseEvents` now also
+  rebuilds local redactions from any room.
 - **Synapse's `auth_events` order is random**: `auth_types_for_event` returns
   a Python set of tuples, and string hashing is randomised per process. Prev
   events are ordered by depth, ties arbitrary. Compare both as sets.
