@@ -243,6 +243,12 @@ func (c *Checker) prepare(ctx context.Context, r *http.Request, req route.Reques
 	p.user, p.device = v.UserID, v.DeviceID
 
 	if p.rvID, err = c.o.Store.RoomVersion(ctx, req.Room); err != nil {
+		if errors.Is(err, pdustore.ErrUnknownRoom) && (req.Endpoint == route.Join || req.Endpoint == route.Knock) {
+			// A room this server is not in: a remote join or knock, which
+			// is main's in Synapse too. There is nothing to compare.
+			p.skip = "remote_join"
+			return p
+		}
 		p.err = err
 		return p
 	}

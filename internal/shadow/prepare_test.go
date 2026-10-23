@@ -111,3 +111,27 @@ func TestPrepareOtherBusy(t *testing.T) {
 
 func (slowStore) GetEvents(context.Context, []string) (map[string]*pdu.Event, error) { return nil, nil }
 func (slowStore) AuthEdges(context.Context, []string) (map[string][]string, error)   { return nil, nil }
+
+// unknownRoomStore is a room this server is not in.
+type unknownRoomStore struct{ slowStore }
+
+func (unknownRoomStore) RoomVersion(context.Context, string) (string, error) {
+	return "", pdustore.ErrUnknownRoom
+}
+
+// A join or knock to a room we are not in is a remote join, main's in
+// Synapse too: skipped, not a prepare error. Other endpoints still error.
+func TestPrepareRemoteJoin(t *testing.T) {
+	c := New(Options{Store: unknownRoomStore{}, Auth: okAuth{}, Log: zerolog.Nop()})
+	for _, ep := range []route.Endpoint{route.Join, route.Knock} {
+		r := httptest.NewRequest(http.MethodPost, "/_matrix/client/v3/join/!r:example.org", strings.NewReader(`{}`))
+		p := c.Prepare(context.Background(), r, route.Request{Endpoint: ep, Write: true, Room: "!r:example.org"})
+		if p == nil || p.err != nil || p.skip != "remote_join" {
+			t.Errorf("%s: %+v", ep, p)
+		}
+	}
+	r, req := request()
+	if p := c.Prepare(context.Background(), r, req); p == nil || p.err == nil {
+		t.Errorf("send to an unknown room is not a skip: %+v", p)
+	}
+}
