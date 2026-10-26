@@ -275,6 +275,13 @@ func (c *Checker) prepare(ctx context.Context, r *http.Request, req route.Reques
 		p.err = err
 		return p
 	}
+	if len(p.prevs) == 0 {
+		// A room we know of but are not in (an invite received, or one we
+		// left): no local event can be made in it, so this is a remote
+		// join, knock or invite rejection, main's in Synapse too.
+		p.skip = "not_in_room"
+		return p
+	}
 	if p.maxStream, err = c.o.Store.RoomMaxStream(ctx, req.Room); err != nil {
 		p.err = err
 		return p
@@ -296,6 +303,12 @@ func (c *Checker) prepare(ctx context.Context, r *http.Request, req route.Reques
 type readCloser struct {
 	io.Reader
 	io.Closer
+}
+
+// Skip records that p will not be checked: the upstream never answered, or
+// the client went away first, so there is no answer of Synapse's to compare.
+func (c *Checker) Skip(p *Pending, reason string) {
+	checks.WithLabelValues(string(p.req.Endpoint), "request", "skip_"+reason).Inc()
 }
 
 // Check compares, in the background, what Synapse did with what we would

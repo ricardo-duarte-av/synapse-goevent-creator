@@ -135,3 +135,19 @@ func TestPrepareRemoteJoin(t *testing.T) {
 		t.Errorf("send to an unknown room is not a skip: %+v", p)
 	}
 }
+
+// notInRoomStore is a room we know of but have no extremities in.
+type notInRoomStore struct{ slowStore }
+
+func (notInRoomStore) PrevEventsForRoom(context.Context, string) ([]string, error) { return nil, nil }
+
+// A room without forward extremities is one we are not in: whatever was
+// done there (a remote join, an invite rejected) is main's, not compared.
+func TestPrepareNotInRoom(t *testing.T) {
+	c := New(Options{Store: notInRoomStore{}, Auth: okAuth{}, Log: zerolog.Nop()})
+	r := httptest.NewRequest(http.MethodPost, "/_matrix/client/v3/rooms/!r:example.org/leave", strings.NewReader(`{}`))
+	p := c.Prepare(context.Background(), r, route.Request{Endpoint: route.Membership, Write: true, Room: "!r:example.org", Action: "leave"})
+	if p == nil || p.err != nil || p.skip != "not_in_room" {
+		t.Errorf("%+v", p)
+	}
+}

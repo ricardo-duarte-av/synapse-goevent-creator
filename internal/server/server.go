@@ -106,7 +106,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	res := h.up.Forward(w, r, capture)
 
-	if pending != nil {
+	switch {
+	case pending == nil:
+	case res.Err != nil:
+		// Our 502, not Synapse's answer.
+		h.checker.Skip(pending, "upstream_failed")
+	case res.Canceled:
+		h.checker.Skip(pending, "canceled")
+	default:
 		h.checker.Check(pending, res.Status, res.Body)
 	}
 

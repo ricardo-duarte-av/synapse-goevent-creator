@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 
@@ -139,3 +140,53 @@ func (quickStore) GetEvents(context.Context, []string) (map[string]*pdu.Event, e
 	return nil, nil
 }
 func (quickStore) AuthEdges(context.Context, []string) (map[string][]string, error) { return nil, nil }
+
+// An upstream that cannot be reached gets our 502, which is not Synapse's
+// refusal: nothing is compared with it.
+func TestShadowUpstreamUnreachable(t *testing.T) {
+	cfg := &config.Config{Modes: map[route.Endpoint]config.Mode{}, Shadow: config.Shadow{AllRooms: true}}
+	for _, ep := range route.Endpoints {
+		cfg.Modes[ep] = config.ModeShadow
+	}
+	up, _ := proxy.New(config.Upstream{Sockets: []string{t.TempDir() + "/gone.sock"}}, zerolog.Nop())
+	rooms, _ := allowlist.New(allowlist.Permitted)
+	h := New(cfg, up, rooms, shadow.New(shadow.Options{Store: quickStore{}, Auth: quickAuth{}, Log: zerolog.Nop()}), nil, zerolog.Nop())
+	skipped := shadowChecks(t, "send", "request", "skip_upstream_failed")
+	refused := shadowChecks(t, "send", "request", "status_502")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/_matrix/client/v3/rooms/%21elsewhere%3Aexample.org/send/m.room.message/t1",
+		strings.NewReader(`{"msgtype":"m.text","body":"hi"}`)))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("%d", rec.Code)
+	}
+	if shadowChecks(t, "send", "request", "skip_upstream_failed") != skipped+1 {
+		t.Error("not counted as skipped")
+	}
+	if shadowChecks(t, "send", "request", "status_502") != refused {
+		t.Error("compared as Synapse's refusal")
+	}
+}
+
+// shadowChecks reads goevent_shadow_checks_total from the default registry.
+func shadowChecks(t *testing.T, ep, check, result string) float64 {
+	t.Helper()
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "goevent_shadow_checks_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			l := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				l[lp.GetName()] = lp.GetValue()
+			}
+			if l["endpoint"] == ep && l["check"] == check && l["result"] == result {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
