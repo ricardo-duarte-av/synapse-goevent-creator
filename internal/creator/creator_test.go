@@ -1047,3 +1047,44 @@ func TestRecordRequest(t *testing.T) {
 		t.Errorf("%q", ips.got)
 	}
 }
+
+// Without redact power the auth rules pass any redaction (v3+), and the
+// events writer allows only one's own events, which must exist: refused
+// here as the writer would refuse them (persist_and_notify_client_events).
+func TestRedactionWithoutPower(t *testing.T) {
+	for name, tc := range map[string]struct {
+		target func(h *harness) string
+		status int
+		want   string
+	}{
+		"own event":     {func(h *harness) string { return h.f.topic }, 200, ""},
+		"unknown event": {func(*harness) string { return "$unknown" }, 404, `{"errcode":"M_NOT_FOUND","error":"Could not find event $unknown"}`},
+		"other's event": {func(h *harness) string {
+			ev := *h.f.events[h.f.topic].Event
+			ev.Sender = other
+			h.f.events["$theirs"] = &pdustore.StoredEvent{Event: &ev, StreamOrdering: 1}
+			return "$theirs"
+		}, 403, `{"errcode":"M_FORBIDDEN","error":"You don't have permission to redact events"}`},
+	} {
+		h := newHarness(t)
+		h.f.addState(t, "m.room.power_levels", "", `{"events_default":0,"state_default":0}`)
+		target := tc.target(h)
+		rec, out := h.put(t, redactReq(target, "r1"), "/redact/x/r1", `{}`)
+		if rec.Code != tc.status {
+			t.Errorf("%s: %d %s %+v", name, rec.Code, rec.Body, out)
+			continue
+		}
+		if tc.status == 200 {
+			if !gjson.GetBytes(h.p.entries[0], "internal_metadata.recheck_redaction").Bool() {
+				t.Errorf("%s: no recheck_redaction", name)
+			}
+			continue
+		}
+		if got := strings.TrimSpace(rec.Body.String()); got != tc.want {
+			t.Errorf("%s: %s", name, got)
+		}
+		if len(h.w.calls) != 0 || len(h.p.entries) != 0 {
+			t.Errorf("%s: wrote %v", name, h.w.calls)
+		}
+	}
+}

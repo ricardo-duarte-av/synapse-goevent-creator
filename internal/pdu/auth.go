@@ -702,6 +702,7 @@ func checkRedaction(rv *RoomVersion, ev *Event, auth AuthState) error {
 	if rv.EventFormat != FormatV1V2 {
 		// Rechecked when the redaction is applied.
 		ev.RecheckRedaction = true
+		ev.RedactOwnOnly = true
 		return nil
 	}
 	redacter, err := domainOf(ev.ID)
@@ -717,6 +718,7 @@ func checkRedaction(rv *RoomVersion, ev *Event, auth AuthState) error {
 		return err
 	}
 	if redacter == redactee {
+		ev.RedactOwnOnly = true
 		return nil
 	}
 	return deny("You don't have permission to redact events")

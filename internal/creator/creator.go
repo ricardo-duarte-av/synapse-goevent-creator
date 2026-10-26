@@ -981,6 +981,11 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 	if err := c.checkAuth(ctx, ev); err != nil {
 		return nil, "", c.authRefusal(err)
 	}
+	if ev.RedactOwnOnly && in.redacts != nil {
+		if st := c.checkOwnRedaction(ctx, ev, *in.redacts); st != nil {
+			return nil, "", st
+		}
+	}
 
 	var rows map[string]pushcalc.Row
 	if c.o.Push != nil {
@@ -1072,6 +1077,25 @@ func (c *Creator) checkRedaction(ctx context.Context, req route.Request, target 
 		return badRequest("redact_other_room", "Cannot redact event from a different room").stop()
 	case orig.Type == "m.room.server_acl":
 		return forbidden("redact_acl", "Redacting server ACL events is not permitted").stop()
+	}
+	return nil
+}
+
+// checkOwnRedaction is the rest of the writer's redaction checks, when
+// check_redaction answered True (no redact power): the target must exist,
+// not rejected, and be the sender's own.
+func (c *Creator) checkOwnRedaction(ctx context.Context, ev *pdu.Event, target string) *stop {
+	evs, _, err := c.o.Store.GetStoredEvents(ctx, []string{target})
+	if err != nil {
+		return fb("db_error")
+	}
+	orig := evs[target]
+	if orig == nil || orig.Reason != "" {
+		return (&refusal{reason: "redact_not_found", status: http.StatusNotFound, errcode: "M_NOT_FOUND",
+			msg: "Could not find event " + target}).stop()
+	}
+	if orig.Sender != ev.Sender {
+		return forbidden("redact_not_own", "You don't have permission to redact events").stop()
 	}
 	return nil
 }

@@ -36,6 +36,10 @@ type Event struct {
 	// metadata flag of the same name: a redaction whose sender may only
 	// redact their own events, in a room version that checks that later.
 	RecheckRedaction bool
+	// RedactOwnOnly is check_redaction answering True: the sender lacks
+	// redact power and may redact only their own events, which the events
+	// writer checks (persist_and_notify_client_events). Any room version.
+	RedactOwnOnly bool
 }
 
 // ErrMalformed is an event Synapse would not have accepted in this shape,

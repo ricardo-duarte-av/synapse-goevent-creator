@@ -349,7 +349,14 @@ Each native event is verified against what was persisted
   the create event (403), an event of another room (400) or a server ACL
   (403) is refused here, never sent. The writer ratelimits (`rc_message`)
   before those checks, so a refusal here is not counted there. A redaction
-  of an event we do not hold is sent: the writer checks nothing either.
+  of an event we do not hold is sent: the writer checks nothing either,
+  unless the sender lacks redact power. Then (`check_redaction` answering
+  True: any v3+ room, or v1/v2 on the same server) the writer refuses an
+  unknown or rejected target (404 `Could not find event`) and another
+  sender's event (403 `You don't have permission to redact events`), after
+  the auth rules, which let it through (`pdu.Event.RedactOwnOnly`). Missed
+  until 2026-10-26: shadow's refusal check caught one in a matrix.org room
+  (`accepted`).
 - **Presence, not `.get`**: jsonschema and `key in content` treat a present
   `null` as present and invalid; Python's `.get` (`pdu.Get`) reads it as
   absent. Use `pdu.Field` for the former (`m.mentions: null` is Synapse's
