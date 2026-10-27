@@ -42,7 +42,7 @@ func TestProxyModeForwardsEverythingUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rooms, err := allowlist.New(allowlist.Permitted)
+	rooms, err := allowlist.New(allowlist.TestRooms)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestShadowAllRooms(t *testing.T) {
 			cfg.Modes[ep] = config.ModeShadow
 		}
 		up, _ := proxy.New(config.Upstream{Addrs: []string{strings.TrimPrefix(upstream.URL, "http://")}}, zerolog.Nop())
-		rooms, _ := allowlist.New(allowlist.Permitted)
+		rooms, _ := allowlist.New(allowlist.TestRooms)
 		h := New(cfg, up, rooms, shadow.New(shadow.Options{Store: quickStore{}, Auth: quickAuth{}, Log: zerolog.Nop()}), nil, zerolog.Nop())
 		want := "proxy"
 		if all {
@@ -149,7 +149,7 @@ func TestShadowUpstreamUnreachable(t *testing.T) {
 		cfg.Modes[ep] = config.ModeShadow
 	}
 	up, _ := proxy.New(config.Upstream{Sockets: []string{t.TempDir() + "/gone.sock"}}, zerolog.Nop())
-	rooms, _ := allowlist.New(allowlist.Permitted)
+	rooms, _ := allowlist.New(allowlist.TestRooms)
 	h := New(cfg, up, rooms, shadow.New(shadow.Options{Store: quickStore{}, Auth: quickAuth{}, Log: zerolog.Nop()}), nil, zerolog.Nop())
 	skipped := shadowChecks(t, "send", "request", "skip_upstream_failed")
 	refused := shadowChecks(t, "send", "request", "status_502")

@@ -25,13 +25,17 @@ The plan, with what Synapse does on the creator vs. the persister, is in
 
 ## Decisions that are easy to undo by accident
 
-- **Writes only to TEST6TEST (`!decSfHzLLhrNKJaZid`), TEST7TESTE
-  (`!nmZrvcKkeQiFGRlJtE`)** (operator, 2026-10-16) **the policy room
-  (`!FRudVQysKkIHAjrSzd`) and the v12 room (`!goBCqT-...`)** (operator,
-  2026-10-20). Compiled into
-  `internal/allowlist.Permitted`; the config can narrow it, never widen it.
-  Every write path asks `allowlist.Check`, and only it. Both rooms have
-  remote members, so what we write federates.
+- **Writes only to the config's `rooms`, which may be any room**
+  (operator, 2026-10-27: "allow any room in the config, so that i can
+  add/remove at will"). Until then it was a compiled-in list of four test
+  rooms the config could only narrow. The rooms are reread on SIGHUP
+  (`docker kill -s HUP av-goevent-creator-1`; nothing else reloads, and a
+  config that fails to load keeps the old rooms). Every write path asks
+  `allowlist.Check`, and only it. What we write federates.
+- **The e2e suite runs only in `allowlist.TestRooms`**: TEST6TEST
+  (`!decSfHzLLhrNKJaZid`), TEST7TESTE (`!nmZrvcKkeQiFGRlJtE`), the policy
+  room (`!FRudVQysKkIHAjrSzd`) and the v12 room (`!goBCqT-...`). It bans,
+  kicks and sends refusals on purpose: never in a real room.
 - **The goal is retiring `av-client-events-1` entirely** (operator,
   2026-10-16). So the upstream is **main**
   (`/var/sockets/nginx/av-synapse-main.sock`), not the Python event_creator:

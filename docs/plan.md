@@ -55,7 +55,7 @@ New repo, module `github.com/ricardo-duarte-av/synapse-goevent-creator`, built w
 - `TestWritesOnlyAllowlistedRooms`: every code path that reaches `send_events` or a DB write goes through one `allowlist.Check(roomID)`, and a test asserts no other caller.
 - `TestEveryWriteIsGranted`: the write SQL only touches the granted tables (like goinbound's `TestEveryQueryIsASelect`).
 - `TestEveryQuerySiteIsNamed` (gofederation).
-- The allowlist is compiled in as a default **and** configured. The config cannot add rooms outside a compile-time set until we decide to lift it.
+- The allowlist was compiled in as a default **and** configured, the config only narrowing it. Lifted 2026-10-27 (operator): the config names any rooms, reread on SIGHUP.
 
 ## Milestones
 

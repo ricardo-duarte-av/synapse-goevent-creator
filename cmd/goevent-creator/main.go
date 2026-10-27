@@ -14,6 +14,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -78,12 +79,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(cfg, log); err != nil {
+	if err := run(cfg, *configPath, log); err != nil {
 		log.Fatal().Err(err).Msg("Worker stopped")
 	}
 }
 
-func run(cfg *config.Config, log zerolog.Logger) error {
+func run(cfg *config.Config, configPath string, log zerolog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -180,10 +181,18 @@ func run(cfg *config.Config, log zerolog.Logger) error {
 		errCh <- srv.Serve(ln)
 	}()
 
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	for done := false; !done; {
+		select {
+		case err := <-errCh:
+			return err
+		case <-hup:
+			reloadRooms(configPath, rooms, log)
+		case <-ctx.Done():
+			done = true
+		}
 	}
 
 	log.Info().Msg("Shutting down")
@@ -461,4 +470,34 @@ func listen(cfg config.Listen) (net.Listener, error) {
 		return nil, fmt.Errorf("chmod socket: %w", err)
 	}
 	return l, nil
+}
+
+// reloadRooms rereads the config on SIGHUP and replaces the rooms written
+// to natively. Nothing else is reloaded. A config that does not load leaves
+// the rooms as they were.
+func reloadRooms(path string, rooms *allowlist.List, log zerolog.Logger) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		log.Error().Err(err).Msg("Reload failed: rooms unchanged")
+		return
+	}
+	before := rooms.Rooms()
+	if err := rooms.Set(cfg.Rooms); err != nil {
+		log.Error().Err(err).Msg("Reload failed: rooms unchanged")
+		return
+	}
+	after := rooms.Rooms()
+	var added, removed []string
+	for _, r := range after {
+		if !slices.Contains(before, r) {
+			added = append(added, r)
+		}
+	}
+	for _, r := range before {
+		if !slices.Contains(after, r) {
+			removed = append(removed, r)
+		}
+	}
+	log.Info().Strs("rooms", after).Strs("added", added).Strs("removed", removed).
+		Msg("Reloaded rooms (only rooms are reloaded; other changes need a restart)")
 }

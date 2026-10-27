@@ -3,7 +3,8 @@
 // the events as Synapse serves them afterwards, and the worker's own
 // counters (shadow and native mismatches must not move).
 //
-// It writes to one of the allowlisted rooms only, as the test account:
+// It writes to one of the test rooms only (allowlist.TestRooms), which the
+// worker must have in its rooms, as the test account:
 //
 //	GOEVENT_E2E_PASSWORD=... go run ./cmd/goevent-e2e \
 //	  -base https://goevent.aguiarvieira.pt -user test \
@@ -491,15 +492,15 @@ func main() { os.Exit(run()) }
 func run() int {
 	base := flag.String("base", "https://goevent.aguiarvieira.pt", "the test hostname")
 	user := flag.String("user", "test", "localpart of the test account")
-	room := flag.String("room", "!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt", "an allowlisted room the account may write to")
+	room := flag.String("room", "!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt", "a test room (allowlist.TestRooms), configured on the worker")
 	metricsURL := flag.String("metrics", "", "the worker's /metrics, to check its counters (optional)")
 	goldenPath := flag.String("golden", "cmd/goevent-e2e/refusals.golden.json", "Synapse's refusal bodies, recorded")
 	policyControl := flag.String("policy-control", "", "the fake policy server's control listener, for the policy room's steps")
 	record := flag.Bool("record", false, "record the refusal bodies to -golden instead of comparing (run against Synapse)")
 	flag.Parse()
 
-	if !slices.Contains(allowlist.Permitted, *room) {
-		fmt.Fprintf(os.Stderr, "room %s is not one the worker may write to (%v)\n", *room, allowlist.Permitted)
+	if !slices.Contains(allowlist.TestRooms, *room) {
+		fmt.Fprintf(os.Stderr, "room %s is not a test room (%v): the suite bans, kicks and sends refusals, never in a real room\n", *room, allowlist.TestRooms)
 		return 2
 	}
 	password := os.Getenv("GOEVENT_E2E_PASSWORD")

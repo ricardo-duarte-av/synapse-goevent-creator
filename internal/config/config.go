@@ -62,8 +62,8 @@ type Config struct {
 	// nothing is proxied "because that is the default".
 	Modes map[route.Endpoint]Mode `yaml:"modes"`
 
-	// Rooms are the rooms this worker may write to. Each must also be in
-	// allowlist.Permitted, which is compiled in.
+	// Rooms are the rooms this worker may write to: any room IDs. They are
+	// reread on SIGHUP.
 	Rooms []string `yaml:"rooms"`
 
 	Database Database `yaml:"database"`
