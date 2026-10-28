@@ -51,9 +51,29 @@ The plan, with what Synapse does on the creator vs. the persister, is in
   `av-goevent-creator`, `/var/sockets/nginx/xx-goevent-creator-1.sock`),
   besides the test hostname `goevent.aguiarvieira.pt`. Changing nginx is
   the operator's call.
-- **All of `/profile/` is proxied** (operator, 2026-10-16). Profile writes go
-  to main and then send a membership event into every room the user is in
-  (`handlers/profile.py`, `_update_join_states`), which breaks the two-room rule.
+- **Profile writes are native, reads proxied** (operator, 2026-10-28:
+  "time to handle /profile/ properly"; until then all of `/profile/` was
+  proxied). `modes.profile: native`. In v1.163 a worker that is not the
+  first events writer hands every profile write to it
+  (`ReplicationProfileSetField`/`DeleteField`), which stores it, updates
+  the user directory and, to propagate, schedules `update_join_states`,
+  which **main** runs: one join event per room the user is in (670 for
+  `@daedric`). Here (`creator/profile.go`) the servlet's checks are ours,
+  in its order and words; the writer still stores the field, asked with
+  `propagate: false` (its refusals relayed); then `rc_message` on the target
+  (the writer's `_update_join_states` ratelimit: a 429 *after* the field is
+  stored), and the join events are made natively in the background,
+  `update_membership(join, ratelimit=False)` with `create_requester`'s
+  requester (no token, no device, entity the requesting user), rooms in ID
+  order, a newer change cancelling an older one, failures logged
+  (`goevent_profile_propagation_total{result}`). The requester crosses
+  replication as a bare user ID, so Synapse here propagates even for a
+  shadow-banned user; so do we. Every room the user is joined to must pass
+  the allowlist, or the whole request is main's (`room_not_native`).
+  Unlike Synapse's scheduled task, a propagation does not survive a restart
+  of this worker: the rooms not yet done keep the old profile. Custom
+  fields (MSC4133, v3 only) never propagate; the unstable MSC4133 path is
+  proxied.
 - **Every endpoint's mode is required** and only modes whose code exists are
   accepted (`config.accepted`). A mode accepted early would silently mean proxy.
 - **homeserver.yaml is mounted read-only** at `/etc/synapse`. Never write to it.

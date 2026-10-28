@@ -76,6 +76,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// allowlisted rooms. An alias names no room yet, so it never passes.
 	ours := req.Write && h.rooms.Check(req.Room)
 
+	if req.Endpoint == route.Profile && req.Write && mode == config.ModeNative && h.creator != nil {
+		// A profile change names no room: it goes into every room the user
+		// is in, and the creator asks the allowlist about each.
+		out := h.creator.ServeProfile(w, r, req)
+		if out.Fallback == "" {
+			requests.WithLabelValues(string(req.Endpoint), "true", "none", "native", "native_"+out.Result).Inc()
+			return
+		}
+		served = "fallback"
+	}
 	if ours && mode == config.ModeNative && h.creator != nil && creator.Serves(req.Endpoint) {
 		out := h.creator.Serve(w, r, req)
 		if out.Fallback == "" {

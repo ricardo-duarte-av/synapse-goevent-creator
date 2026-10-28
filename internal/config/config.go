@@ -31,7 +31,9 @@ const (
 	ModeShadow Mode = "shadow"
 	// ModeNative serves writes in an allowlisted room here (package
 	// creator), and proxies the rest; whatever native handling declines is
-	// proxied and shadow-checked. Not knock or profile.
+	// proxied and shadow-checked. Profile writes are native (every room the
+	// user is in must be allowlisted), reads proxied, and nothing there is
+	// shadowed.
 	ModeNative Mode = "native"
 )
 
@@ -45,7 +47,7 @@ var accepted = map[route.Endpoint][]Mode{
 	route.Membership: {ModeProxy, ModeShadow, ModeNative},
 	route.Join:       {ModeProxy, ModeShadow, ModeNative},
 	route.Knock:      {ModeProxy, ModeNative},
-	route.Profile:    {ModeProxy},
+	route.Profile:    {ModeProxy, ModeNative},
 }
 
 // Config is the top-level worker configuration.

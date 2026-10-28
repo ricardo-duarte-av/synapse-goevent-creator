@@ -318,3 +318,39 @@ func (c *Client) DelayedEventAdded(ctx context.Context, nextSendTS int64) error 
 	_, err := c.call(ctx, t, "added_delayed_event", t.base+"/_synapse/replication/added_delayed_event/", body)
 	return err
 }
+
+// ProfileSetField is ReplicationProfileSetField, which a worker that is not
+// the profile updates writer (the first events writer) calls to set a
+// profile field: the writer stores it, updates the user directory and, with
+// propagate, schedules the join events into the user's rooms. requester is
+// the requesting user's ID, the only part of the requester sent. CACHE is
+// False: no txn_id.
+func (c *Client) ProfileSetField(ctx context.Context, instance, userID, requester, field string, value json.RawMessage, byAdmin, propagate bool) error {
+	body, err := json.Marshal(map[string]any{
+		"requester": requester, "field_name": field, "new_value": value,
+		"by_admin": byAdmin, "propagate": propagate,
+	})
+	if err != nil {
+		return fmt.Errorf("replication: encode profile field: %w", err)
+	}
+	return c.profileCall(ctx, instance, "profile_set_field", userID, body)
+}
+
+// ProfileDeleteField is ReplicationProfileDeleteField: a custom field
+// removed. CACHE is False: no txn_id.
+func (c *Client) ProfileDeleteField(ctx context.Context, instance, userID, requester, field string, byAdmin bool) error {
+	body, err := json.Marshal(map[string]any{"requester": requester, "field_name": field, "by_admin": byAdmin})
+	if err != nil {
+		return fmt.Errorf("replication: encode profile field: %w", err)
+	}
+	return c.profileCall(ctx, instance, "profile_delete_field", userID, body)
+}
+
+func (c *Client) profileCall(ctx context.Context, instance, name, userID string, body []byte) error {
+	t, ok := c.targets[canonical(instance)]
+	if !ok {
+		return fmt.Errorf("replication: instance %q is not in instance_map", instance)
+	}
+	_, err := c.call(ctx, t, name, t.base+"/_synapse/replication/"+name+"/"+quote(userID), body)
+	return err
+}

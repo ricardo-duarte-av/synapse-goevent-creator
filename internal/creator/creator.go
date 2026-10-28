@@ -106,6 +106,7 @@ type Store interface {
 
 	// Membership.
 	Profile(ctx context.Context, userID string) (displayname, avatarURL *string, ok bool, err error)
+	JoinedRooms(ctx context.Context, userID string) ([]string, error)
 	RoomBlocked(ctx context.Context, roomID string) (bool, error)
 	LocalMembership(ctx context.Context, userID, roomID string) (membership, eventID string, err error)
 	RatelimitExempt(ctx context.Context, userID string) (bool, error)
@@ -175,6 +176,17 @@ type Options struct {
 	MSC4293, MSC4155 bool
 	// Main is told when a local user leaves a room they were joined to.
 	Main MembershipNotifier
+
+	// ProfileWriter, at ProfileWriterInstance (the first events writer),
+	// stores profile fields; Rooms is the allowlist, which every room a
+	// profile change sends a join event into must pass. MSC4069 is
+	// msc4069_profile_inhibit_propagation. SyncPropagation runs a profile
+	// change's join events before answering (tests).
+	ProfileWriter         ProfileWriter
+	ProfileWriterInstance string
+	Rooms                 RoomChecker
+	MSC4069               bool
+	SyncPropagation       bool
 	// UserIPs is told of each authenticated request (_record_request);
 	// nil tells no one.
 	UserIPs UserIPs
@@ -214,6 +226,8 @@ type Creator struct {
 	dry bool
 	// verify is replaced in tests.
 	verify func(v pending)
+	// profiles are the profile changes being propagated.
+	profiles profileJobs
 }
 
 // New builds a Creator.
@@ -297,6 +311,9 @@ type input struct {
 	originTS *int64
 	// delayMS is a delayed event's delay.
 	delayMS *int64
+	// noRatelimit is update_membership's ratelimit=False: the events
+	// writer does not ratelimit it either.
+	noRatelimit bool
 }
 
 func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {
@@ -710,6 +727,9 @@ type requester struct {
 	// neither is serialized.
 	Admin     bool
 	Suspended bool
+	// NoToken is create_requester's requester, made by the server (a
+	// profile change's join events): access_token_id is None.
+	NoToken bool
 }
 
 // appServiceID is app_service_id: null for a user's own token.
@@ -730,7 +750,7 @@ func (rq *requester) MarshalJSON() ([]byte, error) {
 		entity = rq.UserID
 	}
 	var token any = rq.TokenID
-	if rq.AppService != nil {
+	if rq.AppService != nil || rq.NoToken {
 		token = nil
 	}
 	return json.Marshal(map[string]any{
@@ -1303,7 +1323,7 @@ func (c *Creator) entry(p *prepared) (json.RawMessage, error) {
 			"partial_state":            false,
 		},
 		"requester":   p.rq,
-		"ratelimit":   true,
+		"ratelimit":   !p.in.noRatelimit,
 		"extra_users": extra,
 	})
 }

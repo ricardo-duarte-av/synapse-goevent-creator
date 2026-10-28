@@ -681,6 +681,15 @@ func lastWins(n *yaml.Node) map[string]any {
 	return out
 }
 
+// ProfileWriter is the profile updates writer: the first events writer
+// (handlers/profile.py, writers.events[0]), "master" when there are none.
+func (w Writers) ProfileWriter() string {
+	if len(w.Events) == 0 {
+		return MainProcessInstanceName
+	}
+	return w.Events[0]
+}
+
 // EventsWriter is the event persister for a room: _get_instance
 // (config/_base.py:1074), the room ID's sha256 read little-endian, modulo the
 // number of writers. "master" when stream_writers.events is empty.

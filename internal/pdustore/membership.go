@@ -100,3 +100,21 @@ func (s *Store) RatelimitOverride(ctx context.Context, userID string) (found boo
 	}
 	return true, perSecond, burst, nil
 }
+
+const qJoinedRooms = `SELECT room_id FROM current_state_events
+	WHERE type = 'm.room.member' AND state_key = $1 AND membership = 'join'
+	ORDER BY room_id`
+
+// JoinedRooms is get_rooms_for_user, sorted as _update_join_states_task
+// sorts it: the rooms the user is joined to.
+func (s *Store) JoinedRooms(ctx context.Context, userID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, qJoinedRooms, userID)
+	if err != nil {
+		return nil, fmt.Errorf("pdustore: joined rooms: %w", err)
+	}
+	rooms, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("pdustore: joined rooms: %w", err)
+	}
+	return rooms, nil
+}

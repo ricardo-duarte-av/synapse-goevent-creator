@@ -57,6 +57,10 @@ type Request struct {
 	// TxnID is the transaction ID for Send, Redact, Join, Knock and
 	// Membership's PUT form.
 	TxnID string
+	// FieldPath is a Profile path ProfileFieldRestServlet serves; User is
+	// its user ID and Action its field name, either possibly empty.
+	FieldPath bool
+	User      string
 }
 
 var membershipActions = map[string]bool{
@@ -105,7 +109,13 @@ func Classify(method, escapedPath string) Request {
 	case "profile":
 		// Every method: profile writes fan out to every room the user is
 		// in, so the whole endpoint is one mode.
-		return Request{Endpoint: Profile, Write: method != http.MethodGet && method != http.MethodHead}
+		r := Request{Endpoint: Profile, Write: method != http.MethodGet && method != http.MethodHead}
+		// ProfileFieldRestServlet: displayname and avatar_url under every
+		// prefix (client_patterns, v1=True), any other field under v3 only.
+		if len(parts) == 3 && (parts[2] == "displayname" || parts[2] == "avatar_url" || version == "v3") {
+			r.FieldPath, r.User, r.Action = true, parts[1], parts[2]
+		}
+		return r
 
 	case "join", "knock":
 		ep := Join

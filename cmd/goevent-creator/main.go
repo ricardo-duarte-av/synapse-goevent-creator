@@ -126,7 +126,7 @@ func run(cfg *config.Config, configPath string, log zerolog.Logger) error {
 		defer d.close()
 		var predictor shadow.Predictor
 		if cfg.AnyNative() {
-			if native, err = d.creator(ctx, hs, log); err != nil {
+			if native, err = d.creator(ctx, hs, rooms, log); err != nil {
 				return err
 			}
 			// The native path run dry, for comparing Synapse's refusals.
@@ -340,7 +340,7 @@ func (d *deps) checker(cfg *config.Config, hs *synapsecfg.Config, log zerolog.Lo
 // creator connects what native mode writes with: the write role, created or
 // repaired with homeserver.yaml's credentials, and replication to the events
 // writer.
-func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.Logger) (*creator.Creator, error) {
+func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, rooms *allowlist.List, log zerolog.Logger) (*creator.Creator, error) {
 	if hs.ReplicationSecret == "" {
 		log.Warn().Msg("No worker_replication_secret: replication requests are sent without one")
 	}
@@ -420,6 +420,11 @@ func (d *deps) creator(ctx context.Context, hs *synapsecfg.Config, log zerolog.L
 		MSC3848:                hs.Flag("msc3848_enabled", false),
 		MSC4293:                hs.Flag("msc4293_enabled", false),
 		MSC4155:                hs.Flag("msc4155_enabled", false),
+
+		ProfileWriter:         repl,
+		ProfileWriterInstance: hs.Writers.ProfileWriter(),
+		Rooms:                 rooms,
+		MSC4069:               hs.Flag("msc4069_profile_inhibit_propagation", false),
 	}), nil
 }
 

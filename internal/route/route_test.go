@@ -33,7 +33,16 @@ func TestClassify(t *testing.T) {
 		{"POST", "/_matrix/client/v3/knock/" + r,
 			Request{Endpoint: Knock, Write: true, Room: r}},
 		{"PUT", "/_matrix/client/v3/profile/%40u%3Aex/displayname",
+			Request{Endpoint: Profile, Write: true, FieldPath: true, User: "@u:ex", Action: "displayname"}},
+		{"PUT", "/_matrix/client/r0/profile/%40u%3Aex/avatar_url",
+			Request{Endpoint: Profile, Write: true, FieldPath: true, User: "@u:ex", Action: "avatar_url"}},
+		{"DELETE", "/_matrix/client/v3/profile/%40u%3Aex/m.tz",
+			Request{Endpoint: Profile, Write: true, FieldPath: true, User: "@u:ex", Action: "m.tz"}},
+		// A custom field outside v3 is no servlet's.
+		{"PUT", "/_matrix/client/r0/profile/%40u%3Aex/m.tz",
 			Request{Endpoint: Profile, Write: true}},
+		{"PUT", "/_matrix/client/unstable/uk.tcpip.msc4133/profile/%40u%3Aex/m.tz",
+			Request{Endpoint: Other}},
 		{"GET", "/_matrix/client/v3/profile/%40u%3Aex",
 			Request{Endpoint: Profile, Write: false}},
 
