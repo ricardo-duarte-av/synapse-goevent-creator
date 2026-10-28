@@ -792,7 +792,7 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		return nil, "", fb("unknown_room")
 	}
 	rv, ok := pdu.LookupRoomVersion(rvID)
-	if !ok || rv.EventFormat < 3 {
+	if !ok {
 		return nil, "", fb("room_version")
 	}
 	if partial, err := c.o.Store.PartialState(ctx, req.Room); err != nil {
@@ -923,6 +923,14 @@ func (c *Creator) prepare(ctx context.Context, req route.Request, rq *requester,
 		OriginServerTS:   originTS,
 		StickyDurationMS: in.sticky,
 	}
+	if rv.EventFormat == pdu.FormatV1V2 {
+		// builder.py: the origin picks the event ID, and each prev and auth
+		// event is listed with its reference hash (add_event_hashes).
+		bp.EventID = build.NewV1EventID(ts, c.o.Key.ServerName)
+		if bp.RefHashes, err = c.refHashes(ctx, rv, prevs, authIDs); err != nil {
+			return nil, "", fb("ref_hashes")
+		}
+	}
 	built, err := build.Build(bp, c.o.Key)
 	if err != nil {
 		return nil, "", fb("build")
@@ -1039,6 +1047,30 @@ func (c *Creator) duplicate(ctx context.Context, before pdu.StateMap, in *input,
 		return "", nil
 	}
 	return prevID, nil
+}
+
+// refHashes is get_event_reference_hashes for the events a v1/v2 event
+// lists: rejected ones too (allow_rejected), each as stored.
+func (c *Creator) refHashes(ctx context.Context, rv *pdu.RoomVersion, idLists ...[]string) (map[string][]byte, error) {
+	var ids []string
+	for _, l := range idLists {
+		ids = append(ids, l...)
+	}
+	evs, bad, err := c.o.Store.GetStoredEvents(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string][]byte, len(ids))
+	for _, e := range ids {
+		se := evs[e]
+		if se == nil || bad[e] != nil {
+			return nil, fmt.Errorf("event %s unavailable", e)
+		}
+		if out[e], err = build.RefHash(se.Event.JSON, id.RoomVersion(rv.ID)); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // withField sets one top-level field of a JSON object.

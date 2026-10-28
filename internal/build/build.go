@@ -13,11 +13,15 @@
 package build
 
 import (
+	"encoding/json"
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"slices"
+	"strconv"
+	"sync/atomic"
 
 	"go.mau.fi/util/jsontime"
 	"maunium.net/go/mautrix/crypto/canonicaljson"
@@ -52,6 +56,16 @@ type Proto struct {
 	// StickyDurationMS is MSC4354's msc4354_sticky.duration_ms, from the
 	// client's sticky query parameter (rest/client/room.py), nil for none.
 	StickyDurationMS *int64
+
+	// EventID is the event's ID in room versions 1 and 2, where the origin
+	// chooses it (NewV1EventID). Other versions derive it from the event.
+	EventID string
+	// RefHashes are the prev and auth events' reference hashes (sha256),
+	// which rooms v1 and v2 list beside each (add_event_hashes; RefHash).
+	RefHashes map[string][]byte
+	// Origin is the top-level origin older Synapses added (before 2025 here).
+	// v1.163.0 adds none: only for rebuilding stored events.
+	Origin jsontext.Value
 }
 
 // Key is the server's signing key.
@@ -69,17 +83,23 @@ func ParseKey(serverName, line string) (*Key, error) {
 	return &Key{ServerName: serverName, SigningKey: sk}, nil
 }
 
-// Event is a built event.
+// Event is a built event. PDU is nil in room versions 1 and 2, whose
+// events are V1.
 type Event struct {
 	ID   string
 	PDU  *pdu.PDU
+	V1   *pdu.RoomV1PDU
 	JSON []byte
 }
 
 // ErrUnsupportedRoomVersion is a room version whose event format this
-// package does not build: v1 and v2 carry hashes beside each event
-// reference, and nothing here needs them.
+// package does not build.
 var ErrUnsupportedRoomVersion = errors.New("build: unsupported room version")
+
+// ErrNoRefHash is a v1/v2 prev or auth event without a reference hash.
+// Synapse would list it with {} (an event it does not hold); every event
+// we reference is one we hold, so this is a bug or a race, not Synapse's.
+var ErrNoRefHash = errors.New("build: no reference hash")
 
 // Depth is the builder's rule: one more than the deepest prev event, capped.
 func Depth(prevDepths []int64) int64 {
@@ -102,12 +122,12 @@ func Build(p Proto, key *Key) (*Event, error) {
 	if !p.RoomVersion.IsKnown() {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedRoomVersion, p.RoomVersion)
 	}
-	switch p.RoomVersion {
-	case id.RoomV1, id.RoomV2:
-		return nil, fmt.Errorf("%w: %q", ErrUnsupportedRoomVersion, p.RoomVersion)
-	}
 	if p.Content == nil {
 		p.Content = jsontext.Value("{}")
+	}
+	switch p.RoomVersion {
+	case id.RoomV1, id.RoomV2:
+		return buildV1(p, key)
 	}
 
 	auth := slices.Clone(p.AuthEvents)
@@ -128,6 +148,7 @@ func Build(p Proto, key *Key) (*Event, error) {
 		StateKey:       p.StateKey,
 		Type:           p.Type,
 	}
+	ev.DeprecatedOrigin = p.Origin
 	if p.Redacts != nil && TopLevelRedacts(p.RoomVersion) {
 		r := id.EventID(*p.Redacts)
 		ev.Redacts = &r
@@ -162,6 +183,100 @@ func Build(p Proto, key *Key) (*Event, error) {
 		return nil, fmt.Errorf("build: marshal: %w", err)
 	}
 	return &Event{ID: string(eventID), PDU: ev, JSON: raw}, nil
+}
+
+// buildV1 is Build for room versions 1 and 2: the event ID is chosen, not
+// derived, and each prev and auth event is listed with its reference hash.
+func buildV1(p Proto, key *Key) (*Event, error) {
+	if p.EventID == "" {
+		return nil, fmt.Errorf("build: a v1 event needs an event ID")
+	}
+	refs := func(ids []string) ([]pdu.V1EventReference, error) {
+		out := make([]pdu.V1EventReference, len(ids))
+		for i, e := range ids {
+			h, ok := p.RefHashes[e]
+			if !ok {
+				return nil, fmt.Errorf("%w: %s", ErrNoRefHash, e)
+			}
+			out[i] = pdu.V1EventReference{ID: id.EventID(e), Hashes: pdu.Hashes{SHA256: h}}
+		}
+		return out, nil
+	}
+	prev, err := refs(p.PrevEvents)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := refs(p.AuthEvents)
+	if err != nil {
+		return nil, err
+	}
+	ev := &pdu.RoomV1PDU{
+		AuthEvents:     auth,
+		Content:        p.Content,
+		Depth:          p.Depth,
+		EventID:        id.EventID(p.EventID),
+		OriginServerTS: p.OriginServerTS,
+		PrevEvents:     prev,
+		RoomID:         id.RoomID(p.RoomID),
+		Sender:         id.UserID(p.Sender),
+		StateKey:       p.StateKey,
+		Type:           p.Type,
+
+		DeprecatedOrigin: p.Origin,
+	}
+	if p.Redacts != nil {
+		r := id.EventID(*p.Redacts)
+		ev.Redacts = &r
+	}
+	if p.StickyDurationMS != nil {
+		ev.Sticky = &event.Sticky{Duration: jsontime.MSInt(*p.StickyDurationMS)}
+	}
+	// As in Build: the hash covers both, the signature neither.
+	if err := ev.FillContentHash(); err != nil {
+		return nil, fmt.Errorf("build: content hash: %w", err)
+	}
+	sticky, redacts := ev.Sticky, ev.Redacts
+	ev.Sticky, ev.Redacts = nil, nil
+	if err := ev.Sign(p.RoomVersion, key.ServerName, key.ID, key.Priv); err != nil {
+		return nil, fmt.Errorf("build: sign: %w", err)
+	}
+	ev.Sticky, ev.Redacts = sticky, redacts
+	raw, err := jsonMarshal(ev)
+	if err != nil {
+		return nil, fmt.Errorf("build: marshal: %w", err)
+	}
+	return &Event{ID: p.EventID, V1: ev, JSON: raw}, nil
+}
+
+// RefHash is compute_event_reference_hash for a v1/v2 event's stored JSON:
+// sha256 of the event as Synapse prunes it, which keeps neither a
+// redaction's top-level redacts nor msc4354_sticky (mautrix keeps both).
+func RefHash(raw []byte, rv id.RoomVersion) ([]byte, error) {
+	var ev pdu.RoomV1PDU
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return nil, fmt.Errorf("build: reference hash: %w", err)
+	}
+	ev.Sticky, ev.Redacts = nil, nil
+	h, err := ev.GetReferenceHash(rv)
+	if err != nil {
+		return nil, fmt.Errorf("build: reference hash: %w", err)
+	}
+	return h[:], nil
+}
+
+// v1Counter is _event_id_counter: per process, from 0.
+var v1Counter atomic.Uint64
+
+// NewV1EventID is _create_event_id: "$", the time in whole seconds, the
+// process's counter, five random letters, ":" and the server name.
+func NewV1EventID(nowMS int64, serverName string) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	b := make([]byte, 5)
+	for i := range b {
+		b[i] = letters[rand.IntN(len(letters))]
+	}
+	n := v1Counter.Add(1) - 1
+	return "$" + strconv.FormatInt(nowMS/1000, 10) + strconv.FormatUint(n, 10) + string(b) + ":" + serverName
 }
 
 func toEventIDs(ss []string) []id.EventID {

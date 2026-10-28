@@ -2,12 +2,15 @@ package creator
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/json/jsontext"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -53,19 +56,45 @@ type fakeRoom struct {
 	accountData map[string]bool
 	exempt      bool
 	annotated   map[string]bool // aggregation keys the user has sent
+	version     string          // the room version, "11" unless made otherwise
+	v1IDs       int
+}
+
+// proto fills in what the room version needs: v1/v2 events carry a chosen
+// ID and their prev and auth events' reference hashes.
+func (f *fakeRoom) proto(t *testing.T, p build.Proto) build.Proto {
+	t.Helper()
+	p.RoomVersion = id.RoomVersion(f.version)
+	if f.version == "1" || f.version == "2" {
+		f.v1IDs++
+		p.EventID = fmt.Sprintf("$%d:example.org", f.v1IDs)
+		p.RefHashes = map[string][]byte{}
+		for _, e := range append(slices.Clone(p.PrevEvents), p.AuthEvents...) {
+			h, err := build.RefHash(f.events[e].Event.JSON, p.RoomVersion)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.RefHashes[e] = h
+		}
+	}
+	return p
 }
 
 func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
+	return newFakeRoomVersion(t, key, "11")
+}
+
+func newFakeRoomVersion(t *testing.T, key *build.Key, version string) *fakeRoom {
 	t.Helper()
-	f := &fakeRoom{events: map[string]*pdustore.StoredEvent{}, state: pdu.StateMap{},
+	f := &fakeRoom{version: version, events: map[string]*pdustore.StoredEvent{}, state: pdu.StateMap{},
 		token: &pdustore.TokenInfo{ID: 42, UserID: user, DeviceID: "DEV", Used: true}}
-	rv, _ := pdu.LookupRoomVersion("11")
+	rv, _ := pdu.LookupRoomVersion(version)
 	var prev []string
 	depth := int64(1)
 	add := func(typ, sk, content string, auth []string) string {
 		s := sk
-		b, err := build.Build(build.Proto{RoomVersion: id.RoomV11, RoomID: room, Sender: user, Type: typ, StateKey: &s,
-			Content: jsontext.Value(content), PrevEvents: prev, AuthEvents: auth, Depth: depth, OriginServerTS: 1}, key)
+		b, err := build.Build(f.proto(t, build.Proto{RoomID: room, Sender: user, Type: typ, StateKey: &s,
+			Content: jsontext.Value(content), PrevEvents: prev, AuthEvents: auth, Depth: depth, OriginServerTS: 1}), key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -79,7 +108,7 @@ func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
 		depth++
 		return b.ID
 	}
-	create := add("m.room.create", "", `{"room_version":"11","creator":"`+user+`"}`, nil)
+	create := add("m.room.create", "", `{"room_version":"`+version+`","creator":"`+user+`"}`, nil)
 	member := add("m.room.member", user, `{"membership":"join"}`, []string{create})
 	pl := add("m.room.power_levels", "", `{"users":{"`+user+`":100},"events_default":0}`, []string{create, member})
 	f.create = create
@@ -93,12 +122,12 @@ func newFakeRoom(t *testing.T, key *build.Key) *fakeRoom {
 // extremity.
 func (f *fakeRoom) addState(t *testing.T, typ, sk, content string) string {
 	t.Helper()
-	rv, _ := pdu.LookupRoomVersion("11")
+	rv, _ := pdu.LookupRoomVersion(f.version)
 	s := sk
 	depth := f.events[f.prevs[0]].Depth + 1
 	auth := []string{f.create, f.state[pdu.StateKey{Type: "m.room.power_levels"}], f.state[pdu.StateKey{Type: "m.room.member", StateKey: user}]}
-	b, err := build.Build(build.Proto{RoomVersion: id.RoomV11, RoomID: room, Sender: user, Type: typ, StateKey: &s,
-		Content: jsontext.Value(content), PrevEvents: f.prevs, AuthEvents: auth, Depth: depth, OriginServerTS: 1}, f.key)
+	b, err := build.Build(f.proto(t, build.Proto{RoomID: room, Sender: user, Type: typ, StateKey: &s,
+		Content: jsontext.Value(content), PrevEvents: f.prevs, AuthEvents: auth, Depth: depth, OriginServerTS: 1}), f.key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +183,7 @@ func (f *fakeRoom) TxnEvent(_ context.Context, r, u, d, txn string) (string, err
 	}
 	return "", pdustore.ErrNotFound
 }
-func (f *fakeRoom) RoomVersion(context.Context, string) (string, error)         { return "11", nil }
+func (f *fakeRoom) RoomVersion(context.Context, string) (string, error)         { return f.version, nil }
 func (f *fakeRoom) PartialState(context.Context, string) (bool, error)          { return f.partial, nil }
 func (f *fakeRoom) PrevEventsForRoom(context.Context, string) ([]string, error) { return f.prevs, nil }
 func (f *fakeRoom) RoomMaxStream(context.Context, string) (int64, error)        { return 3, nil }
@@ -316,11 +345,16 @@ func (m *fakeMain) UserLeftRoom(_ context.Context, roomID, userID string) error 
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessVersion(t, "11")
+}
+
+func newHarnessVersion(t *testing.T, version string) *harness {
+	t.Helper()
 	key, err := build.ParseKey("example.org", federation.GenerateSigningKey().SynapseString())
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &harness{f: newFakeRoom(t, key), w: &fakeWriter{}, p: &fakePersister{}, main: &fakeMain{}}
+	h := &harness{f: newFakeRoomVersion(t, key, version), w: &fakeWriter{}, p: &fakePersister{}, main: &fakeMain{}}
 	lim := synapsecfg.Ratelimit{PerSecond: 1, Burst: 10}
 	h.c = New(Options{Store: h.f, Writer: h.w, Persister: h.p, Key: key,
 		ServerName: "example.org", EventsWriter: func(string) string { return "persister" }, Sticky: true,
@@ -1085,6 +1119,57 @@ func TestRedactionWithoutPower(t *testing.T) {
 		}
 		if len(h.w.calls) != 0 || len(h.p.entries) != 0 {
 			t.Errorf("%s: wrote %v", name, h.w.calls)
+		}
+	}
+}
+
+// Rooms v1 to v3 are served natively. In v1 and v2 the event ID is chosen
+// (_create_event_id) and each prev and auth event carries its reference
+// hash (add_event_hashes); a redaction's redacts is top-level.
+func TestNativeOldRoomVersions(t *testing.T) {
+	v1ID := regexp.MustCompile(`^\$\d+[A-Za-z]{5}:example\.org$`)
+	for _, version := range []string{"1", "2", "3"} {
+		h := newHarnessVersion(t, version)
+		rec, out := h.send(t, http.MethodPut, "t1", `{"msgtype":"m.text","body":"hi"}`)
+		if out.Result != "created" || rec.Code != 200 {
+			t.Fatalf("v%s: %+v %d %s", version, out, rec.Code, rec.Body)
+		}
+		e := gjson.ParseBytes(h.p.entries[0])
+		ev := e.Get("event")
+		got := gjson.Get(rec.Body.String(), "event_id").Str
+		if version == "3" {
+			if ev.Get("event_id").Exists() || ev.Get("prev_events.0").Type != gjson.String {
+				t.Errorf("v3: %s", ev.Raw)
+			}
+			continue
+		}
+		if !v1ID.MatchString(got) || ev.Get("event_id").Str != got {
+			t.Errorf("v%s: event ID %q, in the event %q", version, got, ev.Get("event_id").Str)
+		}
+		for _, list := range []string{"prev_events", "auth_events"} {
+			for _, ref := range ev.Get(list).Array() {
+				want, err := build.RefHash(h.f.events[ref.Get("0").Str].Event.JSON, id.RoomVersion(version))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ref.Get("1.sha256").Str != base64.RawStdEncoding.EncodeToString(want) {
+					t.Errorf("v%s: %s %s: hash %s", version, list, ref.Get("0").Str, ref.Get("1").Raw)
+				}
+			}
+		}
+		// The event persisted parses as what was built, ID and all.
+		rv, _ := pdu.LookupRoomVersion(version)
+		if _, err := pdu.ParseEvent([]byte(ev.Raw), got, rv, false); err != nil {
+			t.Errorf("v%s: %v", version, err)
+		}
+
+		rec, out = h.put(t, redactReq(h.f.topic, "r1"), "/redact/x/r1", `{"reason":"x"}`)
+		if out.Result != "created" || rec.Code != 200 {
+			t.Fatalf("v%s redaction: %+v %d %s", version, out, rec.Code, rec.Body)
+		}
+		red := gjson.GetBytes(h.p.entries[1], "event")
+		if red.Get("redacts").Str != h.f.topic || red.Get("content.redacts").Exists() {
+			t.Errorf("v%s redaction: %s", version, red.Raw)
 		}
 	}
 }

@@ -87,6 +87,19 @@ in gopro.
   wrong signature and ID until 2026-10-22 (shadow caught one in a v9 room;
   the test rooms are all v11+). `TestLiveRebuildsSynapseEvents` now also
   rebuilds local redactions from any room.
+- **Rooms v1 to v3 are native too** (2026-10-28). Until then any room
+  before v4 fell back (`EventFormat < 3`, v3 included). In v1/v2 the
+  origin picks the ID, `_create_event_id`'s `$<unix seconds><process
+  counter><5 letters>:<server>`, and each prev and auth event is listed as
+  `[id, {"sha256": reference hash}]` (`add_event_hashes`; `build.RefHash`,
+  which drops `redacts` and `msc4354_sticky` as Synapse's prune does).
+  Events before 2025 here also carry a top-level `origin`, which v1.163
+  no longer adds (`Proto.Origin` exists only to rebuild them).
+  `TestLiveRebuildsSynapseEvents` rebuilds the newest 200 local events in
+  v1-v3 rooms (189 v1) with every signature, content hash and stored
+  reference hash equal. Shadow cannot compare a v1 event ID, so its
+  `rebuild` compares the signature over the stored ID instead. A policy
+  server in a v1/v2 room falls back (`policy_v1`).
 - **Synapse's `auth_events` order is random**: `auth_types_for_event` returns
   a Python set of tuples, and string hashing is randomised per process. Prev
   events are ordered by depth, ties arbitrary. Compare both as sets.

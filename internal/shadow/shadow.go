@@ -555,14 +555,52 @@ func (c *Checker) check(ctx context.Context, p *Pending, resp []byte) {
 	// The rebuild: our decisions, with the two things we cannot predict --
 	// the timestamp, and list orders Synapse leaves to chance -- taken from
 	// the stored event.
-	built, err := build.Build(c.proto(p, ev, content, ourAuth), c.o.Key)
+	pr := c.proto(p, ev, content, ourAuth)
+	if p.rv.EventFormat == pdu.FormatV1V2 {
+		// The origin chose the ID, so it proves nothing here: the stored
+		// one, with the reference hashes we would list, and the signature
+		// over both is what must agree.
+		pr.EventID = ev.ID
+		if pr.RefHashes, err = c.refHashes(ctx, p.rvID, pr.PrevEvents, pr.AuthEvents); err != nil {
+			r.record("rebuild", Error, func(e *zerolog.Event) { e.Err(err) })
+			return
+		}
+	}
+	built, err := build.Build(pr, c.o.Key)
 	if err != nil {
 		r.record("rebuild", Error, func(e *zerolog.Event) { e.Err(err) })
 		return
 	}
-	r.compare("rebuild", built.ID == ev.ID, func(e *zerolog.Event) {
+	same := built.ID == ev.ID
+	if p.rv.EventFormat == pdu.FormatV1V2 {
+		sig := "signatures." + gjson.Escape(c.o.Key.ServerName) + "." + gjson.Escape(string(c.o.Key.ID))
+		same = gjson.GetBytes(built.JSON, sig).Str == gjson.GetBytes(ev.JSON, sig).Str
+	}
+	r.compare("rebuild", same, func(e *zerolog.Event) {
 		e.Str("ours", built.ID).RawJSON("stored_json", ev.JSON).RawJSON("our_json", built.JSON)
 	})
+}
+
+// refHashes are the reference hashes a v1/v2 event lists.
+func (c *Checker) refHashes(ctx context.Context, rvID string, lists ...[]string) (map[string][]byte, error) {
+	var ids []string
+	for _, l := range lists {
+		ids = append(ids, l...)
+	}
+	evs, bad, err := c.o.Store.GetStoredEvents(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]byte{}
+	for _, e := range ids {
+		if evs[e] == nil || bad[e] != nil {
+			return nil, fmt.Errorf("event %s unavailable", e)
+		}
+		if out[e], err = build.RefHash(evs[e].Event.JSON, id.RoomVersion(rvID)); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // findEvent is the event Synapse made for the request.

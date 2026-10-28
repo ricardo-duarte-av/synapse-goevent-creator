@@ -227,6 +227,11 @@ func (c *Creator) policyCheck(ctx context.Context, built *build.Event, pduJSON [
 	if !ok {
 		return nil
 	}
+	if built.PDU == nil {
+		// A v1/v2 event: the policy server path here signs only the v3+
+		// type. A policy server in a v1/v2 room is left to Synapse.
+		return fb("policy_v1")
+	}
 	if st := c.askPolicy(ctx, built, pduJSON, server); st != nil {
 		return st
 	}
