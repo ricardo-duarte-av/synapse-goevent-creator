@@ -7,7 +7,7 @@ in place of the Python `event_creator` worker (`av-client-events-1`, which it
 is meant to retire) and proxies whatever it does not serve itself to Synapse's
 main process.
 
-**Status: M6.** In the rooms the config names (`rooms`, reread on SIGHUP), `send`,
+**Status: M6.** In the rooms the config names, or all of them (`rooms`, `exclude_rooms`, reread on SIGHUP), `send`,
 `state`, `redact`, membership and `join/` can be served natively
 (`modes.*: native`). The worker builds and signs the event, auths it, computes
 its state group and push actions, writes what Synapse's event creator writes

@@ -95,7 +95,7 @@ func run(cfg *config.Config, configPath string, log zerolog.Logger) error {
 	log.Info().Str("version", tag).Str("commit", commit).Dict("modes", modes).
 		Msg("Starting goevent-creator")
 
-	rooms, err := allowlist.New(cfg.Rooms)
+	rooms, err := allowlist.NewSpec(roomSpec(cfg))
 	if err != nil {
 		return err
 	}
@@ -177,7 +177,7 @@ func run(cfg *config.Config, configPath string, log zerolog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info().Str("socket", cfg.Listen.Socket).Str("addr", cfg.Listen.Addr).
-			Strs("upstreams", up.Backends()).Strs("rooms", rooms.Rooms()).Msg("Serving")
+			Strs("upstreams", up.Backends()).Strs("rooms", rooms.Rooms()).Strs("excluded", rooms.Excluded()).Msg("Serving")
 		errCh <- srv.Serve(ln)
 	}()
 
@@ -472,22 +472,35 @@ func listen(cfg config.Listen) (net.Listener, error) {
 	return l, nil
 }
 
+// roomSpec is the config's rooms for the allowlist.
+func roomSpec(cfg *config.Config) allowlist.Spec {
+	return allowlist.Spec{All: cfg.Rooms.All, Rooms: cfg.Rooms.IDs, Excluded: cfg.ExcludeRooms}
+}
+
 // reloadRooms rereads the config on SIGHUP and replaces the rooms written
-// to natively. Nothing else is reloaded. A config that does not load leaves
-// the rooms as they were.
+// to natively, and the excluded ones. Nothing else is reloaded. A config
+// that does not load leaves the rooms as they were.
 func reloadRooms(path string, rooms *allowlist.List, log zerolog.Logger) {
 	cfg, err := config.Load(path)
 	if err != nil {
 		log.Error().Err(err).Msg("Reload failed: rooms unchanged")
 		return
 	}
-	before := rooms.Rooms()
-	if err := rooms.Set(cfg.Rooms); err != nil {
+	before, beforeEx := rooms.Rooms(), rooms.Excluded()
+	if err := rooms.Apply(roomSpec(cfg)); err != nil {
 		log.Error().Err(err).Msg("Reload failed: rooms unchanged")
 		return
 	}
-	after := rooms.Rooms()
-	var added, removed []string
+	after, afterEx := rooms.Rooms(), rooms.Excluded()
+	added, removed := diff(before, after)
+	excluded, included := diff(beforeEx, afterEx)
+	log.Info().Strs("rooms", after).Strs("added", added).Strs("removed", removed).
+		Strs("excluded", afterEx).Strs("newly_excluded", excluded).Strs("no_longer_excluded", included).
+		Msg("Reloaded rooms (only rooms are reloaded; other changes need a restart)")
+}
+
+// diff is what after has that before had not, and the reverse.
+func diff(before, after []string) (added, removed []string) {
 	for _, r := range after {
 		if !slices.Contains(before, r) {
 			added = append(added, r)
@@ -498,6 +511,5 @@ func reloadRooms(path string, rooms *allowlist.List, log zerolog.Logger) {
 			removed = append(removed, r)
 		}
 	}
-	log.Info().Strs("rooms", after).Strs("added", added).Strs("removed", removed).
-		Msg("Reloaded rooms (only rooms are reloaded; other changes need a restart)")
+	return added, removed
 }

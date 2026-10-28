@@ -52,3 +52,36 @@ func TestSet(t *testing.T) {
 		t.Error("could not empty the list")
 	}
 }
+
+// All rooms means every room ID but the excluded ones, and never an alias.
+func TestAll(t *testing.T) {
+	l, err := NewSpec(Spec{All: true, Excluded: []string{"!policy:example.org"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for r, want := range map[string]bool{
+		"!any:example.org":    true,
+		"!v12roomid":          true,
+		"!policy:example.org": false,
+		"#alias:example.org":  false,
+		"":                    false,
+	} {
+		if l.Check(r) != want {
+			t.Errorf("%q: %v", r, !want)
+		}
+	}
+	if got := l.Rooms(); len(got) != 1 || got[0] != "all" {
+		t.Errorf("rooms %v", got)
+	}
+	if _, err := NewSpec(Spec{All: true, Rooms: []string{"!a:example.org"}}); err == nil {
+		t.Error("all with a list was accepted")
+	}
+	if _, err := NewSpec(Spec{All: true, Excluded: []string{"#a:example.org"}}); err == nil {
+		t.Error("an excluded alias was accepted")
+	}
+	// Exclusion applies to a list too.
+	l, _ = NewSpec(Spec{Rooms: []string{"!a:example.org"}, Excluded: []string{"!a:example.org"}})
+	if l.Check("!a:example.org") {
+		t.Error("an excluded room in the list was allowed")
+	}
+}

@@ -28,7 +28,11 @@ The plan, with what Synapse does on the creator vs. the persister, is in
 - **Writes only to the config's `rooms`, which may be any room**
   (operator, 2026-10-27: "allow any room in the config, so that i can
   add/remove at will"). Until then it was a compiled-in list of four test
-  rooms the config could only narrow. The rooms are reread on SIGHUP
+  rooms the config could only narrow. `rooms: all` (operator, 2026-10-28:
+  "go native, all rooms") writes to every room but `exclude_rooms`; rooms
+  we are not in or do not know fall back to main before any write
+  (`unknown_room`, `prev_events_0`, `host_not_in_room`). The rooms and the
+  exclusions are reread on SIGHUP
   (`docker kill -s HUP av-goevent-creator-1`; nothing else reloads, and a
   config that fails to load keeps the old rooms). Every write path asks
   `allowlist.Check`, and only it. What we write federates.
@@ -42,8 +46,10 @@ The plan, with what Synapse does on the creator vs. the persister, is in
   main is the fallback for whatever we don't serve, and nothing may come to
   depend on av-client-events-1. Main is busy and single-threaded, so the
   fallback share should shrink, not grow.
-- **Test hostname only: `goevent.aguiarvieira.pt`** (deployed 2026-10-16).
-  `aguiarvieira.pt`'s nginx is not to be pointed at us. Changing nginx is
+- **`aguiarvieira.pt`'s nginx points at us** (the operator, by 2026-10-26:
+  the seven event-creation patterns in `proxy_host/2.conf` go to upstream
+  `av-goevent-creator`, `/var/sockets/nginx/xx-goevent-creator-1.sock`),
+  besides the test hostname `goevent.aguiarvieira.pt`. Changing nginx is
   the operator's call.
 - **All of `/profile/` is proxied** (operator, 2026-10-16). Profile writes go
   to main and then send a membership event into every room the user is in

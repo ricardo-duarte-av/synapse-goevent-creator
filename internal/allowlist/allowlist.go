@@ -2,8 +2,9 @@
 //
 // This worker creates events, and an event cannot be taken back: it is
 // persisted, streamed and federated within a second. It writes only to the
-// rooms the configuration names (operator, 2026-10-27: any room, added and
-// removed at will), and those can be changed while it runs (Set, on SIGHUP).
+// rooms the configuration names, or to every room but the excluded ones
+// (operator, 2026-10-27: any room, added and removed at will; 2026-10-28:
+// all rooms), and those can be changed while it runs (Apply, on SIGHUP).
 // Every write path must ask Check, and only Check.
 package allowlist
 
@@ -28,30 +29,64 @@ var TestRooms = []string{
 	"!goBCqT-LJRiRgPetKo34PrUe4GqYZ_R74c6SBGLwTo4",
 }
 
-// List is the configured rooms.
-type List struct {
-	rooms atomic.Pointer[map[string]bool]
+// Spec is what the configuration says: every room (All) or the listed
+// Rooms, never the Excluded ones.
+type Spec struct {
+	All      bool
+	Rooms    []string
+	Excluded []string
 }
 
-// New builds a List from configured room IDs.
+// List is the configured rooms.
+type List struct {
+	cur atomic.Pointer[state]
+}
+
+type state struct {
+	all      bool
+	rooms    map[string]bool
+	excluded map[string]bool
+}
+
+// New builds a List of the given rooms.
 func New(rooms []string) (*List, error) {
+	return NewSpec(Spec{Rooms: rooms})
+}
+
+// NewSpec builds a List from a Spec.
+func NewSpec(s Spec) (*List, error) {
 	l := &List{}
-	if err := l.Set(rooms); err != nil {
+	if err := l.Apply(s); err != nil {
 		return nil, err
 	}
 	return l, nil
 }
 
-// Set replaces the rooms. On an error the list is unchanged.
+// Set replaces the rooms with the given ones. On an error the list is
+// unchanged.
 func (l *List) Set(rooms []string) error {
-	m := make(map[string]bool, len(rooms))
-	for _, r := range rooms {
+	return l.Apply(Spec{Rooms: rooms})
+}
+
+// Apply replaces the rooms. On an error the list is unchanged.
+func (l *List) Apply(s Spec) error {
+	if s.All && len(s.Rooms) > 0 {
+		return fmt.Errorf("rooms: all takes no list of rooms")
+	}
+	st := &state{all: s.All, rooms: map[string]bool{}, excluded: map[string]bool{}}
+	for _, r := range s.Rooms {
 		if err := valid(r); err != nil {
 			return fmt.Errorf("rooms: %q: %w", r, err)
 		}
-		m[r] = true
+		st.rooms[r] = true
 	}
-	l.rooms.Store(&m)
+	for _, r := range s.Excluded {
+		if err := valid(r); err != nil {
+			return fmt.Errorf("exclude_rooms: %q: %w", r, err)
+		}
+		st.excluded[r] = true
+	}
+	l.cur.Store(st)
 	return nil
 }
 
@@ -72,18 +107,36 @@ func valid(r string) error {
 }
 
 // Check reports whether this worker may write to roomID. roomID must be a
-// resolved room ID; an alias is never allowed.
+// resolved room ID; an alias is never allowed, even with all rooms.
 func (l *List) Check(roomID string) bool {
 	if l == nil {
 		return false
 	}
-	m := l.rooms.Load()
-	return m != nil && (*m)[roomID]
+	st := l.cur.Load()
+	switch {
+	case st == nil || valid(roomID) != nil || st.excluded[roomID]:
+		return false
+	case st.all:
+		return true
+	}
+	return st.rooms[roomID]
 }
 
-// Rooms returns the configured rooms, for logging.
+// Rooms returns the configured rooms, or just "all", for logging.
 func (l *List) Rooms() []string {
-	m := *l.rooms.Load()
+	st := l.cur.Load()
+	if st.all {
+		return []string{"all"}
+	}
+	return sorted(st.rooms)
+}
+
+// Excluded returns the excluded rooms, for logging.
+func (l *List) Excluded() []string {
+	return sorted(l.cur.Load().excluded)
+}
+
+func sorted(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for r := range m {
 		out = append(out, r)

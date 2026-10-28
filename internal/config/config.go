@@ -62,13 +62,35 @@ type Config struct {
 	// nothing is proxied "because that is the default".
 	Modes map[route.Endpoint]Mode `yaml:"modes"`
 
-	// Rooms are the rooms this worker may write to: any room IDs. They are
+	// Rooms are the rooms this worker may write to: a list of room IDs, or
+	// "all". ExcludeRooms are never written to, even with all. Both are
 	// reread on SIGHUP.
-	Rooms []string `yaml:"rooms"`
+	Rooms        Rooms    `yaml:"rooms"`
+	ExcludeRooms []string `yaml:"exclude_rooms"`
 
 	Database Database `yaml:"database"`
 	Auth     Auth     `yaml:"auth"`
 	Shadow   Shadow   `yaml:"shadow"`
+}
+
+// Rooms is rooms: either the word all or a list of room IDs.
+type Rooms struct {
+	All bool
+	IDs []string
+}
+
+// UnmarshalYAML takes "all", a list, or nothing (no rooms).
+func (r *Rooms) UnmarshalYAML(n *yaml.Node) error {
+	switch {
+	case n.Kind == yaml.ScalarNode && n.Tag == "!!null":
+		return nil
+	case n.Kind == yaml.ScalarNode && n.Value == "all":
+		r.All = true
+		return nil
+	case n.Kind == yaml.ScalarNode:
+		return fmt.Errorf("rooms: %q: a list of room IDs, or all", n.Value)
+	}
+	return n.Decode(&r.IDs)
 }
 
 // Database is how we reach Synapse's PostgreSQL. Needed by any mode but

@@ -95,3 +95,30 @@ func TestNative(t *testing.T) {
 		t.Error("send is not native, or its fallbacks are not shadowed")
 	}
 }
+
+// rooms is a list of room IDs, the word all, or nothing.
+func TestRooms(t *testing.T) {
+	list := `rooms: ["!decSfHzLLhrNKJaZid:aguiarvieira.pt"]`
+	for in, want := range map[string]Rooms{
+		list:         {IDs: []string{"!decSfHzLLhrNKJaZid:aguiarvieira.pt"}},
+		"rooms: all": {All: true},
+		"rooms:":     {},
+		"rooms:\n  - \"!a:example.org\"\n  - \"!b:example.org\"": {IDs: []string{"!a:example.org", "!b:example.org"}},
+	} {
+		cfg, err := parse([]byte(strings.Replace(valid, list, in, 1)))
+		if err != nil {
+			t.Errorf("%q: %v", in, err)
+			continue
+		}
+		if cfg.Rooms.All != want.All || strings.Join(cfg.Rooms.IDs, ",") != strings.Join(want.IDs, ",") {
+			t.Errorf("%q: %+v", in, cfg.Rooms)
+		}
+	}
+	if _, err := parse([]byte(strings.Replace(valid, list, "rooms: every", 1))); err == nil {
+		t.Error("rooms: every was accepted")
+	}
+	cfg, err := parse([]byte(strings.Replace(valid, list, "rooms: all\nexclude_rooms: [\"!p:example.org\"]", 1)))
+	if err != nil || !cfg.Rooms.All || len(cfg.ExcludeRooms) != 1 {
+		t.Errorf("%+v %v", cfg, err)
+	}
+}

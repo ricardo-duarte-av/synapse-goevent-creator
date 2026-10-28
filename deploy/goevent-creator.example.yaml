@@ -23,12 +23,18 @@ metrics:
 log:
   level: info
 
-# The rooms this worker writes to natively: any room IDs (never aliases).
-# Every other room is proxied to main. Reread on SIGHUP, without a restart
-# (docker kill -s HUP <container>); nothing else is reloaded.
+# The rooms this worker writes to natively: a list of room IDs (never
+# aliases), or `rooms: all`. exclude_rooms are never written to, even with
+# all. Every other room is proxied to main, and so is whatever the native
+# path cannot serve (rooms we are not in, remote joins, ...). Both are
+# reread on SIGHUP, without a restart (docker kill -s HUP <container>);
+# nothing else is reloaded.
 rooms:
   - "!decSfHzLLhrNKJaZid:aguiarvieira.pt"   # TEST6TEST
   - "!nmZrvcKkeQiFGRlJtE:aguiarvieira.pt"   # TEST7TESTE
+# rooms: all
+# exclude_rooms:
+#   - "!IeWLVCQO4YviYfUxG-ca-eV5Vo__EcHXD-uD0CwVDLU"   # a policy list
 
 # Every endpoint must be given a mode:
 #   proxy   forward to the upstream, untouched

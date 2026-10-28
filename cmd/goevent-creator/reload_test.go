@@ -47,9 +47,15 @@ func TestReloadRooms(t *testing.T) {
 		t.Errorf("not reloaded: %v", rooms.Rooms())
 	}
 
+	write(" all\nexclude_rooms: [\"!c:example.org\"]")
+	reloadRooms(path, rooms, zerolog.Nop())
+	if !rooms.Check("!a:example.org") || !rooms.Check("!z:example.org") || rooms.Check("!c:example.org") {
+		t.Errorf("all rooms not reloaded: %v, excluded %v", rooms.Rooms(), rooms.Excluded())
+	}
+
 	write(` ["#alias:example.org"]`)
 	reloadRooms(path, rooms, zerolog.Nop())
-	if !rooms.Check("!b:example.org") {
+	if !rooms.Check("!z:example.org") || rooms.Check("!c:example.org") {
 		t.Errorf("a bad config changed the rooms: %v", rooms.Rooms())
 	}
 }
