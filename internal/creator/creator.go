@@ -319,6 +319,9 @@ type input struct {
 	// noRatelimit is update_membership's ratelimit=False: the events
 	// writer does not ratelimit it either.
 	noRatelimit bool
+	// profileJoin is a profile change's join into one of the user's rooms
+	// (_update_join_states_task).
+	profileJoin bool
 }
 
 func (c *Creator) serve(w http.ResponseWriter, r *http.Request, req route.Request) Outcome {

@@ -379,7 +379,7 @@ func (c *Creator) propagateJoin(ctx context.Context, room, target, entity string
 	req := route.Request{Endpoint: route.Membership, Write: true, Room: room, Action: "join"}
 	in, st := c.parseMembership(req, rq, []byte("{}"))
 	if st == nil {
-		in.noRatelimit = true
+		in.noRatelimit, in.profileJoin = true, true
 		st = c.checkMembershipRequest(ctx, req, rq, in)
 	}
 	if st != nil {

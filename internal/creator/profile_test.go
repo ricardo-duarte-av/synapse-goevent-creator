@@ -280,3 +280,24 @@ func TestProfileJobResumes(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// In a server notices room a profile change's join is made here; any
+// other membership change there stays main's.
+func TestProfileServerNoticeRoom(t *testing.T) {
+	h, _ := profileHarness(t)
+	const sn = "@notices:example.org"
+	h.c.o.Membership.ServerNoticesMXID = sn
+	h.f.addState(t, "m.room.member", sn, `{"membership":"join"}`)
+
+	rec, out := h.put(t, route.Request{Endpoint: route.State, Write: true, Room: room, Action: "m.room.member", StateKey: user},
+		"/state/m.room.member/"+user, `{"membership":"join","displayname":"Here only"}`)
+	if out.Fallback != "server_notice_room" {
+		t.Errorf("per-room name: %+v %d %s", out, rec.Code, rec.Body)
+	}
+
+	_, out = h.profile(t, "PUT", profilePath+"displayname", `{"displayname":"Everywhere"}`)
+	if out.Result != "set" || len(h.p.entries) != 1 ||
+		gjson.GetBytes(h.p.entries[0], "event.content.displayname").Str != "Everywhere" {
+		t.Errorf("profile change: %+v, %d events", out, len(h.p.entries))
+	}
+}

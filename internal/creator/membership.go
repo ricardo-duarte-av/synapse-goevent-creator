@@ -631,7 +631,10 @@ func (c *Creator) checkMembershipRequest(ctx context.Context, req route.Request,
 		if err != nil {
 			return fb("db_error")
 		}
-		if cur == "join" {
+		// A profile change's join is served there too: for a join the room
+		// changes nothing but consent, which is configFallback's, and the
+		// background propagation has no main to hand one room to.
+		if cur == "join" && !in.profileJoin {
 			return fb("server_notice_room")
 		}
 	}

@@ -234,7 +234,9 @@ Each native event is verified against what was persisted
   without `membership` and never matches. A leave from a join tells main
   (`membership_change/.../left`, `_user_left_room`). Fallbacks: remote
   joins and knocks (main's in Synapse too), 3pid invites, `third_party_signed`,
-  invite filtering account data (MSC4380, MSC4155), server notice rooms,
+  invite filtering account data (MSC4380, MSC4155), server notice rooms
+  (except a profile change's join: for a join the room changes nothing but
+  consent, and the background propagation has no main to hand it to),
   restricted joins needing an authorising server, the host not in the room,
   an avatar with media limits configured, and any module,
   `hs_disabled`/MAU limit or consent requirement in homeserver.yaml.
