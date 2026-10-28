@@ -129,6 +129,13 @@ func run(cfg *config.Config, configPath string, log zerolog.Logger) error {
 			if native, err = d.creator(ctx, hs, rooms, log); err != nil {
 				return err
 			}
+			// Profile changes whose join events a previous run left
+			// unfinished, as Synapse resumes its scheduled tasks.
+			if n, err := native.ResumeProfiles(ctx); err != nil {
+				log.Error().Err(err).Msg("Could not read the unfinished profile propagations")
+			} else if n > 0 {
+				log.Info().Int("jobs", n).Msg("Resumed profile propagations")
+			}
 			// The native path run dry, for comparing Synapse's refusals.
 			predictor = native.Predictor()
 		}

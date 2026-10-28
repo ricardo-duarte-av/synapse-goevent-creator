@@ -90,3 +90,7 @@ func (dryWriter) StoreFullStateGroup(context.Context, string, string, []writer.S
 func (dryWriter) AddDelayedEvent(context.Context, writer.DelayedEvent, int) (int64, error) {
 	return 0, errDry
 }
+func (dryWriter) SaveProfileJob(context.Context, writer.ProfileJob) error            { return errDry }
+func (dryWriter) CheckpointProfileJob(context.Context, string, string, string) error { return errDry }
+func (dryWriter) DeleteProfileJob(context.Context, string, string) error             { return errDry }
+func (dryWriter) ProfileJobs(context.Context) ([]writer.ProfileJob, error)           { return nil, nil }

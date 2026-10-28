@@ -12,6 +12,7 @@ import (
 
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/writer"
 )
 
 func (f *fakeRoom) JoinedRooms(_ context.Context, u string) ([]string, error) {
@@ -57,6 +58,40 @@ func (p *fakeProfiles) ProfileSetField(_ context.Context, instance, userID, requ
 func (p *fakeProfiles) ProfileDeleteField(_ context.Context, instance, userID, requester, field string, byAdmin bool) error {
 	p.calls = append(p.calls, map[string]any{"op": "delete", "user": userID, "field": field, "by_admin": byAdmin})
 	return nil
+}
+
+// The fake writer's profile jobs, outside its calls (which tests read as
+// "nothing was written to rooms"). checkpoints records each room done.
+func (w *fakeWriter) SaveProfileJob(_ context.Context, j writer.ProfileJob) error {
+	if w.jobs == nil {
+		w.jobs = map[string]writer.ProfileJob{}
+	}
+	w.jobs[j.UserID] = j
+	return nil
+}
+
+func (w *fakeWriter) CheckpointProfileJob(_ context.Context, userID, jobID, roomID string) error {
+	if j, ok := w.jobs[userID]; ok && j.JobID == jobID {
+		j.LastRoomID = roomID
+		w.jobs[userID] = j
+		w.checkpoints = append(w.checkpoints, roomID)
+	}
+	return nil
+}
+
+func (w *fakeWriter) DeleteProfileJob(_ context.Context, userID, jobID string) error {
+	if j, ok := w.jobs[userID]; ok && j.JobID == jobID {
+		delete(w.jobs, userID)
+	}
+	return nil
+}
+
+func (w *fakeWriter) ProfileJobs(context.Context) ([]writer.ProfileJob, error) {
+	var out []writer.ProfileJob
+	for _, j := range w.jobs {
+		out = append(out, j)
+	}
+	return out, nil
 }
 
 type roomSet map[string]bool
@@ -213,3 +248,35 @@ func TestProfileRatelimited(t *testing.T) {
 		t.Errorf("%d %s, %d calls, %d events", rec.Code, rec.Body, len(p.calls), len(h.p.entries))
 	}
 }
+
+// The job is saved before the answer, checkpointed per room, and forgotten
+// when done; an unfinished one is resumed on start after its last room,
+// as the task scheduler resumes an ACTIVE task.
+func TestProfileJobResumes(t *testing.T) {
+	h, _ := profileHarness(t)
+	h.profile(t, "PUT", profilePath+"displayname", `{"displayname":"New Name"}`)
+	if len(h.w.jobs) != 0 || len(h.w.checkpoints) != 1 || h.w.checkpoints[0] != room {
+		t.Fatalf("after a finished job: jobs %v, checkpoints %v", h.w.jobs, h.w.checkpoints)
+	}
+
+	// Left unfinished before the room: resumed, the room done.
+	h, _ = profileHarness(t)
+	h.f.profiles = map[string][2]*string{user: {ptr("Resumed"), nil}}
+	h.w.jobs = map[string]writer.ProfileJob{user: {UserID: user, JobID: "j1", Entity: user}}
+	if n, err := h.c.ResumeProfiles(t.Context()); n != 1 || err != nil {
+		t.Fatal(n, err)
+	}
+	if len(h.p.entries) != 1 || gjson.GetBytes(h.p.entries[0], "event.content.displayname").Str != "Resumed" || len(h.w.jobs) != 0 {
+		t.Errorf("resume: %d events, jobs %v", len(h.p.entries), h.w.jobs)
+	}
+
+	// Left unfinished after the room: nothing more to do, and forgotten.
+	h, _ = profileHarness(t)
+	h.w.jobs = map[string]writer.ProfileJob{user: {UserID: user, JobID: "j2", Entity: user, LastRoomID: room}}
+	h.c.ResumeProfiles(t.Context())
+	if len(h.p.entries) != 0 || len(h.w.jobs) != 0 {
+		t.Errorf("resume past the last room: %d events, jobs %v", len(h.p.entries), h.w.jobs)
+	}
+}
+
+func ptr(s string) *string { return &s }

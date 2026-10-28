@@ -128,6 +128,11 @@ type Writer interface {
 	StoreStateGroup(ctx context.Context, eventID, roomID string, prev int64, delta []writer.StateRow, full func() ([]writer.StateRow, error)) (int64, error)
 	StoreFullStateGroup(ctx context.Context, eventID, roomID string, rows []writer.StateRow) (int64, error)
 	AddDelayedEvent(ctx context.Context, ev writer.DelayedEvent, limit int) (int64, error)
+	// The profile propagations not yet finished (goevent_profile_propagations).
+	SaveProfileJob(ctx context.Context, j writer.ProfileJob) error
+	CheckpointProfileJob(ctx context.Context, userID, jobID, roomID string) error
+	DeleteProfileJob(ctx context.Context, userID, jobID string) error
+	ProfileJobs(ctx context.Context) ([]writer.ProfileJob, error)
 }
 
 // UserIPs is insert_client_ip.

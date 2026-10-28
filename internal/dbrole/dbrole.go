@@ -3,7 +3,9 @@
 // tables Synapse's event creator writes itself (docs/plan.md).
 //
 // What it changes is roles, never Synapse's data: CREATE/ALTER ROLE, GRANT,
-// and for a write role REVOKE, so its grants are exactly the spec's. It runs at startup, and only when connecting as the role failed or
+// and for a write role REVOKE, so its grants are exactly the spec's. The one
+// exception is the worker's own tables (Spec.Setup: CREATE TABLE IF NOT
+// EXISTS, goevent_ names), which Synapse does not know and ignores. It runs at startup, and only when connecting as the role failed or
 // the role lacked something, using homeserver.yaml's credentials -- on a
 // homeserver with a PostgreSQL of its own that is the database's only user, and
 // a superuser. The serving connection never uses those credentials.
@@ -55,6 +57,9 @@ type Spec struct {
 	Writes []Grant
 	// Sequences are granted USAGE (nextval).
 	Sequences []string
+	// Setup are idempotent statements creating the worker's own tables,
+	// run before the grants, so they can be granted too.
+	Setup []string
 }
 
 // Grant is privileges on one table, e.g. "INSERT, DELETE" or "UPDATE (id)".
@@ -143,6 +148,9 @@ func statements(ctx context.Context, conn *pgx.Conn, spec Spec) ([]statement, er
 	}
 
 	var out []statement
+	for i, sql := range spec.Setup {
+		out = append(out, statement{fmt.Sprintf("set up the worker's tables (%d)", i+1), sql})
+	}
 	if exists {
 		out = append(out, statement{"alter role " + spec.Role, "ALTER ROLE " + role + " " + login})
 	} else {

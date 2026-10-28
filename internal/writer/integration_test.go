@@ -157,6 +157,45 @@ func TestWritesAsTheRole(t *testing.T) {
 		}
 	}
 
+	// The worker's own table: created by Setup, written as the role.
+	if _, err := a.Exec(ctx, `DELETE FROM goevent_profile_propagations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SaveProfileJob(ctx, ProfileJob{UserID: "@u:x", JobID: "j1", Entity: "@u:x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CheckpointProfileJob(ctx, "@u:x", "j1", "!r:x"); err != nil {
+		t.Fatal(err)
+	}
+	// A newer change restarts the job; the old one's checkpoint and
+	// delete no longer touch it.
+	if err := d.SaveProfileJob(ctx, ProfileJob{UserID: "@u:x", JobID: "j2", Entity: "@admin:x"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CheckpointProfileJob(ctx, "@u:x", "j1", "!s:x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.DeleteProfileJob(ctx, "@u:x", "j1"); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := d.ProfileJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0] != (ProfileJob{UserID: "@u:x", JobID: "j2", Entity: "@admin:x"}) {
+		t.Errorf("jobs %+v", jobs)
+	}
+	if err := d.DeleteProfileJob(ctx, "@u:x", "j2"); err != nil {
+		t.Fatal(err)
+	}
+	if jobs, _ := d.ProfileJobs(ctx); len(jobs) != 0 {
+		t.Errorf("not forgotten: %+v", jobs)
+	}
+	// Setup is idempotent: a second Ensure changes nothing.
+	if err := dbrole.Ensure(ctx, admin, Spec(password)); err != nil {
+		t.Fatal(err)
+	}
+
 	// Nothing else: Synapse's other tables are refused.
 	for _, q := range []string{
 		`INSERT INTO events (event_id, topological_ordering, stream_ordering, room_id, type, processed, outlier) VALUES ('$x', 1, 1, '!r:x', 't', true, false)`,

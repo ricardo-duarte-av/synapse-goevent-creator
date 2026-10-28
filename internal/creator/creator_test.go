@@ -255,12 +255,14 @@ func (f *fakeRoom) HasAnnotated(_ context.Context, _, _, _, key string) (bool, e
 }
 
 type fakeWriter struct {
-	calls      []string
-	groupDelta []writer.StateRow
-	groupPrev  int64
-	bumped     []int64
-	nextGroup  int64
-	delayed    []writer.DelayedEvent
+	jobs        map[string]writer.ProfileJob
+	checkpoints []string
+	calls       []string
+	groupDelta  []writer.StateRow
+	groupPrev   int64
+	bumped      []int64
+	nextGroup   int64
+	delayed     []writer.DelayedEvent
 }
 
 func (w *fakeWriter) AddDelayedEvent(_ context.Context, ev writer.DelayedEvent, limit int) (int64, error) {

@@ -93,6 +93,7 @@ func TestGrantsAreNarrow(t *testing.T) {
 		"state_groups_pending_deletion": "SELECT, UPDATE",
 		"access_tokens":                 "SELECT (id, used), UPDATE (used)",
 		"delayed_events":                "SELECT, INSERT",
+		"goevent_profile_propagations":  "SELECT, INSERT, UPDATE, DELETE",
 	}
 	if len(Grants) != len(writes) {
 		t.Fatalf("Grants has %d tables, the test knows %d", len(Grants), len(writes))

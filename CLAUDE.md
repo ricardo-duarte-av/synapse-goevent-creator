@@ -70,13 +70,25 @@ The plan, with what Synapse does on the creator vs. the persister, is in
   replication as a bare user ID, so Synapse here propagates even for a
   shadow-banned user; so do we. Every room the user is joined to must pass
   the allowlist, or the whole request is main's (`room_not_native`).
-  Unlike Synapse's scheduled task, a propagation does not survive a restart
-  of this worker: the rooms not yet done keep the old profile. Custom
+  A propagation survives restarts as Synapse's scheduled task does: it is
+  saved before the answer in **our own table in Synapse's database**,
+  `goevent_profile_propagations` (user, job ID, entity, `last_room_id`),
+  checkpointed after every room, deleted when done, and resumed at start
+  after its last room (`ResumeProfiles`, `bisect_right` on the sorted
+  rooms). Not `scheduled_tasks`: main runs every ACTIVE or due task there
+  itself, every minute. The table is created by `dbrole.Ensure`
+  (`writer.Setup`, `CREATE TABLE IF NOT EXISTS`, the only DDL it makes) and
+  granted to the role; Synapse ignores it, and dropping it loses only
+  unfinished propagations. A room done but not yet checkpointed is redone
+  after a crash, and the duplicate rule makes that a no-op. Custom
   fields (MSC4133, v3 only) never propagate; the unstable MSC4133 path is
   proxied.
 - **Every endpoint's mode is required** and only modes whose code exists are
   accepted (`config.accepted`). A mode accepted early would silently mean proxy.
 - **homeserver.yaml is mounted read-only** at `/etc/synapse`. Never write to it.
+- **Our own tables in Synapse's database are `goevent_`-named**, created by
+  `writer.Setup` (operator, 2026-10-28, for profile propagations). Nothing
+  of Synapse's schema is ever altered.
 
 ## Building
 

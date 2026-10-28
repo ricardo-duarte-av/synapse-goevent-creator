@@ -46,6 +46,24 @@ var Grants = []dbrole.Grant{
 	{Table: "access_tokens", Privileges: "SELECT (id, used), UPDATE (used)"},
 	// add_delayed_event: a delayed event's row, sent later by main.
 	{Table: "delayed_events", Privileges: "SELECT, INSERT"},
+	// The worker's own: profile changes whose join events are not all
+	// sent yet (Setup).
+	{Table: "goevent_profile_propagations", Privileges: "SELECT, INSERT, UPDATE, DELETE"},
+}
+
+// Setup creates the worker's own tables in Synapse's database. Synapse does
+// not know them and ignores them; dropping them loses only what they hold.
+var Setup = []string{
+	// One row per user whose profile change is being propagated: the
+	// scheduled task Synapse would keep (update_join_states, its result's
+	// last_room_id), here, as main runs every task in scheduled_tasks.
+	`CREATE TABLE IF NOT EXISTS goevent_profile_propagations (
+		user_id      TEXT PRIMARY KEY,
+		job_id       TEXT NOT NULL,
+		entity       TEXT NOT NULL,
+		last_room_id TEXT,
+		updated_ts   BIGINT NOT NULL
+	)`,
 }
 
 // Sequences are granted USAGE: new state group IDs, and the pending deletion
@@ -54,7 +72,7 @@ var Sequences = []string{"state_group_id_seq", "state_groups_pending_deletion_se
 
 // Spec is the role as dbrole ensures it.
 func Spec(password string) dbrole.Spec {
-	return dbrole.Spec{Role: Role, Password: password, Writes: Grants, Sequences: Sequences}
+	return dbrole.Spec{Role: Role, Password: password, Writes: Grants, Sequences: Sequences, Setup: Setup}
 }
 
 const (
@@ -397,4 +415,77 @@ func b2i(b bool) int16 {
 		return 1
 	}
 	return 0
+}
+
+const (
+	// qSaveProfileJob starts (or restarts) a user's propagation: a newer
+	// change replaces an older one, from the first room.
+	qSaveProfileJob = `
+		INSERT INTO goevent_profile_propagations (user_id, job_id, entity, last_room_id, updated_ts)
+		VALUES ($1, $2, $3, NULL, $4)
+		ON CONFLICT (user_id) DO UPDATE
+		SET job_id = EXCLUDED.job_id, entity = EXCLUDED.entity, last_room_id = NULL, updated_ts = EXCLUDED.updated_ts`
+	// qCheckpointProfileJob records a room done, for this job only: a
+	// cancelled one must not move a newer one on.
+	qCheckpointProfileJob = `
+		UPDATE goevent_profile_propagations SET last_room_id = $3, updated_ts = $4
+		WHERE user_id = $1 AND job_id = $2`
+	qDeleteProfileJob = `DELETE FROM goevent_profile_propagations WHERE user_id = $1 AND job_id = $2`
+	qProfileJobs      = `SELECT user_id, job_id, entity, last_room_id FROM goevent_profile_propagations ORDER BY user_id`
+)
+
+// ProfileJob is a profile change whose join events are not all sent.
+type ProfileJob struct {
+	UserID, JobID, Entity string
+	// LastRoomID is the last room done, "" for none.
+	LastRoomID string
+}
+
+// SaveProfileJob records a user's propagation before it starts.
+func (d *DB) SaveProfileJob(ctx context.Context, j ProfileJob) error {
+	if _, err := d.pool.Exec(ctx, qSaveProfileJob, j.UserID, j.JobID, j.Entity, d.now().UnixMilli()); err != nil {
+		return fmt.Errorf("writer: save profile job: %w", err)
+	}
+	return nil
+}
+
+// CheckpointProfileJob records the last room done.
+func (d *DB) CheckpointProfileJob(ctx context.Context, userID, jobID, roomID string) error {
+	if _, err := d.pool.Exec(ctx, qCheckpointProfileJob, userID, jobID, roomID, d.now().UnixMilli()); err != nil {
+		return fmt.Errorf("writer: checkpoint profile job: %w", err)
+	}
+	return nil
+}
+
+// DeleteProfileJob forgets a finished propagation, if it is still this job.
+func (d *DB) DeleteProfileJob(ctx context.Context, userID, jobID string) error {
+	if _, err := d.pool.Exec(ctx, qDeleteProfileJob, userID, jobID); err != nil {
+		return fmt.Errorf("writer: delete profile job: %w", err)
+	}
+	return nil
+}
+
+// ProfileJobs are the propagations left unfinished, to resume.
+func (d *DB) ProfileJobs(ctx context.Context) ([]ProfileJob, error) {
+	rows, err := d.pool.Query(ctx, qProfileJobs)
+	if err != nil {
+		return nil, fmt.Errorf("writer: profile jobs: %w", err)
+	}
+	var out []ProfileJob
+	for rows.Next() {
+		var j ProfileJob
+		var last *string
+		if err := rows.Scan(&j.UserID, &j.JobID, &j.Entity, &last); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("writer: profile jobs: %w", err)
+		}
+		if last != nil {
+			j.LastRoomID = *last
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("writer: profile jobs: %w", err)
+	}
+	return out, nil
 }

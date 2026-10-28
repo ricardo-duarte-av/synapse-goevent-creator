@@ -12,12 +12,15 @@ package creator
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +32,7 @@ import (
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/pdu"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/replication"
 	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/route"
+	"github.com/ricardo-duarte-av/synapse-goevent-creator/internal/writer"
 )
 
 // ProfileWriter is the profile updates writer's replication.
@@ -205,11 +209,17 @@ func (c *Creator) serveProfile(w http.ResponseWriter, r *http.Request, req route
 		// came over replication as a bare user ID, the target's when an
 		// admin made the change, and is ratelimited (rc_message) after the
 		// field is stored.
-		entity := rq.UserID
 		if out, limited := c.messageRatelimit(ctx, w, &requester{UserID: req.User, Entity: req.User}); limited {
 			return out
 		}
-		c.propagateProfile(req.User, entity)
+		// schedule_task: saved before the answer, so an accepted change
+		// is never lost to a restart.
+		job := writer.ProfileJob{UserID: req.User, JobID: jobID(), Entity: rq.UserID}
+		if err := c.o.Writer.SaveProfileJob(ctx, job); err != nil {
+			c.o.Log.Error().Err(err).Str("user_id", req.User).Msg("Could not save a profile propagation")
+			return c.refuse(w, internalError("profile_job"))
+		}
+		c.propagateProfile(job)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -255,51 +265,74 @@ type profileJobs struct {
 }
 
 // propagateProfile is _update_join_states_task, in the background: a join,
-// ratelimit=False, into each room the user is joined to, in room ID order;
-// a failure in one room is logged and the rest go on.
-func (c *Creator) propagateProfile(target, entity string) {
+// ratelimit=False, into each room the user is joined to, in room ID order
+// (Python's sorted: code points), after the job's last room done; a failure
+// in one room is logged and the rest go on. Each room done is checkpointed,
+// and the finished job forgotten, so a restart resumes it (ResumeProfiles).
+func (c *Creator) propagateProfile(job writer.ProfileJob) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.profiles.mu.Lock()
 	if c.profiles.jobs == nil {
 		c.profiles.jobs = map[string]context.CancelFunc{}
 	}
-	if old := c.profiles.jobs[target]; old != nil {
+	if old := c.profiles.jobs[job.UserID]; old != nil {
 		old()
 		propagated.WithLabelValues("cancelled").Inc()
 	}
-	c.profiles.jobs[target] = cancel
+	c.profiles.jobs[job.UserID] = cancel
 	c.profiles.mu.Unlock()
 
 	done := func() {
 		c.profiles.mu.Lock()
-		// Only our own entry: a newer job may have replaced it.
-		if c.profiles.jobs[target] != nil && ctx.Err() == nil {
-			delete(c.profiles.jobs, target)
+		// Only our own entry: a newer job has cancelled us and replaced it.
+		if ctx.Err() == nil {
+			delete(c.profiles.jobs, job.UserID)
 		}
 		c.profiles.mu.Unlock()
 		cancel()
 	}
 	run := func() {
 		defer done()
-		rooms, err := c.o.Store.JoinedRooms(ctx, target)
+		log := c.o.Log.With().Str("user_id", job.UserID).Str("job_id", job.JobID).Logger()
+		rooms, err := c.o.Store.JoinedRooms(ctx, job.UserID)
 		if err != nil {
-			c.o.Log.Error().Err(err).Str("user_id", target).Msg("Profile propagation: no rooms")
+			log.Error().Err(err).Msg("Profile propagation: no rooms; left for the next start")
 			return
+		}
+		slices.Sort(rooms)
+		if job.LastRoomID != "" {
+			// bisect_right: the rooms after the last one done.
+			i, found := slices.BinarySearch(rooms, job.LastRoomID)
+			if found {
+				i++
+			}
+			rooms = rooms[i:]
 		}
 		counts := map[string]int{}
 		for _, room := range rooms {
 			if ctx.Err() != nil {
 				return
 			}
-			res := c.propagateJoin(ctx, room, target, entity)
+			res := "not_allowed"
+			if c.o.Rooms != nil && c.o.Rooms.Check(room) {
+				res = c.propagateJoin(ctx, room, job.UserID, job.Entity)
+			}
 			counts[res]++
 			propagated.WithLabelValues(res).Inc()
 			if res != "created" && res != "state_dedup" && res != "membership_noop" {
-				c.o.Log.Warn().Str("room_id", room).Str("user_id", target).Str("result", res).
-					Msg("Failed to update join event for room")
+				log.Warn().Str("room_id", room).Str("result", res).Msg("Failed to update join event for room")
+			}
+			if err := c.o.Writer.CheckpointProfileJob(ctx, job.UserID, job.JobID, room); err != nil && ctx.Err() == nil {
+				log.Warn().Err(err).Str("room_id", room).Msg("Could not checkpoint a profile propagation")
 			}
 		}
-		c.o.Log.Info().Str("user_id", target).Int("rooms", len(rooms)).Interface("results", counts).
+		if ctx.Err() != nil {
+			return
+		}
+		if err := c.o.Writer.DeleteProfileJob(context.WithoutCancel(ctx), job.UserID, job.JobID); err != nil {
+			log.Warn().Err(err).Msg("Could not forget a finished profile propagation")
+		}
+		log.Info().Int("rooms", len(rooms)).Bool("resumed", job.LastRoomID != "").Interface("results", counts).
 			Msg("Profile propagated")
 	}
 	if c.o.SyncPropagation {
@@ -307,6 +340,29 @@ func (c *Creator) propagateProfile(target, entity string) {
 		return
 	}
 	go run()
+}
+
+// ResumeProfiles restarts the propagations a previous run left unfinished,
+// as the task scheduler resumes its ACTIVE tasks.
+func (c *Creator) ResumeProfiles(ctx context.Context) (int, error) {
+	jobs, err := c.o.Writer.ProfileJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	for _, j := range jobs {
+		c.o.Log.Info().Str("user_id", j.UserID).Str("job_id", j.JobID).Str("after", j.LastRoomID).
+			Msg("Resuming a profile propagation")
+		propagated.WithLabelValues("resumed").Inc()
+		c.propagateProfile(j)
+	}
+	return len(jobs), nil
+}
+
+// jobID is a random job identifier.
+func jobID() string {
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // propagateJoin is one update_membership(requester, target, room, "join",
